@@ -476,7 +476,10 @@ ANTI-PATTERNS:
 - Do NOT toggle FUTURE stages that weren't mentioned (don't mark agreement_signed if user only said agreement_sent).
 - Do NOT make up emails, phone numbers, or other PII not in the transcript.
 
-When you're done, return a concise plain-text summary suitable for posting to Slack.`;
+When you're done, return a concise summary suitable for posting to Slack.
+
+FORMATTING:
+Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with single asterisks, _italic_ with underscores, no markdown headings. Don't use **double-asterisk bold** or # headings.`;
 
 // ---------- Agent loop ----------
 
