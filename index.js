@@ -70,6 +70,17 @@ async function ncPatch(path, body) {
   return res.json();
 }
 
+const STAGE_ORDER = [
+  "onboarding_call_done",
+  "agreement_sent",
+  "agreement_signed",
+  "xero_invoice",
+  "payment_plan",
+  "welcome_email",
+  "preform",
+  "calendar",
+];
+
 const STAGE_COLUMN_MAP = {
   onboarding_call_done: "1. Onboarding call done",
   agreement_sent: "2. Agreement sent",
@@ -195,16 +206,38 @@ const toolImpls = {
   },
 
   async toggle_stage({ person_id, stage, value }) {
-    const column = STAGE_COLUMN_MAP[stage];
-    if (!column) {
+    const idx = STAGE_ORDER.indexOf(stage);
+    if (idx === -1) {
       return {
-        error: `Invalid stage: ${stage}. Valid: ${Object.keys(STAGE_COLUMN_MAP).join(", ")}`,
+        error: `Invalid stage: ${stage}. Valid: ${STAGE_ORDER.join(", ")}`,
       };
     }
-    await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [
-      { Id: person_id, [column]: value, "Last touch": todayISO() },
-    ]);
-    return { id: person_id, stage, value, column };
+    // Stage invariant: stages are sequential.
+    //   value=true  → cascade earlier stages (1..N-1) to true
+    //   value=false → cascade later stages (N+1..end) to false
+    const updates = { Id: person_id, "Last touch": todayISO() };
+    const affected = [];
+    if (value === true) {
+      for (let i = 0; i <= idx; i++) {
+        updates[STAGE_COLUMN_MAP[STAGE_ORDER[i]]] = true;
+        affected.push(STAGE_ORDER[i]);
+      }
+    } else {
+      for (let i = idx; i < STAGE_ORDER.length; i++) {
+        updates[STAGE_COLUMN_MAP[STAGE_ORDER[i]]] = false;
+        affected.push(STAGE_ORDER[i]);
+      }
+    }
+    await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [updates]);
+    const cascaded = affected.filter((s) => s !== stage);
+    return {
+      id: person_id,
+      stage,
+      value,
+      column: STAGE_COLUMN_MAP[stage],
+      cascaded_stages: cascaded,
+      cascade_direction: value ? "earlier" : "later",
+    };
   },
 
   async add_note({ person_id, note }) {
@@ -318,7 +351,9 @@ const tools = [
   {
     name: "toggle_stage",
     description:
-      "Set an onboarding stage checkbox for a person. Stages are sequential: onboarding_call_done → agreement_sent → agreement_signed → xero_invoice → payment_plan → welcome_email → preform → calendar.",
+      "Set an onboarding stage checkbox for a person. Stages are sequential: onboarding_call_done → agreement_sent → agreement_signed → xero_invoice → payment_plan → welcome_email → preform → calendar. " +
+      "AUTO-CASCADE: marking value=true also marks all earlier stages true (you can't sign without sending). Marking value=false also marks all later stages false (an undone earlier stage invalidates later ones). " +
+      "Call this ONCE per stage change — the tool handles the cascade in a single DB write. The response includes 'cascaded_stages' showing which other stages were affected.",
     input_schema: {
       type: "object",
       properties: {
@@ -336,7 +371,7 @@ const tools = [
             "calendar",
           ],
         },
-        value: { type: "boolean", description: "true = mark done, false = unmark" },
+        value: { type: "boolean", description: "true = mark done (cascades earlier), false = unmark (cascades later)" },
       },
       required: ["person_id", "stage", "value"],
     },
@@ -425,15 +460,12 @@ PRINCIPLES:
 - Keep your final response concise: a short summary of what you did, plus any recommended next steps.
 - When you can't do something (e.g. drafting an email — that tool isn't built yet), acknowledge it and note what's still needed manually.
 
-STAGE CASCADE (important):
-Stages are SEQUENTIAL — completing a later stage logically implies all earlier stages are done.
-- agreement_signed=true → agreement_sent must also be true (you can't sign what wasn't sent)
-- xero_invoice=true → agreement_signed and agreement_sent are likely true
-- payment_plan=true → xero_invoice is likely true
-- welcome_email=true → payment_plan is likely true
-- preform=true → welcome_email is likely true
-- calendar=true → preform is likely true
-When the user marks a stage and earlier stages are still false, treat that as an oversight by default and ALSO toggle the earlier stages true. Mention in your summary that you cascaded ("Also marked stage 2 since stage 3 implies it"). If you have a real reason to think the earlier stage was deliberately skipped, ask for clarification.
+STAGE CASCADE:
+The toggle_stage tool handles cascade automatically — you DON'T need to call it multiple times for sequential stages.
+- toggle_stage(stage_N, true) marks stage N AND all earlier stages true in one call
+- toggle_stage(stage_N, false) unmarks stage N AND all later stages in one call
+The response will include 'cascaded_stages' so you can mention them in your summary (e.g. "Also marked agreement_sent since agreement_signed implies it").
+Just call toggle_stage ONCE for the stage the user mentioned — let the tool cascade.
 
 EMAIL TRANSCRIPTION REPAIR:
 Voice transcripts often mangle emails — "at" becomes ".", "dot" stays as "dot" or ".", and "@" is frequently dropped. If you see something that looks like an email but is missing "@" (e.g. "eva.k.gmail.com" or "sarah dot lee dot example dot com"), reasonably reconstruct it. Common pattern: the LAST domain-like segment (gmail.com, example.com, etc.) is the domain, and "@" goes right before it. So "eva.k.gmail.com" → "eva.k@gmail.com". Never invent emails entirely, but DO repair obvious transcription corruption.
