@@ -567,8 +567,21 @@ async function runAgent(transcript) {
 
 // ---------- Slack helpers ----------
 
+// Convert standard markdown to Slack's mrkdwn flavor.
+// Claude writes **bold** and ## headings; Slack expects *bold* and doesn't render headings.
+function toSlackMrkdwn(text) {
+  if (!text) return text;
+  return text
+    // **bold** → *bold*
+    .replace(/\*\*(.+?)\*\*/g, "*$1*")
+    // ## Heading or ### Heading → *Heading*
+    .replace(/^#{1,6}\s+(.+)$/gm, "*$1*")
+    // [text](url) → <url|text>
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+}
+
 async function postToSlack(channel, text, threadTs = null) {
-  const body = { channel, text };
+  const body = { channel, text: toSlackMrkdwn(text) };
   if (threadTs) body.thread_ts = threadTs;
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
