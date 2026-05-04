@@ -92,6 +92,24 @@ const STAGE_COLUMN_MAP = {
   calendar: "8. Calendar invites accepted",
 };
 
+// Stage dependencies — only TRUE logical implications.
+// Onboarding doesn't always happen in linear stage order, so most stages are independent.
+// Map of: stage → list of stages that MUST be true if this stage is true.
+const STAGE_PREREQUISITES = {
+  agreement_signed: ["agreement_sent"], // can't sign what wasn't sent
+  payment_plan: ["xero_invoice"], // payment plan requires the invoice be set up first
+};
+
+// Inverse map: if stage X is false, these stages must also be false (they depend on X).
+// Computed from STAGE_PREREQUISITES.
+const STAGE_DEPENDENTS = {};
+for (const [stage, prereqs] of Object.entries(STAGE_PREREQUISITES)) {
+  for (const prereq of prereqs) {
+    if (!STAGE_DEPENDENTS[prereq]) STAGE_DEPENDENTS[prereq] = [];
+    STAGE_DEPENDENTS[prereq].push(stage);
+  }
+}
+
 const VALID_SOURCES = ["Direct", "Referral", "Workshop", "Website", "Social", "Other"];
 
 function todayISO() {
@@ -206,37 +224,43 @@ const toolImpls = {
   },
 
   async toggle_stage({ person_id, stage, value }) {
-    const idx = STAGE_ORDER.indexOf(stage);
-    if (idx === -1) {
+    if (!STAGE_COLUMN_MAP[stage]) {
       return {
         error: `Invalid stage: ${stage}. Valid: ${STAGE_ORDER.join(", ")}`,
       };
     }
-    // Stage invariant: stages are sequential.
-    //   value=true  → cascade earlier stages (1..N-1) to true
-    //   value=false → cascade later stages (N+1..end) to false
+    // Cascade only TRUE dependencies, not all earlier/later stages.
+    //   value=true  → also mark prerequisites true (e.g. agreement_signed → agreement_sent)
+    //   value=false → also mark dependents false (e.g. agreement_sent=false → agreement_signed=false)
     const updates = { Id: person_id, "Last touch": todayISO() };
-    const affected = [];
+    const affected = new Set([stage]);
+    updates[STAGE_COLUMN_MAP[stage]] = value;
+
     if (value === true) {
-      for (let i = 0; i <= idx; i++) {
-        updates[STAGE_COLUMN_MAP[STAGE_ORDER[i]]] = true;
-        affected.push(STAGE_ORDER[i]);
+      for (const prereq of STAGE_PREREQUISITES[stage] || []) {
+        if (!affected.has(prereq)) {
+          updates[STAGE_COLUMN_MAP[prereq]] = true;
+          affected.add(prereq);
+        }
       }
     } else {
-      for (let i = idx; i < STAGE_ORDER.length; i++) {
-        updates[STAGE_COLUMN_MAP[STAGE_ORDER[i]]] = false;
-        affected.push(STAGE_ORDER[i]);
+      for (const dep of STAGE_DEPENDENTS[stage] || []) {
+        if (!affected.has(dep)) {
+          updates[STAGE_COLUMN_MAP[dep]] = false;
+          affected.add(dep);
+        }
       }
     }
+
     await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [updates]);
-    const cascaded = affected.filter((s) => s !== stage);
+    const cascaded = [...affected].filter((s) => s !== stage);
     return {
       id: person_id,
       stage,
       value,
       column: STAGE_COLUMN_MAP[stage],
       cascaded_stages: cascaded,
-      cascade_direction: value ? "earlier" : "later",
+      cascade_reason: cascaded.length === 0 ? null : (value ? "prerequisites" : "dependents"),
     };
   },
 
@@ -351,9 +375,12 @@ const tools = [
   {
     name: "toggle_stage",
     description:
-      "Set an onboarding stage checkbox for a person. Stages are sequential: onboarding_call_done → agreement_sent → agreement_signed → xero_invoice → payment_plan → welcome_email → preform → calendar. " +
-      "AUTO-CASCADE: marking value=true also marks all earlier stages true (you can't sign without sending). Marking value=false also marks all later stages false (an undone earlier stage invalidates later ones). " +
-      "Call this ONCE per stage change — the tool handles the cascade in a single DB write. The response includes 'cascaded_stages' showing which other stages were affected.",
+      "Set an onboarding stage checkbox for a person. The 8 stages don't all happen linearly — most are independent, so changing one stage usually doesn't affect others. " +
+      "NARROW CASCADE: only TRUE logical dependencies are cascaded automatically: " +
+      "  • agreement_signed=true → also marks agreement_sent=true (can't sign what wasn't sent) " +
+      "  • payment_plan=true → also marks xero_invoice=true (payment plan needs invoice first) " +
+      "  • inverses (agreement_sent=false → unmarks agreement_signed; xero_invoice=false → unmarks payment_plan) " +
+      "All other stages are independent — marking xero_invoice does NOT mark onboarding_call_done. The tool returns 'cascaded_stages' showing what (if anything) was also affected.",
     input_schema: {
       type: "object",
       properties: {
@@ -460,12 +487,13 @@ PRINCIPLES:
 - Keep your final response concise: a short summary of what you did, plus any recommended next steps.
 - When you can't do something (e.g. drafting an email — that tool isn't built yet), acknowledge it and note what's still needed manually.
 
-STAGE CASCADE:
-The toggle_stage tool handles cascade automatically — you DON'T need to call it multiple times for sequential stages.
-- toggle_stage(stage_N, true) marks stage N AND all earlier stages true in one call
-- toggle_stage(stage_N, false) unmarks stage N AND all later stages in one call
-The response will include 'cascaded_stages' so you can mention them in your summary (e.g. "Also marked agreement_sent since agreement_signed implies it").
-Just call toggle_stage ONCE for the stage the user mentioned — let the tool cascade.
+STAGE CASCADE (narrow):
+The 8 onboarding stages are NOT strictly linear — they often happen in non-linear order in real workflow. So most stages are independent. The toggle_stage tool only cascades real logical dependencies:
+- agreement_signed=true → also marks agreement_sent=true
+- payment_plan=true → also marks xero_invoice=true
+- inverses of the above
+All other stages are independent. Marking xero_invoice does NOT mark onboarding_call_done. Marking welcome_email does NOT mark anything else. Only toggle the stages the user explicitly mentions.
+The response will include 'cascaded_stages' if any cascade happened. If empty, no cascade.
 
 EMAIL TRANSCRIPTION REPAIR:
 Voice transcripts often mangle emails — "at" becomes ".", "dot" stays as "dot" or ".", and "@" is frequently dropped. If you see something that looks like an email but is missing "@" (e.g. "eva.k.gmail.com" or "sarah dot lee dot example dot com"), reasonably reconstruct it. Common pattern: the LAST domain-like segment (gmail.com, example.com, etc.) is the domain, and "@" goes right before it. So "eva.k.gmail.com" → "eva.k@gmail.com". Never invent emails entirely, but DO repair obvious transcription corruption.
