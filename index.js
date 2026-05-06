@@ -354,6 +354,20 @@ const toolImpls = {
     };
   },
 
+  async delete_clickup_task({ task_id }) {
+    const token = process.env.CLICKUP_TOKEN;
+    if (!token) return { error: "CLICKUP_TOKEN not configured" };
+    const res = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
+      method: "DELETE",
+      headers: { authorization: token },
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return { error: `ClickUp ${res.status}: ${data.err || data.error || JSON.stringify(data)}` };
+    }
+    return { task_id, deleted: true };
+  },
+
   async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null }) {
     const token = process.env.CLICKUP_TOKEN;
     const targetList = list_id || process.env.CLICKUP_DEFAULT_LIST_ID;
@@ -560,6 +574,17 @@ const tools = [
         body_text: { type: "string", description: "Plain text body. Mutually exclusive with body_html." },
       },
       required: ["to_email", "subject"],
+    },
+  },
+  {
+    name: "delete_clickup_task",
+    description: "Delete a ClickUp task by its ID. Use when a task is no longer relevant or was created in error.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "The ClickUp task ID (visible in the task URL after /t/)" },
+      },
+      required: ["task_id"],
     },
   },
   {
