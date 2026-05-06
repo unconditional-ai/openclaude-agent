@@ -750,6 +750,117 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
+// ---------- Admin: one-off introspection (no auth, remove later) ----------
+
+app.get("/admin/clickup-structure", async (_req, res) => {
+  const token = process.env.CLICKUP_TOKEN;
+  if (!token) return res.status(400).json({ error: "CLICKUP_TOKEN not set" });
+  const headers = { authorization: token };
+  const teamsRes = await fetch("https://api.clickup.com/api/v2/team", { headers });
+  const teams = (await teamsRes.json()).teams || [];
+  const out = { teams: [] };
+  for (const team of teams) {
+    const spaces = ((await fetch(`https://api.clickup.com/api/v2/team/${team.id}/space?archived=false`, { headers }).then((r) => r.json())).spaces) || [];
+    const teamData = { id: team.id, name: team.name, spaces: [] };
+    for (const space of spaces) {
+      const folders = ((await fetch(`https://api.clickup.com/api/v2/space/${space.id}/folder?archived=false`, { headers }).then((r) => r.json())).folders) || [];
+      const folderless = ((await fetch(`https://api.clickup.com/api/v2/space/${space.id}/list?archived=false`, { headers }).then((r) => r.json())).lists) || [];
+      teamData.spaces.push({
+        id: space.id,
+        name: space.name,
+        folders: folders.map((f) => ({
+          id: f.id,
+          name: f.name,
+          lists: (f.lists || []).map((l) => ({ id: l.id, name: l.name })),
+        })),
+        folderless_lists: folderless.map((l) => ({ id: l.id, name: l.name })),
+      });
+    }
+    out.teams.push(teamData);
+  }
+  res.json(out);
+});
+
+// ---------- Google OAuth (Gmail) ----------
+
+const GOOGLE_REDIRECT = `https://openclaude-agent.onrender.com/oauth/google/callback`;
+const GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
+const oauthStateStore = new Map(); // state → expiry timestamp
+
+app.get("/oauth/google/start", (_req, res) => {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  if (!clientId) return res.status(400).send("GOOGLE_CLIENT_ID not set on server");
+  const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  oauthStateStore.set(state, Date.now() + 10 * 60 * 1000);
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: GOOGLE_REDIRECT,
+    response_type: "code",
+    scope: GOOGLE_SCOPE,
+    access_type: "offline",
+    prompt: "consent",
+    state,
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get("/oauth/google/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) return res.status(400).send(`OAuth error: ${error}`);
+  if (!code || !state) return res.status(400).send("Missing code or state");
+  const expiry = oauthStateStore.get(state);
+  if (!expiry || expiry < Date.now()) return res.status(400).send("Invalid or expired state");
+  oauthStateStore.delete(state);
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: GOOGLE_REDIRECT,
+      grant_type: "authorization_code",
+    }),
+  });
+  const tok = await tokenRes.json();
+  if (!tokenRes.ok || !tok.refresh_token) {
+    return res.status(500).send(`Token exchange failed: ${JSON.stringify(tok)}`);
+  }
+
+  // Render the refresh token in plain HTML so the operator can copy it once.
+  res.setHeader("content-type", "text/html");
+  res.send(`<!doctype html>
+<html>
+<head><title>OpenClaude Gmail OAuth — done</title>
+<style>body{font-family:system-ui;max-width:680px;margin:40px auto;padding:24px;color:#222} pre{background:#f4f4f4;padding:16px;border-radius:8px;word-break:break-all;white-space:pre-wrap} .ok{color:#2c7}</style></head>
+<body>
+<h1 class="ok">✓ Gmail access authorized</h1>
+<p>Copy the refresh token below and set it as <code>GOOGLE_REFRESH_TOKEN</code> in Render → Environment.</p>
+<pre>${tok.refresh_token}</pre>
+<p>Once set, the agent can draft and send Gmail messages on your behalf. You can close this tab.</p>
+</body></html>`);
+});
+
+// Helper: refresh access token from stored refresh token (used by future email tools).
+async function getGmailAccessToken() {
+  const refresh = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!refresh) throw new Error("GOOGLE_REFRESH_TOKEN not set — Yohan needs to complete OAuth flow");
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      refresh_token: refresh,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      grant_type: "refresh_token",
+    }),
+  });
+  const tok = await res.json();
+  if (!tok.access_token) throw new Error(`Access token refresh failed: ${JSON.stringify(tok)}`);
+  return tok.access_token;
+}
+
 app.post("/run", async (req, res) => {
   const { transcript, slack_context } = req.body || {};
   if (!transcript || typeof transcript !== "string") {
