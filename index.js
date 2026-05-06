@@ -4,6 +4,11 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import express from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const {
   ANTHROPIC_API_KEY,
@@ -264,6 +269,91 @@ const toolImpls = {
     return { id: person_id, updated_fields: Object.keys(updates).filter((k) => k !== "Id" && k !== "Last touch") };
   },
 
+  async draft_welcome_email({ person_id }) {
+    // Look up person to get name + email
+    const data = await ncGet(
+      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+    );
+    if (data.list.length === 0) return { error: `Person ${person_id} not found` };
+    const p = data.list[0];
+    const recipientName = p.Name || "there";
+    const recipientEmail = p["Primary email"];
+    if (!recipientEmail) return { error: `Person ${person_id} has no Primary email` };
+
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    const fromAddress = await getGmailFromAddress(accessToken);
+    const html = renderTemplate("welcome_9week", { name: recipientName });
+    const subject = `Welcome to the UST 9-Week Training, ${recipientName} 🌱`;
+
+    const raw = buildMimeMessage({
+      from: `Yohan Dante <${fromAddress}>`,
+      to: `${recipientName} <${recipientEmail}>`,
+      subject,
+      html,
+    });
+
+    const draftRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ message: { raw } }),
+    });
+    const draftData = await draftRes.json();
+    if (!draftRes.ok) return { error: `Gmail draft failed: ${JSON.stringify(draftData)}` };
+
+    return {
+      person_id,
+      draft_id: draftData.id,
+      message_id: draftData.message?.id,
+      to: recipientEmail,
+      subject,
+      gmail_url: `https://mail.google.com/mail/u/0/#drafts/${draftData.id}`,
+    };
+  },
+
+  async draft_email({ to_email, to_name = null, subject, body_html = null, body_text = null }) {
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    const fromAddress = await getGmailFromAddress(accessToken);
+
+    let html = body_html;
+    if (!html && body_text) {
+      // Wrap plain text in basic HTML so the draft has a sensible HTML body too
+      html = `<div style="font-family:system-ui,arial;font-size:15px;line-height:1.5;color:#222;white-space:pre-wrap">${body_text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/\n/g, "<br>")}</div>`;
+    }
+    if (!html) return { error: "Provide body_html or body_text" };
+
+    const toHeader = to_name ? `${to_name} <${to_email}>` : to_email;
+    const raw = buildMimeMessage({
+      from: `<${fromAddress}>`,
+      to: toHeader,
+      subject,
+      html,
+    });
+
+    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ message: { raw } }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `Gmail draft failed: ${JSON.stringify(data)}` };
+    return {
+      draft_id: data.id,
+      to: to_email,
+      subject,
+      gmail_url: `https://mail.google.com/mail/u/0/#drafts/${data.id}`,
+    };
+  },
+
   async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null }) {
     const token = process.env.CLICKUP_TOKEN;
     const targetList = list_id || process.env.CLICKUP_DEFAULT_LIST_ID;
@@ -442,6 +532,34 @@ const tools = [
         amount_paid: { type: "number" },
       },
       required: ["person_id"],
+    },
+  },
+  {
+    name: "draft_welcome_email",
+    description:
+      "Create a Gmail draft of the standard 9-week training welcome email to a person. Looks up the person's name + email. Use this when the user says 'send the welcome email' or 'draft the welcome email' for a participant who has paid the deposit. Drafts go to Gmail; the user reviews and clicks send. Returns the Gmail draft URL.",
+    input_schema: {
+      type: "object",
+      properties: {
+        person_id: { type: "number", description: "NocoDB Person record Id" },
+      },
+      required: ["person_id"],
+    },
+  },
+  {
+    name: "draft_email",
+    description:
+      "Create a Gmail draft of an arbitrary email. Use for one-off emails that don't fit the welcome template (follow-ups, replies, intros). Provide body_html for rich content or body_text for plain. The user reviews the draft and clicks send.",
+    input_schema: {
+      type: "object",
+      properties: {
+        to_email: { type: "string" },
+        to_name: { type: "string", description: "Recipient's name for friendly To: header" },
+        subject: { type: "string" },
+        body_html: { type: "string", description: "HTML body. Mutually exclusive with body_text." },
+        body_text: { type: "string", description: "Plain text body. Mutually exclusive with body_html." },
+      },
+      required: ["to_email", "subject"],
     },
   },
   {
@@ -842,10 +960,10 @@ app.get("/oauth/google/callback", async (req, res) => {
 </body></html>`);
 });
 
-// Helper: refresh access token from stored refresh token (used by future email tools).
+// Helper: refresh access token from stored refresh token (used by email tools).
 async function getGmailAccessToken() {
   const refresh = process.env.GOOGLE_REFRESH_TOKEN;
-  if (!refresh) throw new Error("GOOGLE_REFRESH_TOKEN not set — Yohan needs to complete OAuth flow");
+  if (!refresh) throw new Error("GOOGLE_REFRESH_TOKEN not set — OAuth flow not completed yet");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -859,6 +977,74 @@ async function getGmailAccessToken() {
   const tok = await res.json();
   if (!tok.access_token) throw new Error(`Access token refresh failed: ${JSON.stringify(tok)}`);
   return tok.access_token;
+}
+
+// Email template loading
+const EMAIL_TEMPLATES = {};
+function loadTemplates() {
+  const dir = path.join(__dirname, "templates");
+  if (!fs.existsSync(dir)) return;
+  for (const file of fs.readdirSync(dir)) {
+    if (file.endsWith(".html")) {
+      const key = file.replace(/\.html$/, "");
+      EMAIL_TEMPLATES[key] = fs.readFileSync(path.join(dir, file), "utf8");
+    }
+  }
+  console.log(`Loaded email templates: ${Object.keys(EMAIL_TEMPLATES).join(", ")}`);
+}
+loadTemplates();
+
+function renderTemplate(name, vars) {
+  let html = EMAIL_TEMPLATES[name];
+  if (!html) throw new Error(`Unknown template: ${name}`);
+  for (const [k, v] of Object.entries(vars)) {
+    html = html.replaceAll(`{{${k}}}`, v ?? "");
+  }
+  return html;
+}
+
+// Build a base64url-encoded RFC822 MIME message for Gmail API.
+function buildMimeMessage({ from, to, subject, html, replyTo = null }) {
+  const boundary = `_b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  const headers = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+  ];
+  if (replyTo) headers.push(`Reply-To: ${replyTo}`);
+  // Plain-text fallback (very simple — strip tags from HTML)
+  const text = html.replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  const body = [
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    text,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    html,
+    "",
+    `--${boundary}--`,
+    "",
+  ].join("\r\n");
+  const raw = headers.join("\r\n") + "\r\n\r\n" + body;
+  // Gmail API wants base64url
+  return Buffer.from(raw, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Get the authenticated Gmail user's "From" address (the connected account's email).
+async function getGmailFromAddress(accessToken) {
+  const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const data = await res.json();
+  if (!data.emailAddress) throw new Error(`Failed to fetch Gmail profile: ${JSON.stringify(data)}`);
+  return data.emailAddress;
 }
 
 app.post("/run", async (req, res) => {
