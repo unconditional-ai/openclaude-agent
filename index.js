@@ -731,6 +731,12 @@ PAYMENT vs STAGES:
 - Use toggle_stage(deposit_paid|payment_plan_active|paid_in_full) for the related checkboxes.
 - These are complementary — set both when relevant.
 
+QUESTIONS / DECISIONS NEEDED:
+When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list 901613028919) instead of using ask_for_clarification. Title prefix: "❓". Examples:
+- User says "we should probably standardise the cohort email format" — that's a decision for Yohan, not blocking. Create a ❓ task.
+- During a person.upsert, if you notice the email looks wrong but you can still complete the action — create a ❓ task to follow up, but proceed.
+Use ask_for_clarification ONLY when you cannot proceed without an answer (e.g., "Reach out to Daniel" with no Daniel in the system).
+
 EMAIL TRANSCRIPTION REPAIR:
 Voice transcripts often mangle emails — "at" becomes ".", "dot" stays as "dot" or ".", and "@" is frequently dropped. If you see something that looks like an email but is missing "@" (e.g. "eva.k.gmail.com" or "sarah dot lee dot example dot com"), reasonably reconstruct it. Common pattern: the LAST domain-like segment (gmail.com, example.com, etc.) is the domain, and "@" goes right before it. So "eva.k.gmail.com" → "eva.k@gmail.com". Never invent emails entirely, but DO repair obvious transcription corruption.
 
