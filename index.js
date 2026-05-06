@@ -18,8 +18,9 @@ const {
   COHORTS_TABLE_ID,
   TOUCHPOINTS_TABLE_ID,
   COHORTS_LINK_COLUMN_ID,
+  TOUCHPOINTS_PERSON_LINK_COLUMN_ID = "c40g63j2i9pnmbc",
   SLACK_BOT_TOKEN,
-  AGENT_MODEL = "claude-sonnet-4-5",
+  AGENT_MODEL = "claude-sonnet-4-6",
   PORT = 10000,
 } = process.env;
 
@@ -471,9 +472,22 @@ const toolImpls = {
       Content: content,
       "Handled by": "openclaude",
     };
-    if (person_id) payload.Person = person_id;
     const created = await ncPost(`/api/v2/tables/${TOUCHPOINTS_TABLE_ID}/records`, [payload]);
-    return { id: Array.isArray(created) ? created[0].Id : created.Id };
+    const touchpointId = Array.isArray(created) ? created[0].Id : created.Id;
+
+    // For bt-type links, NocoDB v2 doesn't accept the link inline at create time.
+    // Use the link endpoint after creating the record.
+    if (person_id) {
+      try {
+        await ncPost(
+          `/api/v2/tables/${TOUCHPOINTS_TABLE_ID}/links/${TOUCHPOINTS_PERSON_LINK_COLUMN_ID}/records/${touchpointId}`,
+          [{ Id: person_id }]
+        );
+      } catch (e) {
+        return { id: touchpointId, person_link_error: e.message };
+      }
+    }
+    return { id: touchpointId, person_id: person_id || null };
   },
 };
 
