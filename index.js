@@ -72,32 +72,38 @@ async function ncPatch(path, body) {
 
 const STAGE_ORDER = [
   "onboarding_call_done",
-  "agreement_sent",
-  "agreement_signed",
-  "xero_invoice",
-  "payment_plan",
-  "welcome_email",
-  "preform",
-  "calendar",
+  "deposit_paid",
+  "welcome_email_sent",
+  "form_submitted",
+  "contract_sent",
+  "contract_signed",
+  "calendar_invites_sent",
+  "calendar_invites_accepted",
+  "payment_plan_active",
+  "paid_in_full",
 ];
 
 const STAGE_COLUMN_MAP = {
   onboarding_call_done: "1. Onboarding call done",
-  agreement_sent: "2. Agreement sent",
-  agreement_signed: "3. Agreement signed",
-  xero_invoice: "4. Xero invoice set",
-  payment_plan: "5. Payment plan active",
-  welcome_email: "6. Welcome email sent",
-  preform: "7. Pre-form submitted",
-  calendar: "8. Calendar invites accepted",
+  deposit_paid: "2. Deposit paid",
+  welcome_email_sent: "3. Welcome email sent",
+  form_submitted: "4. Form submitted",
+  contract_sent: "5. Contract sent",
+  contract_signed: "6. Contract signed",
+  calendar_invites_sent: "7. Calendar invites sent",
+  calendar_invites_accepted: "8. Calendar invites accepted",
+  payment_plan_active: "9. Payment plan active",
+  paid_in_full: "10. Paid in full",
 };
 
 // Stage dependencies — only TRUE logical implications.
-// Onboarding doesn't always happen in linear stage order, so most stages are independent.
-// Map of: stage → list of stages that MUST be true if this stage is true.
+// UST onboarding is non-linear; most stages are independent. Only encode REAL prereqs.
 const STAGE_PREREQUISITES = {
-  agreement_signed: ["agreement_sent"], // can't sign what wasn't sent
-  payment_plan: ["xero_invoice"], // payment plan requires the invoice be set up first
+  welcome_email_sent: ["deposit_paid"],            // welcome email is sent on the call after deposit
+  form_submitted: ["welcome_email_sent"],          // form link is inside the welcome email
+  contract_signed: ["contract_sent"],              // can't sign what wasn't sent
+  calendar_invites_accepted: ["calendar_invites_sent"], // can't accept invites that weren't sent
+  paid_in_full: ["deposit_paid"],                  // deposit precedes full payment
 };
 
 // Inverse map: if stage X is false, these stages must also be false (they depend on X).
@@ -135,18 +141,20 @@ const toolImpls = {
         primary_phone: p["Primary phone"],
         status: p.Status,
         owner: p.Owner,
+        room: p.Room,
         cohort_count: p.Cohorts || 0,
         notes: p.Notes,
-        stages: {
-          onboarding_call_done: p["1. Onboarding call done"] || false,
-          agreement_sent: p["2. Agreement sent"] || false,
-          agreement_signed: p["3. Agreement signed"] || false,
-          xero_invoice: p["4. Xero invoice set"] || false,
-          payment_plan: p["5. Payment plan active"] || false,
-          welcome_email: p["6. Welcome email sent"] || false,
-          preform: p["7. Pre-form submitted"] || false,
-          calendar: p["8. Calendar invites accepted"] || false,
+        next_action: p["Next action"],
+        payment: {
+          status: p["Payment status"],
+          risk: p["Payment risk"],
+          amount_total: p["Amount total"],
+          amount_paid: p["Amount paid"],
+          amount_owing: p["Amount owing"],
         },
+        stages: Object.fromEntries(
+          STAGE_ORDER.map((s) => [s, p[STAGE_COLUMN_MAP[s]] || false])
+        ),
       })),
     };
   },
@@ -175,6 +183,12 @@ const toolImpls = {
     cohort_name = null,
     source = "Other",
     notes = "",
+    room = null,
+    payment_status = null,
+    payment_risk = null,
+    amount_total = null,
+    amount_paid = null,
+    next_action = null,
   }) {
     let normalizedSource = "Other";
     if (source && typeof source === "string") {
@@ -182,18 +196,27 @@ const toolImpls = {
       if (VALID_SOURCES.includes(cap)) normalizedSource = cap;
     }
 
-    const created = await ncPost(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [
-      {
-        Name: name,
-        "Primary email": primary_email,
-        "Primary phone": primary_phone,
-        Status: "Onboarding",
-        Owner: "Valerie",
-        Source: normalizedSource,
-        Notes: notes,
-        "Last touch": todayISO(),
-      },
-    ]);
+    const record = {
+      Name: name,
+      "Primary email": primary_email,
+      "Primary phone": primary_phone,
+      Status: "Onboarding",
+      Owner: "Valerie",
+      Source: normalizedSource,
+      Notes: notes,
+      "Last touch": todayISO(),
+    };
+    if (room) record["Room"] = room;
+    if (payment_status) record["Payment status"] = payment_status;
+    if (payment_risk) record["Payment risk"] = payment_risk;
+    if (amount_total != null) record["Amount total"] = amount_total;
+    if (amount_paid != null) {
+      record["Amount paid"] = amount_paid;
+      if (amount_total != null) record["Amount owing"] = amount_total - amount_paid;
+    }
+    if (next_action) record["Next action"] = next_action;
+
+    const created = await ncPost(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [record]);
     const personId = Array.isArray(created) ? created[0].Id : created.Id;
 
     let cohortLinked = null;
@@ -215,6 +238,50 @@ const toolImpls = {
       cohort_linked: cohortLinked,
       created: true,
     };
+  },
+
+  async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk }) {
+    const updates = { Id: person_id, "Last touch": todayISO() };
+    if (payment_status !== undefined) updates["Payment status"] = payment_status;
+    if (amount_total !== undefined) updates["Amount total"] = amount_total;
+    if (amount_paid !== undefined) updates["Amount paid"] = amount_paid;
+    if (payment_risk !== undefined) updates["Payment risk"] = payment_risk;
+    // If both totals are present (either via this update or previously known), recompute owing
+    if (amount_total !== undefined && amount_paid !== undefined) {
+      updates["Amount owing"] = amount_total - amount_paid;
+    } else if (amount_paid !== undefined || amount_total !== undefined) {
+      // Need to fetch current values to compute owing accurately
+      const data = await ncGet(
+        `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+      );
+      if (data.list[0]) {
+        const tot = amount_total !== undefined ? amount_total : data.list[0]["Amount total"];
+        const paid = amount_paid !== undefined ? amount_paid : data.list[0]["Amount paid"];
+        if (tot != null && paid != null) updates["Amount owing"] = tot - paid;
+      }
+    }
+    await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [updates]);
+    return { id: person_id, updated_fields: Object.keys(updates).filter((k) => k !== "Id" && k !== "Last touch") };
+  },
+
+  async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null }) {
+    const token = process.env.CLICKUP_TOKEN;
+    const targetList = list_id || process.env.CLICKUP_DEFAULT_LIST_ID;
+    if (!token) return { error: "CLICKUP_TOKEN not configured on server" };
+    if (!targetList) return { error: "No list_id provided and CLICKUP_DEFAULT_LIST_ID not set" };
+
+    const body = { name, description };
+    if (priority) body.priority = priority; // 1=urgent, 2=high, 3=normal, 4=low
+    if (due_date) body.due_date = new Date(due_date).getTime();
+
+    const res = await fetch(`https://api.clickup.com/api/v2/list/${targetList}/task`, {
+      method: "POST",
+      headers: { authorization: token, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `ClickUp ${res.status}: ${data.err || data.error || JSON.stringify(data)}` };
+    return { id: data.id, url: data.url, name: data.name };
   },
 
   async update_person({ person_id, fields }) {
@@ -335,22 +402,60 @@ const tools = [
   {
     name: "create_person",
     description:
-      "Create a new person record and optionally link to a cohort. Default Status='Onboarding', Owner='Valerie'. Source is one of: Direct, Referral, Workshop, Website, Social, Other (case-insensitive, mapped). Use ONLY after confirming the person doesn't already exist via lookup_person.",
+      "Create a new person record and optionally link to a cohort. Default Status='Onboarding', Owner='Valerie'. Source one of: Direct, Referral, Workshop, Website, Social, Other (case-insensitive). Use ONLY after lookup_person confirms no existing match.",
     input_schema: {
       type: "object",
       properties: {
         name: { type: "string" },
         primary_email: { type: "string", description: "lowercase preferred" },
         primary_phone: { type: "string", description: "E.164 if possible" },
-        cohort_name: {
-          type: "string",
-          description: "Exact cohort name e.g. 'May 9 2026'. Set null if not specified.",
-        },
-        source: {
-          type: "string",
-          enum: ["Direct", "Referral", "Workshop", "Website", "Social", "Other"],
-        },
+        cohort_name: { type: "string", description: "Exact cohort name e.g. 'May 9 2026'. Null if unspecified." },
+        source: { type: "string", enum: ["Direct", "Referral", "Workshop", "Website", "Social", "Other"] },
         notes: { type: "string" },
+        room: { type: "string", description: "Sub-cohort/room name if mentioned" },
+        payment_status: {
+          type: "string",
+          enum: ["Unpaid", "Deposit paid", "On payment plan", "Paid in full", "Scholarship", "Refunded"],
+        },
+        payment_risk: { type: "string", enum: ["Low", "Medium", "High"] },
+        amount_total: { type: "number", description: "Total program fee in dollars" },
+        amount_paid: { type: "number", description: "Amount paid so far in dollars" },
+        next_action: { type: "string", description: "Short note on what's needed next" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "update_payment",
+    description:
+      "Update payment-related fields for a person in one call. Use when the user mentions payment activity (deposit received, full payment, payment plan, etc.). The 'Amount owing' field is automatically computed from total minus paid.",
+    input_schema: {
+      type: "object",
+      properties: {
+        person_id: { type: "number" },
+        payment_status: {
+          type: "string",
+          enum: ["Unpaid", "Deposit paid", "On payment plan", "Paid in full", "Scholarship", "Refunded"],
+        },
+        payment_risk: { type: "string", enum: ["Low", "Medium", "High"] },
+        amount_total: { type: "number" },
+        amount_paid: { type: "number" },
+      },
+      required: ["person_id"],
+    },
+  },
+  {
+    name: "create_clickup_task",
+    description:
+      "Create a task in ClickUp. Use when the user wants to track a follow-up action, project step, or human task. Goes in the default list unless list_id is specified. Priority: 1=urgent, 2=high, 3=normal, 4=low.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Task title (concise)" },
+        description: { type: "string", description: "Markdown allowed" },
+        priority: { type: "number", enum: [1, 2, 3, 4] },
+        due_date: { type: "string", description: "ISO 8601 date or datetime, e.g. '2026-05-12' or '2026-05-12T15:00:00+10:00'" },
+        list_id: { type: "string", description: "Specific ClickUp list ID. Omit to use default." },
       },
       required: ["name"],
     },
@@ -389,16 +494,18 @@ const tools = [
           type: "string",
           enum: [
             "onboarding_call_done",
-            "agreement_sent",
-            "agreement_signed",
-            "xero_invoice",
-            "payment_plan",
-            "welcome_email",
-            "preform",
-            "calendar",
+            "deposit_paid",
+            "welcome_email_sent",
+            "form_submitted",
+            "contract_sent",
+            "contract_signed",
+            "calendar_invites_sent",
+            "calendar_invites_accepted",
+            "payment_plan_active",
+            "paid_in_full",
           ],
         },
-        value: { type: "boolean", description: "true = mark done (cascades earlier), false = unmark (cascades later)" },
+        value: { type: "boolean", description: "true = mark done; false = unmark" },
       },
       required: ["person_id", "stage", "value"],
     },
@@ -469,15 +576,19 @@ Today's date: ${todayISO()}.
 
 Active cohorts: "May 9 2026", "May 10 2026" (both upcoming).
 
-Onboarding stages (in order):
-  1. onboarding_call_done
-  2. agreement_sent
-  3. agreement_signed
-  4. xero_invoice
-  5. payment_plan
-  6. welcome_email
-  7. preform
-  8. calendar
+Onboarding stages (numbered, but real flow is non-linear — most stages are independent):
+  1. onboarding_call_done — initial 1-on-1 call (Yohan or Valerie)
+  2. deposit_paid — they've put down a deposit (key trigger)
+  3. welcome_email_sent — sent on the call right after deposit; contains form link
+  4. form_submitted — JotForm intake completed (sensitive info inside)
+  5. contract_sent — DocuSeal contract sent for signature
+  6. contract_signed — DocuSeal complete
+  7. calendar_invites_sent — Google Calendar invites sent
+  8. calendar_invites_accepted — they've accepted invites
+  9. payment_plan_active — on a monthly/deferred plan (vs paid in full)
+  10. paid_in_full — total fee received (or end of payment plan)
+
+Payment fields on People: Amount total, Amount paid, Amount owing (auto-computed), Payment status (Unpaid/Deposit paid/On payment plan/Paid in full/Scholarship/Refunded), Payment risk (Low/Medium/High), Room (sub-cohort), Next action.
 
 PRINCIPLES:
 - Take initiative. A voice note may imply MULTIPLE actions ("Add Sarah AND mark her agreement signed AND remind me to follow up Tuesday"). Plan and execute all of them in sequence.
@@ -488,12 +599,19 @@ PRINCIPLES:
 - When you can't do something (e.g. drafting an email — that tool isn't built yet), acknowledge it and note what's still needed manually.
 
 STAGE CASCADE (narrow):
-The 8 onboarding stages are NOT strictly linear — they often happen in non-linear order in real workflow. So most stages are independent. The toggle_stage tool only cascades real logical dependencies:
-- agreement_signed=true → also marks agreement_sent=true
-- payment_plan=true → also marks xero_invoice=true
-- inverses of the above
-All other stages are independent. Marking xero_invoice does NOT mark onboarding_call_done. Marking welcome_email does NOT mark anything else. Only toggle the stages the user explicitly mentions.
-The response will include 'cascaded_stages' if any cascade happened. If empty, no cascade.
+The 10 onboarding stages are NOT strictly linear — they happen in non-linear order in real workflow. Most stages are independent. The toggle_stage tool only cascades real logical dependencies:
+- welcome_email_sent=true → also marks deposit_paid=true (welcome email is sent after deposit on the call)
+- form_submitted=true → also marks welcome_email_sent=true (form link is inside the welcome email)
+- contract_signed=true → also marks contract_sent=true
+- calendar_invites_accepted=true → also marks calendar_invites_sent=true
+- paid_in_full=true → also marks deposit_paid=true
+- inverses of the above (false cascades to dependent stages)
+All other stages are independent. Marking calendar_invites_sent does NOT mark contract_signed. Only toggle stages the user explicitly mentions.
+
+PAYMENT vs STAGES:
+- Use update_payment for payment fields (status, amounts, risk).
+- Use toggle_stage(deposit_paid|payment_plan_active|paid_in_full) for the related checkboxes.
+- These are complementary — set both when relevant.
 
 EMAIL TRANSCRIPTION REPAIR:
 Voice transcripts often mangle emails — "at" becomes ".", "dot" stays as "dot" or ".", and "@" is frequently dropped. If you see something that looks like an email but is missing "@" (e.g. "eva.k.gmail.com" or "sarah dot lee dot example dot com"), reasonably reconstruct it. Common pattern: the LAST domain-like segment (gmail.com, example.com, etc.) is the domain, and "@" goes right before it. So "eva.k.gmail.com" → "eva.k@gmail.com". Never invent emails entirely, but DO repair obvious transcription corruption.
