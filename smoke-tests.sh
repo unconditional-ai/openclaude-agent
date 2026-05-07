@@ -29,11 +29,41 @@ fi
 AGENT_URL="${AGENT_URL:-http://localhost:10000}"
 NC_URL="${NC_URL:-https://openclaude-nocodb.onrender.com}"
 NC_TOKEN="${NC_TOKEN:-}"
-PEOPLE_TABLE_ID="${PEOPLE_TABLE_ID:-mciuo6qr841ald4}"
-TOUCHPOINTS_TABLE_ID="${TOUCHPOINTS_TABLE_ID:-m43ehtpo0gs8wi6}"
+PEOPLE_TABLE_ID="${PEOPLE_TABLE_ID:-}"
+TOUCHPOINTS_TABLE_ID="${TOUCHPOINTS_TABLE_ID:-}"
+OPENCLAUDE_ENV="${OPENCLAUDE_ENV:-}"
 
-if [ -z "$NC_TOKEN" ]; then
-  echo "ERROR: NC_TOKEN not set. Export it or put it in .env.smoke" >&2
+# === Safety guards ===
+# Refuse to run unless we're explicitly in test mode (avoids accidentally
+# polluting prod data + audit log when env file is misconfigured).
+if [ "$OPENCLAUDE_ENV" != "test" ]; then
+  echo "ERROR: smoke tests refuse to run unless OPENCLAUDE_ENV=test." >&2
+  echo "  Set this in .env.smoke (use the 'Operations Test' base, not production)." >&2
+  exit 1
+fi
+
+# Refuse to run against the known production tables.
+PROD_PEOPLE="mciuo6qr841ald4"
+PROD_TOUCHPOINTS="m43ehtpo0gs8wi6"
+PROD_AGENT_ACTIONS="mkifqf7pr88ytsp"
+if [ "$PEOPLE_TABLE_ID" = "$PROD_PEOPLE" ] || \
+   [ "$TOUCHPOINTS_TABLE_ID" = "$PROD_TOUCHPOINTS" ] || \
+   [ "${AGENT_ACTIONS_TABLE_ID:-}" = "$PROD_AGENT_ACTIONS" ]; then
+  echo "ERROR: smoke tests refuse to run against production table IDs." >&2
+  echo "  Use Operations Test base IDs in .env.smoke." >&2
+  exit 1
+fi
+
+# Refuse to run against the production agent URL.
+if [[ "$AGENT_URL" == *"openclaude-agent.onrender.com"* ]]; then
+  echo "ERROR: smoke tests refuse to run against the production agent URL." >&2
+  echo "  Run the agent locally (npm start) and target http://localhost:10000." >&2
+  exit 1
+fi
+
+if [ -z "$NC_TOKEN" ] || [ -z "$PEOPLE_TABLE_ID" ] || [ -z "$TOUCHPOINTS_TABLE_ID" ]; then
+  echo "ERROR: NC_TOKEN, PEOPLE_TABLE_ID, TOUCHPOINTS_TABLE_ID must be set." >&2
+  echo "  Copy .env.smoke.example to .env.smoke and fill in." >&2
   exit 1
 fi
 
