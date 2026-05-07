@@ -1139,7 +1139,22 @@ ANTI-PATTERNS:
 When you're done, return a concise summary suitable for posting to Slack.
 
 FORMATTING:
-Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with single asterisks, _italic_ with underscores, no markdown headings. Don't use **double-asterisk bold** or # headings.`;
+Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with single asterisks, _italic_ with underscores, no markdown headings. Don't use **double-asterisk bold** or # headings.
+
+SLACK MENTIONS (notify the right person):
+Known team Slack user IDs — use the <@USER_ID> syntax to ping them in Slack so they get a notification:
+- Yohan: <@${process.env.YOHAN_SLACK_ID || "set YOHAN_SLACK_ID env"}>
+- Valerie: <@${process.env.VALERIE_SLACK_ID || "set VALERIE_SLACK_ID env"}>
+- Nathan: <@${process.env.NATHAN_SLACK_ID || "set NATHAN_SLACK_ID env"}>
+
+When to @-mention them: only when your reply asks them (or recommends they) take an action ("Valerie should call Joseph", "Yohan, please confirm the deposit"). Use the mention in place of (or alongside) their name — e.g. write "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number" instead of just "Valerie should prioritise...". The mention pings them; the bare name doesn't.
+
+When NOT to @-mention them:
+- Casual references ("the call Yohan ran on Tuesday")
+- Reporting on their past actions ("Valerie marked the deposit paid")
+- When the speaker IS that person (don't @ Yohan if Yohan is the one talking to you)
+- Don't @ participants/clients — they aren't in this Slack workspace
+- Don't @ anyone else by guessing — only the IDs listed above are known.`;
 
 // ---------- Agent loop ----------
 
