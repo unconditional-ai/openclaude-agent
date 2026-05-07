@@ -394,7 +394,7 @@ const toolImpls = {
     };
   },
 
-  async list_clickup_tasks({ list_id = null, search = null, statuses = null, include_closed = false, limit = 25 }) {
+  async list_clickup_tasks({ list_id = null, list_ids = null, search = null, statuses = null, include_closed = false, limit = 25 }) {
     const token = process.env.CLICKUP_TOKEN;
     if (!token) return { error: "CLICKUP_TOKEN not configured" };
     const teamRes = await fetch("https://api.clickup.com/api/v2/team", { headers: { authorization: token } });
@@ -402,12 +402,33 @@ const toolImpls = {
     if (teams.length === 0) return { error: "No ClickUp teams accessible" };
     const teamId = teams[0].id;
 
+    // ClickUp's team-task endpoint returns empty without list/space/folder filters.
+    // If no list specified, default to scanning the most active lists workspace-wide.
+    let scopedListIds = list_ids;
+    if (!scopedListIds && list_id) scopedListIds = [list_id];
+    if (!scopedListIds) {
+      // Default search scope: high-traffic lists across UST programs
+      scopedListIds = [
+        "901613028919", // Operations · BAU · Daily Task Board
+        "901613217899", // 2026 UST Programs · May 9-week · 👥People
+        "901613218193", // Feb 35-day · Enrollments
+        "901613218192", // Feb 35-day · Onboarded
+        "901613217869", // Mar 35-day · Enrollments
+        "901613217867", // Mar 35-day · Pre-Program
+        "901613217871", // Mar 35-day · Onboarded
+        "901613217890", // April 35-day · Enrollments
+        "901613217886", // April 35-day · Onboarded
+        "901613218209", // June 35-day · Enrollments
+        "901613218203", // June 35-day · Onboarded
+      ];
+    }
+
     const params = new URLSearchParams();
     params.set("order_by", "created");
     params.set("reverse", "true");
     params.set("subtasks", "true");
     params.set("include_closed", String(include_closed));
-    if (list_id) params.append("list_ids[]", list_id);
+    scopedListIds.forEach((id) => params.append("list_ids[]", id));
     if (Array.isArray(statuses)) statuses.forEach((s) => params.append("statuses[]", s));
 
     const res = await fetch(`https://api.clickup.com/api/v2/team/${teamId}/task?${params.toString()}`, {
