@@ -439,6 +439,17 @@ const toolImpls = {
     };
   },
 
+  async list_skills() {
+    const skills = Object.values(SKILLS).map((s) => ({ name: s.name, description: s.description }));
+    return { count: skills.length, skills };
+  },
+
+  async load_skill({ name }) {
+    const skill = SKILLS[name];
+    if (!skill) return { error: `Skill not found: ${name}. Available: ${Object.keys(SKILLS).join(", ") || "(none)"}` };
+    return { name: skill.name, description: skill.description, content: skill.body };
+  },
+
   async list_recent_actions({ limit = 10, since_hours = null, source = null, success_only = null }) {
     if (!AGENT_ACTIONS_TABLE_ID) return { error: "AGENT_ACTIONS_TABLE_ID not configured" };
     const filters = [];
@@ -608,6 +619,13 @@ const toolImpls = {
 // ---------- Tool definitions for Claude ----------
 
 const tools = [
+  // Server-side tool search: lets Claude discover deferred tools via natural-language search.
+  // Keeps the always-loaded set small (~5 tools) and surfaces specialized tools on-demand.
+  // See https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+  {
+    type: "tool_search_tool_bm25_20251119",
+    name: "tool_search_tool_bm25",
+  },
   {
     name: "lookup_person",
     description:
@@ -624,7 +642,8 @@ const tools = [
   {
     name: "lookup_cohort",
     description:
-      "Find a cohort by exact name. Current cohorts include 'May 9 2026' and 'May 10 2026'. Use to validate cohort_name before creating a person if uncertain.",
+      "Find a cohort by exact name (e.g. 'May 9 2026', 'May 10 2026'). When to use: ONLY when you need to verify a cohort exists before referencing it elsewhere. When NOT to use: don't call this before create_person — that tool already does cohort lookup internally.",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: { name: { type: "string" } },
@@ -660,7 +679,8 @@ const tools = [
   {
     name: "update_payment",
     description:
-      "Update payment-related fields for a person in one call. Use when the user mentions payment activity (deposit received, full payment, payment plan, etc.). The 'Amount owing' field is automatically computed from total minus paid.",
+      "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together.",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -679,7 +699,8 @@ const tools = [
   {
     name: "draft_welcome_email",
     description:
-      "Create a Gmail draft of the standard 9-week training welcome email to a person. Looks up the person's name + email. Use this when the user says 'send the welcome email' or 'draft the welcome email' for a participant who has paid the deposit. Drafts go to Gmail; the user reviews and clicks send. Returns the Gmail draft URL.",
+      "Create a Gmail draft using the standard 9-week training welcome email template (with cohort prep instructions, JotForm link, support info). When to use: user says 'send the welcome email' or 'draft the welcome email' for a 9-week participant. Drafts go to Gmail for the sender to review. When NOT to use: for one-off / non-template emails (use draft_email).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -691,7 +712,8 @@ const tools = [
   {
     name: "draft_email",
     description:
-      "Create a Gmail draft of an arbitrary email. Use for one-off emails that don't fit the welcome template (follow-ups, replies, intros). Provide body_html for rich content or body_text for plain. The user reviews the draft and clicks send.",
+      "Create a Gmail draft of an arbitrary one-off email. When to use: follow-ups, replies, intros, anything that doesn't match the welcome-email template. Provide body_html for rich content or body_text for plain. The sender reviews the draft and clicks send. When NOT to use: for the standard 9-week welcome email (use draft_welcome_email — preserves Valerie's branded design).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -724,7 +746,8 @@ const tools = [
   {
     name: "list_clickup_tasks",
     description:
-      "List ClickUp tasks across the workspace, optionally filtered by list, status, or text search. Use for 'show me recent tasks', 'what's outstanding', 'find tasks about Sarah'. Returns up to 50 tasks.",
+      "List ClickUp tasks across the workspace, optionally filtered by list, status, or text search. When to use: 'show me recent tasks', 'what's outstanding', 'find tasks about Sarah', 'any open follow-ups'. When NOT to use: for People/participant queries (use list_people), for agent activity (use list_recent_actions).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -740,7 +763,8 @@ const tools = [
   {
     name: "list_recent_actions",
     description:
-      "Query the Agent actions audit log to see what the agent has done recently. Use when the user asks 'what did you do today / this week', 'show me recent actions', 'what was the last thing you did for X', etc. Each row records a single voice note / mention / DM run with its transcript, summary, tools used, success status, and source.",
+      "Query the Agent actions audit log — what the AGENT has been doing. When to use: 'what did you do today', 'show me recent runs', 'what was your last action for Sarah', 'any failed runs lately'. When NOT to use: for participants/people queries (use list_people — different table). The audit log records agent runs, not participants.",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -754,7 +778,8 @@ const tools = [
   },
   {
     name: "delete_clickup_task",
-    description: "Delete a ClickUp task by its ID. Use when a task is no longer relevant or was created in error.",
+    description: "Delete a ClickUp task by its ID. When to use: a task is no longer relevant, was created in error, or the user explicitly asks to delete it. When NOT to use: to mark a task complete (let the user close it in ClickUp).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -766,7 +791,8 @@ const tools = [
   {
     name: "create_clickup_task",
     description:
-      "Create a task in ClickUp. Use when the user wants to track a follow-up action, project step, or human task. Goes in the default list unless list_id is specified. Priority: 1=urgent, 2=high, 3=normal, 4=low.",
+      "Create a task in ClickUp. When to use: tracking a follow-up action ('remind me to follow up with X'), a project step, a question for the team (prefix title with ❓), or a human task. Default list is the May 9-week 👥People list; override with list_id for general tasks. Priority: 1=urgent, 2=high, 3=normal, 4=low.",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -782,7 +808,8 @@ const tools = [
   {
     name: "update_person",
     description:
-      "Update arbitrary fields on an existing person record. Use the NocoDB column titles as field keys.",
+      "Update arbitrary fields on an existing person record using NocoDB column titles as keys. When to use: changing name, email, phone, status, owner, source, tags, timezone, or notes on an existing record. When NOT to use: for payment fields (use update_payment instead), for stage checkboxes (use toggle_stage), for cohort linking (use link_person_to_cohort).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -832,7 +859,8 @@ const tools = [
   {
     name: "add_note",
     description:
-      "Append a timestamped note to a person's Notes field. For freeform observations like 'mentioned travelling next week'.",
+      "Append a timestamped note to a person's Notes field. When to use: freeform observations about a person ('mentioned travelling next week', 'has back injury', 'asked about scheduling'). When NOT to use: for communications/touchpoints (use log_touchpoint), for payment changes (use update_payment), for stage progress (use toggle_stage).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -844,7 +872,8 @@ const tools = [
   },
   {
     name: "link_person_to_cohort",
-    description: "Link an existing person to an additional cohort.",
+    description: "Link an existing person to an additional cohort. When to use: a returning participant joining a second cohort, or correcting a cohort assignment. When NOT to use: for new participants (create_person already handles cohort linking via cohort_name parameter).",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -857,7 +886,8 @@ const tools = [
   {
     name: "log_touchpoint",
     description:
-      "Log a touchpoint record for audit trail. Optional — useful when a voice note describes communication or interaction worth tracking.",
+      "Log a Touchpoint record (audit trail of communications). When to use: user describes a real communication event with a participant — they emailed you, you called them, WhatsApp message arrived, etc. When NOT to use: for general agent activity (that's auto-logged separately), for freeform notes about a person (use add_note). Touchpoints represent communications, not observations.",
+    defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
@@ -876,11 +906,28 @@ const tools = [
   {
     name: "ask_for_clarification",
     description:
-      "Use ONLY when intent is genuinely ambiguous and you cannot proceed without user clarification. This terminates the loop and asks the user a question.",
+      "Terminate the agent loop and ask the user a question. When to use: ONLY when intent is genuinely ambiguous and you cannot proceed without an answer (e.g. 'reach out to Daniel' but multiple Daniels exist with no disambiguator). When NOT to use: when you can act with reasonable confidence, or when the question is a non-blocking decision worth tracking (use create_clickup_task with ❓ prefix instead).",
     input_schema: {
       type: "object",
       properties: { question: { type: "string" } },
       required: ["question"],
+    },
+  },
+  {
+    name: "list_skills",
+    description:
+      "List available Skills (workflow playbooks, voice/style guides, process docs). When to use: at the start of complex multi-step work to discover relevant guidance, or when the user references an established process. Skills hold knowledge that doesn't fit in the system prompt and loads on-demand. Returns each skill's name + one-sentence description.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "load_skill",
+    description:
+      "Load the full content of a named Skill. When to use: after list_skills surfaced a relevant skill and you want the full playbook/guide to inform your next steps. Skill content is markdown — read it and follow its guidance.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: { name: { type: "string", description: "Exact skill name from list_skills" } },
+      required: ["name"],
     },
   },
 ];
@@ -931,6 +978,12 @@ PAYMENT vs STAGES:
 - Use update_payment for payment fields (status, amounts, risk).
 - Use toggle_stage(deposit_paid|payment_plan_active|paid_in_full) for the related checkboxes.
 - These are complementary — set both when relevant.
+
+SKILLS:
+You have access to a Skills library — markdown playbooks for specific workflows (e.g. Yohan's voice/style guide, onboarding edge cases). Use list_skills early when starting complex work to see what guidance is available; load_skill to read a specific one. Treat loaded skill content as authoritative for that workflow.
+
+TOOL SEARCH:
+Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). Always-loaded core tools: lookup_person, create_person, toggle_stage, list_people, ask_for_clarification, list_skills. For anything else (payment updates, ClickUp tasks, email drafts, audit queries, etc.), search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment") and the relevant tool will be returned for use. Don't apologize for not having a tool — search first.
 
 QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
@@ -1212,6 +1265,35 @@ function loadTemplates() {
   console.log(`Loaded email templates: ${Object.keys(EMAIL_TEMPLATES).join(", ")}`);
 }
 loadTemplates();
+
+// Skills loading — markdown files with YAML frontmatter (name + description).
+// At startup we only register name + description; full content loads on-demand.
+const SKILLS = {};
+function loadSkills() {
+  const dir = path.join(__dirname, "skills");
+  if (!fs.existsSync(dir)) return;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".md") || file === "README.md") continue;
+    const raw = fs.readFileSync(path.join(dir, file), "utf8");
+    const fmMatch = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n?/);
+    let name = file.replace(/\.md$/, "");
+    let description = "";
+    let body = raw;
+    if (fmMatch) {
+      const frontmatter = fmMatch[1];
+      const nameMatch = frontmatter.match(/^name:\s*(.+)$/m);
+      const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
+      if (nameMatch) name = nameMatch[1].trim();
+      if (descMatch) description = descMatch[1].trim();
+      body = raw.slice(fmMatch[0].length);
+    }
+    SKILLS[name] = { name, description, body, file };
+  }
+  if (Object.keys(SKILLS).length > 0) {
+    console.log(`Loaded skills: ${Object.keys(SKILLS).join(", ")}`);
+  }
+}
+loadSkills();
 
 function renderTemplate(name, vars) {
   let html = EMAIL_TEMPLATES[name];
