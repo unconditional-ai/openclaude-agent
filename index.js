@@ -594,7 +594,18 @@ const toolImpls = {
     if (!token) return { error: "CLICKUP_TOKEN not configured on server" };
     if (!targetList) return { error: "No list_id provided and CLICKUP_DEFAULT_LIST_ID not set" };
 
-    const body = { name, description };
+    // Defensive: tool inputs occasionally arrive with the literal characters
+    // backslash + n (or t/r) instead of real newlines. Normalize so users don't see
+    // literal escape codes in ClickUp.
+    const normalized = (description || "")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t");
+
+    // ClickUp's `description` field is plain text. To render markdown (bold, lists,
+    // headings) the API needs `markdown_content` instead. Send both — ClickUp prefers
+    // markdown_content when present.
+    const body = { name, description: normalized, markdown_content: normalized };
     if (priority) body.priority = priority; // 1=urgent, 2=high, 3=normal, 4=low
     if (due_date) body.due_date = new Date(due_date).getTime();
 
@@ -911,13 +922,13 @@ const tools = [
   {
     name: "create_clickup_task",
     description:
-      "Create a task in ClickUp. When to use: tracking a follow-up action ('remind me to follow up with X'), a project step, a question for the team (prefix title with ❓), or a human task. Default list is the May 9-week 👥People list; override with list_id for general tasks. Priority: 1=urgent, 2=high, 3=normal, 4=low.",
+      "Create a task in ClickUp. When to use: tracking a follow-up action ('remind me to follow up with X'), a project step, a question for the team (prefix title with ❓), or a human task. Default list is the May 9-week 👥People list; override with list_id for general tasks. Priority: 1=urgent, 2=high, 3=normal, 4=low. Description is rendered as markdown — use **bold**, bullet lists, and real newlines (the actual newline character, not the two-character escape \\n).",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Task title (concise)" },
-        description: { type: "string", description: "Markdown allowed" },
+        description: { type: "string", description: "Markdown rendered (bold, lists, headings). Use real newlines for paragraph breaks; the server normalizes literal \\n escape sequences but real newlines render reliably." },
         priority: { type: "number", enum: [1, 2, 3, 4] },
         due_date: { type: "string", description: "ISO 8601 date or datetime, e.g. '2026-05-12' or '2026-05-12T15:00:00+10:00'" },
         list_id: { type: "string", description: "Specific ClickUp list ID. Omit to use default." },
