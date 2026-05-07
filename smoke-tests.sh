@@ -142,7 +142,7 @@ run_test() {
 
 # --- Pre-flight ---
 
-echo -e "${YELLOW}OpenClaude smoke tests${NC}"
+echo -e "${YELLOW}Compass smoke tests${NC}"
 echo "  Agent: $AGENT_URL"
 echo "  NocoDB: $NC_URL"
 echo "  Suffix: $SUFFIX"

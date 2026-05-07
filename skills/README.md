@@ -1,4 +1,4 @@
-# OpenClaude Skills
+# Compass Skills
 
 This directory holds reusable skill files (markdown). Each skill is a workflow or knowledge pack the agent can load on-demand via the `load_skill` tool.
 

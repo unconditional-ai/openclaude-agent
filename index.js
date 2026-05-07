@@ -1,4 +1,4 @@
-// OpenClaude agent service
+// Compass agent service
 // Receives a voice-note transcript + slack_context, runs a Claude tool-use loop
 // against UST's NocoDB, and replies in Slack with what was done.
 
@@ -613,10 +613,10 @@ const toolImpls = {
       Summary: summary,
       Channel: channel,
       Direction: direction,
-      Source: "openclaude agent",
+      Source: "Compass agent",
       Timestamp: new Date().toISOString(),
       Content: content,
-      "Handled by": "openclaude",
+      "Handled by": "Compass",
     };
     const created = await ncPost(`/api/v2/tables/${TOUCHPOINTS_TABLE_ID}/records`, [payload]);
     const touchpointId = Array.isArray(created) ? created[0].Id : created.Id;
@@ -955,7 +955,7 @@ const tools = [
 
 // ---------- System prompt ----------
 
-const SYSTEM_PROMPT = `You are OpenClaude, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
+const SYSTEM_PROMPT = `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
 
 You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
 
@@ -1017,6 +1017,9 @@ The audit log is for "what did the AGENT do". The People table is for "who are t
 
 SELF-AWARENESS / AUDIT TRAIL:
 Every voice note, @mention, and DM you handle is automatically logged to the Agent actions table via list_recent_actions. Don't say you have no memory — you have a full audit trail.
+
+CONVERSATION CONTEXT:
+When you're responding to a Slack message, the transcript may include prior context under a "## Thread context" or "## Recent channel context" heading, followed by "## Current message to act on" with the latest message. Use the prior context to resolve references like "that person", "what we just discussed", "the same thing again". Treat the thread context as a real conversation history — your previous replies (labeled "Compass:") are yours; messages from named users are theirs. If the current message obviously builds on prior turns, don't re-ask things already answered.
 
 QUESTIONS / DECISIONS NEEDED:
 When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list 901613028919) instead of using ask_for_clarification. Title prefix: "❓". Examples:
@@ -1154,6 +1157,104 @@ async function postToSlack(channel, text, threadTs = null) {
   return res.json();
 }
 
+// Generic Slack Web API call (GET-style with query string).
+async function slackApi(method, params = {}) {
+  const url = new URL(`https://slack.com/api/${method}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null) url.searchParams.set(k, v);
+  }
+  const res = await fetch(url, {
+    headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Slack ${method} failed: ${data.error || JSON.stringify(data)}`);
+  return data;
+}
+
+// Cached bot user id — used to label messages as "you" vs "user" in thread context.
+let _botUserIdCache = null;
+async function getBotUserId() {
+  if (_botUserIdCache) return _botUserIdCache;
+  try {
+    const data = await slackApi("auth.test");
+    _botUserIdCache = data.user_id;
+    return _botUserIdCache;
+  } catch (e) {
+    console.error("[slack] auth.test failed:", e.message);
+    return null;
+  }
+}
+
+// Cache of user_id -> display_name (lightweight; never expires within process lifetime).
+const _userNameCache = new Map();
+async function getUserName(userId) {
+  if (!userId) return "user";
+  if (_userNameCache.has(userId)) return _userNameCache.get(userId);
+  try {
+    const data = await slackApi("users.info", { user: userId });
+    const name = data.user?.profile?.display_name || data.user?.profile?.real_name || data.user?.name || userId;
+    _userNameCache.set(userId, name);
+    return name;
+  } catch {
+    return userId;
+  }
+}
+
+// Format a Slack message list as a labeled chat transcript.
+async function formatSlackMessages(messages, botId) {
+  const lines = [];
+  for (const m of messages) {
+    if (m.subtype === "bot_message" && !m.user) continue;
+    const speaker = m.user === botId ? "Compass" : await getUserName(m.user);
+    // Strip Slack mention syntax for readability
+    const text = (m.text || "").replace(/<@[A-Z0-9]+>/g, "").trim();
+    if (!text) continue;
+    lines.push(`${speaker}: ${text}`);
+  }
+  return lines.join("\n");
+}
+
+// Fetch full thread (parent + replies) when the user is responding inside a thread.
+async function fetchThreadContext(channel, threadTs, limit = 30) {
+  try {
+    const data = await slackApi("conversations.replies", { channel, ts: threadTs, limit });
+    const botId = await getBotUserId();
+    return await formatSlackMessages(data.messages || [], botId);
+  } catch (e) {
+    console.error("[slack] thread fetch failed:", e.message);
+    return "";
+  }
+}
+
+// Fetch recent channel messages (top-level only) for context when the user posts at the channel level.
+async function fetchRecentChannelContext(channel, limit = 8) {
+  try {
+    const data = await slackApi("conversations.history", { channel, limit });
+    const botId = await getBotUserId();
+    // Reverse to chronological (Slack returns newest-first)
+    const messages = (data.messages || []).slice().reverse();
+    return await formatSlackMessages(messages, botId);
+  } catch (e) {
+    console.error("[slack] channel history fetch failed:", e.message);
+    return "";
+  }
+}
+
+// Wrap the user's transcript with relevant Slack context so the agent isn't blind to prior messages.
+// If thread_ts is set, fetches the thread. Otherwise fetches recent channel messages.
+async function enrichTranscriptWithContext(transcript, slackContext) {
+  if (!slackContext?.channel) return transcript;
+  let context = "";
+  if (slackContext.thread_ts) {
+    context = await fetchThreadContext(slackContext.channel, slackContext.thread_ts);
+  } else {
+    context = await fetchRecentChannelContext(slackContext.channel);
+  }
+  if (!context) return transcript;
+  const label = slackContext.thread_ts ? "Thread context (chronological — most recent last)" : "Recent channel context (chronological)";
+  return `## ${label}\n${context}\n\n## Current message to act on\n${transcript}`;
+}
+
 // ---------- Express server ----------
 
 const app = express();
@@ -1243,7 +1344,7 @@ app.get("/oauth/google/callback", async (req, res) => {
   res.setHeader("content-type", "text/html");
   res.send(`<!doctype html>
 <html>
-<head><title>OpenClaude Gmail OAuth — done</title>
+<head><title>Compass Gmail OAuth — done</title>
 <style>body{font-family:system-ui;max-width:680px;margin:40px auto;padding:24px;color:#222} pre{background:#f4f4f4;padding:16px;border-radius:8px;word-break:break-all;white-space:pre-wrap} .ok{color:#2c7}</style></head>
 <body>
 <h1 class="ok">✓ Gmail access authorized</h1>
@@ -1404,9 +1505,19 @@ app.post("/run", async (req, res) => {
 
   console.log(`[agent] transcript: ${transcript.slice(0, 200)}`);
   const t0 = Date.now();
+  let enrichedTranscript = transcript;
+  if (slack_context?.channel) {
+    try {
+      enrichedTranscript = await enrichTranscriptWithContext(transcript, slack_context);
+      const ctxBytes = enrichedTranscript.length - transcript.length;
+      if (ctxBytes > 0) console.log(`[agent] enriched transcript with ${ctxBytes} bytes of Slack context`);
+    } catch (e) {
+      console.error(`[agent] context enrichment failed (continuing with raw transcript):`, e.message);
+    }
+  }
   let result;
   try {
-    result = await runAgent(transcript);
+    result = await runAgent(enrichedTranscript);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
@@ -1435,5 +1546,5 @@ app.post("/run", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenClaude agent listening on :${PORT}`);
+  console.log(`Compass agent listening on :${PORT}`);
 });
