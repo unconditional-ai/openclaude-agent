@@ -18,7 +18,7 @@ const {
   COHORTS_TABLE_ID,
   TOUCHPOINTS_TABLE_ID,
   COHORTS_LINK_COLUMN_ID,
-  TOUCHPOINTS_PERSON_LINK_COLUMN_ID = "c40g63j2i9pnmbc",
+  TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
@@ -33,6 +33,7 @@ const requiredEnv = {
   COHORTS_TABLE_ID,
   TOUCHPOINTS_TABLE_ID,
   COHORTS_LINK_COLUMN_ID,
+  TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   SLACK_BOT_TOKEN,
 };
 for (const [k, v] of Object.entries(requiredEnv)) {
@@ -617,6 +618,13 @@ const toolImpls = {
     if (!STAGE_COLUMN_MAP[stage]) {
       return {
         error: `Invalid stage: ${stage}. Valid: ${STAGE_ORDER.join(", ")}`,
+      };
+    }
+    // Reject string-coerced booleans — the cascade logic uses `value === true` strict equality,
+    // so "true"/"false" strings would silently flip the cascade direction.
+    if (typeof value !== "boolean") {
+      return {
+        error: `toggle_stage value must be a boolean (true or false). Got ${typeof value}: ${JSON.stringify(value)}`,
       };
     }
     // Cascade only TRUE dependencies, not all earlier/later stages.
