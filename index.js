@@ -19,6 +19,7 @@ const {
   TOUCHPOINTS_TABLE_ID,
   COHORTS_LINK_COLUMN_ID,
   TOUCHPOINTS_PERSON_LINK_COLUMN_ID = "c40g63j2i9pnmbc",
+  AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
   PORT = 10000,
@@ -1092,6 +1093,33 @@ async function getGmailFromAddress(accessToken) {
   return data.emailAddress;
 }
 
+// Log every agent run to the Agent actions audit table.
+// Fire-and-forget — failures here shouldn't fail the response.
+async function logAgentAction({ transcript, slack_context, result, elapsedMs }) {
+  if (!AGENT_ACTIONS_TABLE_ID) return;
+  try {
+    const source = slack_context?.file_id ? "Slack voice" : (slack_context?.channel ? "Slack text" : "API call");
+    const toolsUsed = (result.trace || []).map((t) => t.tool).filter(Boolean);
+    const summaryShort = (result.summary || "").slice(0, 200).replace(/\n+/g, " ");
+    const payload = {
+      Summary: summaryShort || (result.error ? `Error: ${result.error.slice(0, 180)}` : "agent run"),
+      Transcript: transcript,
+      "Agent response": result.summary || "",
+      "Tools used": JSON.stringify(toolsUsed),
+      Iterations: result.iterations || 0,
+      "Elapsed ms": elapsedMs,
+      Success: !!result.ok,
+      "Needed clarification": !!result.clarification_needed,
+      Source: source,
+      "Slack channel": slack_context?.channel || null,
+      "Slack user id": slack_context?.user_id || null,
+    };
+    await ncPost(`/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records`, [payload]);
+  } catch (e) {
+    console.error(`[audit] failed to log agent action:`, e.message);
+  }
+}
+
 app.post("/run", async (req, res) => {
   const { transcript, slack_context } = req.body || {};
   if (!transcript || typeof transcript !== "string") {
@@ -1109,6 +1137,9 @@ app.post("/run", async (req, res) => {
   }
   const elapsedMs = Date.now() - t0;
   console.log(`[agent] done in ${elapsedMs}ms, ok=${result.ok}, iterations=${result.iterations}`);
+
+  // Audit log — fire-and-forget, don't block the response on it
+  logAgentAction({ transcript, slack_context, result, elapsedMs });
 
   // Reply to Slack if context provided
   if (slack_context?.channel) {
