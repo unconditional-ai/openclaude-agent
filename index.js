@@ -1133,9 +1133,20 @@ When you're responding to a Slack message, the transcript may include prior cont
 If the transcript starts with "## Context status" (instead of "## Thread context" or "## Recent channel context"), Slack context fetching failed — the user may be referencing prior messages you genuinely can't see. Ask them for a brief summary if the current message is ambiguous, rather than guessing.
 
 QUESTIONS / DECISIONS NEEDED:
-When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification. Title prefix: "❓". Examples:
-- User says "we should probably standardise the cohort email format" — that's a decision for Yohan, not blocking. Create a ❓ task.
-- During a person.upsert, if you notice the email looks wrong but you can still complete the action — create a ❓ task to follow up, but proceed.
+When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification.
+
+The "❓" prefix is RESERVED for tasks that are genuinely a question or decision — not just any task assigned to a human. The prefix lets Yohan/Valerie scan their board and see "things needing my judgement" separate from regular action items.
+
+Use "❓" prefix when:
+- "We should probably standardise the cohort email format" → "❓ Standardise cohort email format?"
+- Person record's email looks wrong but action still completes → "❓ Verify Sarah's email — looks possibly mistyped"
+- Two valid options and you don't know which → "❓ Use Tuesday or Thursday for May 9 onboarding call?"
+
+DON'T use "❓" prefix for action items, even if they're for a human. Use a plain-language verb-led title:
+- Wrong: "❓ Set up Gmail OAuth for Yohan"  → Right: "Set up Gmail OAuth for Yohan"
+- Wrong: "❓ Send welcome email to new participant"  → Right: "Send welcome email to new participant"
+- Wrong: "❓ Schedule onboarding call with Joseph"  → Right: "Schedule onboarding call with Joseph"
+
 Use ask_for_clarification ONLY when you cannot proceed without an answer (e.g., "Reach out to Daniel" with no Daniel in the system).
 
 EMAIL TRANSCRIPTION REPAIR:
