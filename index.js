@@ -356,6 +356,36 @@ const toolImpls = {
     };
   },
 
+  async list_recent_actions({ limit = 10, since_hours = null, source = null, success_only = null }) {
+    if (!AGENT_ACTIONS_TABLE_ID) return { error: "AGENT_ACTIONS_TABLE_ID not configured" };
+    const filters = [];
+    if (since_hours != null) {
+      const cutoff = new Date(Date.now() - since_hours * 3600 * 1000).toISOString();
+      filters.push(`(CreatedAt,gte,exactDate,${cutoff})`);
+    }
+    if (source) filters.push(`(Source,eq,${source})`);
+    if (success_only === true) filters.push(`(Success,eq,1)`);
+    if (success_only === false) filters.push(`(Success,eq,0)`);
+    const where = filters.length ? `&where=${encodeURIComponent(filters.join("~and"))}` : "";
+    const url = `/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records?limit=${Math.min(limit, 50)}&sort=-CreatedAt${where}`;
+    const data = await ncGet(url);
+    return {
+      count: data.list.length,
+      actions: data.list.map((a) => ({
+        id: a.Id,
+        when: a.CreatedAt,
+        summary: a.Summary,
+        transcript: a.Transcript,
+        tools_used: (() => { try { return JSON.parse(a["Tools used"] || "[]"); } catch { return []; } })(),
+        iterations: a.Iterations,
+        elapsed_ms: a["Elapsed ms"],
+        success: a.Success,
+        needed_clarification: a["Needed clarification"],
+        source: a.Source,
+      })),
+    };
+  },
+
   async delete_clickup_task({ task_id }) {
     const token = process.env.CLICKUP_TOKEN;
     if (!token) return { error: "CLICKUP_TOKEN not configured" };
@@ -592,6 +622,21 @@ const tools = [
     },
   },
   {
+    name: "list_recent_actions",
+    description:
+      "Query the Agent actions audit log to see what the agent has done recently. Use when the user asks 'what did you do today / this week', 'show me recent actions', 'what was the last thing you did for X', etc. Each row records a single voice note / mention / DM run with its transcript, summary, tools used, success status, and source.",
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max rows to return (default 10, max 50)" },
+        since_hours: { type: "number", description: "Only show actions from the last N hours (e.g. 24 for today)" },
+        source: { type: "string", enum: ["Slack voice", "Slack text", "API call", "Other"] },
+        success_only: { type: "boolean", description: "true = only successful runs, false = only failures" },
+      },
+      required: [],
+    },
+  },
+  {
     name: "delete_clickup_task",
     description: "Delete a ClickUp task by its ID. Use when a task is no longer relevant or was created in error.",
     input_schema: {
@@ -770,6 +815,9 @@ PAYMENT vs STAGES:
 - Use update_payment for payment fields (status, amounts, risk).
 - Use toggle_stage(deposit_paid|payment_plan_active|paid_in_full) for the related checkboxes.
 - These are complementary — set both when relevant.
+
+SELF-AWARENESS / AUDIT TRAIL:
+Every voice note, @mention, and DM you handle is automatically logged to the Agent actions table. You can query it via list_recent_actions. When asked "what did you do today", "show me recent activity", "what was the last thing you ran", etc., use list_recent_actions (e.g. since_hours=24 for today) and present the actions in a useful summary. Don't say you have no memory — you have a full audit trail.
 
 QUESTIONS / DECISIONS NEEDED:
 When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list 901613028919) instead of using ask_for_clarification. Title prefix: "❓". Examples:
