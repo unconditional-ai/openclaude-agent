@@ -356,6 +356,89 @@ const toolImpls = {
     };
   },
 
+  async list_people({ status = null, cohort_name = null, payment_status = null, has_pending_stage = null, owner = null, limit = 25 }) {
+    const filters = [];
+    if (status) filters.push(`(Status,eq,${status})`);
+    if (cohort_name) filters.push(`(Cohort name,eq,${cohort_name})`);
+    if (payment_status) filters.push(`(Payment status,eq,${payment_status})`);
+    if (owner) filters.push(`(Owner,eq,${owner})`);
+    // has_pending_stage=true → at least one of stages 1-8 unchecked (real onboarding work)
+    if (has_pending_stage === true) {
+      const stageCols = STAGE_ORDER.slice(0, 8).map((s) => STAGE_COLUMN_MAP[s]);
+      const stageFilter = stageCols.map((c) => `(${c},notchecked)`).join("~or");
+      filters.push(`(${stageFilter})`);
+    }
+    if (has_pending_stage === false) {
+      const stageCols = STAGE_ORDER.slice(0, 8).map((s) => STAGE_COLUMN_MAP[s]);
+      stageCols.forEach((c) => filters.push(`(${c},checked)`));
+    }
+    const where = filters.length ? `&where=${encodeURIComponent(filters.join("~and"))}` : "";
+    const url = `/api/v2/tables/${PEOPLE_TABLE_ID}/records?limit=${Math.min(limit, 100)}&sort=Name${where}`;
+    const data = await ncGet(url);
+    return {
+      count: data.list.length,
+      total: data.pageInfo?.totalRows ?? data.list.length,
+      people: data.list.map((p) => ({
+        id: p.Id,
+        name: p.Name,
+        primary_email: p["Primary email"],
+        status: p.Status,
+        owner: p.Owner,
+        cohort_name: p["Cohort name"],
+        payment_status: p["Payment status"],
+        amount_owing: p["Amount owing"],
+        next_action: p["Next action"],
+        completed_stages: STAGE_ORDER.filter((s) => p[STAGE_COLUMN_MAP[s]] === true),
+        pending_stages: STAGE_ORDER.slice(0, 8).filter((s) => p[STAGE_COLUMN_MAP[s]] !== true),
+      })),
+    };
+  },
+
+  async list_clickup_tasks({ list_id = null, search = null, statuses = null, include_closed = false, limit = 25 }) {
+    const token = process.env.CLICKUP_TOKEN;
+    if (!token) return { error: "CLICKUP_TOKEN not configured" };
+    const teamRes = await fetch("https://api.clickup.com/api/v2/team", { headers: { authorization: token } });
+    const teams = (await teamRes.json()).teams || [];
+    if (teams.length === 0) return { error: "No ClickUp teams accessible" };
+    const teamId = teams[0].id;
+
+    const params = new URLSearchParams();
+    params.set("order_by", "created");
+    params.set("reverse", "true");
+    params.set("subtasks", "true");
+    params.set("include_closed", String(include_closed));
+    if (list_id) params.append("list_ids[]", list_id);
+    if (Array.isArray(statuses)) statuses.forEach((s) => params.append("statuses[]", s));
+
+    const res = await fetch(`https://api.clickup.com/api/v2/team/${teamId}/task?${params.toString()}`, {
+      headers: { authorization: token },
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `ClickUp ${res.status}: ${data.err || JSON.stringify(data)}` };
+
+    let tasks = data.tasks || [];
+    if (search) {
+      const q = search.toLowerCase();
+      tasks = tasks.filter((t) => (t.name || "").toLowerCase().includes(q) || (t.description || "").toLowerCase().includes(q));
+    }
+    tasks = tasks.slice(0, Math.min(limit, 50));
+    return {
+      count: tasks.length,
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        name: t.name,
+        status: t.status?.status,
+        priority: t.priority?.priority,
+        url: t.url,
+        list: t.list?.name,
+        list_id: t.list?.id,
+        assignees: (t.assignees || []).map((a) => a.username),
+        due_date: t.due_date ? new Date(parseInt(t.due_date)).toISOString().slice(0, 10) : null,
+        date_created: t.date_created ? new Date(parseInt(t.date_created)).toISOString().slice(0, 10) : null,
+      })),
+    };
+  },
+
   async list_recent_actions({ limit = 10, since_hours = null, source = null, success_only = null }) {
     if (!AGENT_ACTIONS_TABLE_ID) return { error: "AGENT_ACTIONS_TABLE_ID not configured" };
     const filters = [];
@@ -619,6 +702,39 @@ const tools = [
         body_text: { type: "string", description: "Plain text body. Mutually exclusive with body_html." },
       },
       required: ["to_email", "subject"],
+    },
+  },
+  {
+    name: "list_people",
+    description:
+      "List/filter People records. Use this for 'who's onboarding right now', 'show me May 9 cohort', 'who has incomplete onboarding', 'all of Valerie's people', etc. All filters are optional and combine with AND. Returns up to 100 people with their key fields and which stages are completed/pending.",
+    input_schema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["Lead", "Prospect", "Onboarding", "Active", "Completed", "Alumni", "Paused"] },
+        cohort_name: { type: "string", description: "Exact cohort name e.g. 'May 9 2026'" },
+        payment_status: { type: "string", enum: ["Unpaid", "Deposit paid", "On payment plan", "Paid in full", "Scholarship", "Refunded"] },
+        owner: { type: "string", enum: ["Yohan", "Valerie", "Nathan"] },
+        has_pending_stage: { type: "boolean", description: "true = anyone with at least one of stages 1-8 incomplete; false = anyone fully onboarded" },
+        limit: { type: "number", description: "Max rows (default 25, max 100)" },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "list_clickup_tasks",
+    description:
+      "List ClickUp tasks across the workspace, optionally filtered by list, status, or text search. Use for 'show me recent tasks', 'what's outstanding', 'find tasks about Sarah'. Returns up to 50 tasks.",
+    input_schema: {
+      type: "object",
+      properties: {
+        list_id: { type: "string", description: "ClickUp list ID. Omit to search across workspace." },
+        search: { type: "string", description: "Case-insensitive substring match on task name/description" },
+        statuses: { type: "array", items: { type: "string" }, description: "ClickUp status names like 'to do', 'in progress'" },
+        include_closed: { type: "boolean", description: "Include closed tasks (default false)" },
+        limit: { type: "number", description: "Max tasks (default 25, max 50)" },
+      },
+      required: [],
     },
   },
   {
