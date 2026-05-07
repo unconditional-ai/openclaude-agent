@@ -21,6 +21,37 @@ Receives `{transcript, slack_context}` from n8n, runs a Claude tool-use loop aga
 - `GET /healthz` — health check
 - `POST /run` — run agent on `{transcript, slack_context: {channel, thread_ts}}`
 
+## Local development + smoke tests
+
+Run the agent locally:
+
+```bash
+cp .env.smoke.example .env.smoke   # fill in NC_TOKEN
+npm install
+npm start                          # listens on :10000
+```
+
+Run smoke tests against local agent:
+
+```bash
+./smoke-tests.sh
+```
+
+Run against production:
+
+```bash
+AGENT_URL=https://openclaude-agent.onrender.com ./smoke-tests.sh
+```
+
+The script self-cleans test records (filters by per-run suffix). Safe to run against production.
+
+Recommended workflow before pushing to main:
+
+1. Make changes locally
+2. `node --check index.js` (syntax)
+3. `./smoke-tests.sh` against local
+4. Commit + push only if 15/15 pass
+
 ## Env vars (Render)
 
 ```
