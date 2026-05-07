@@ -129,6 +129,64 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// ---------- ClickUp list discovery (lazy, cached) ----------
+// Replaces hardcoded list IDs. At first use, walks ClickUp hierarchy and caches a flat
+// list of {id, name, space, folder, path} records keyed by name. Cache TTL 1 hour.
+// On TTL expiry or first cache miss for a name, the cache is rebuilt.
+
+const CLICKUP_LIST_CACHE_TTL_MS = 60 * 60 * 1000;
+let _clickupListCache = null;
+
+async function clickupGet(url, token) {
+  const res = await fetch(url, { headers: { authorization: token } });
+  if (!res.ok) throw new Error(`ClickUp ${url}: HTTP ${res.status}`);
+  return res.json();
+}
+
+async function discoverClickUpLists() {
+  const token = process.env.CLICKUP_TOKEN;
+  if (!token) throw new Error("CLICKUP_TOKEN not set");
+  const teams = (await clickupGet("https://api.clickup.com/api/v2/team", token)).teams || [];
+  const out = [];
+  for (const team of teams) {
+    const spaces = (await clickupGet(`https://api.clickup.com/api/v2/team/${team.id}/space?archived=false`, token)).spaces || [];
+    for (const space of spaces) {
+      const folderless = (await clickupGet(`https://api.clickup.com/api/v2/space/${space.id}/list?archived=false`, token)).lists || [];
+      for (const l of folderless) {
+        out.push({ id: l.id, name: l.name, space: space.name, folder: null, path: `${space.name} / ${l.name}` });
+      }
+      const folders = (await clickupGet(`https://api.clickup.com/api/v2/space/${space.id}/folder?archived=false`, token)).folders || [];
+      for (const folder of folders) {
+        for (const l of (folder.lists || [])) {
+          out.push({ id: l.id, name: l.name, space: space.name, folder: folder.name, path: `${space.name} / ${folder.name} / ${l.name}` });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function getClickUpLists() {
+  const now = Date.now();
+  if (_clickupListCache && _clickupListCache.expires_at > now) return _clickupListCache.lists;
+  const lists = await discoverClickUpLists();
+  _clickupListCache = { lists, expires_at: now + CLICKUP_LIST_CACHE_TTL_MS };
+  console.log(`[clickup] discovered ${lists.length} lists, cached for ${CLICKUP_LIST_CACHE_TTL_MS / 60000}min`);
+  return lists;
+}
+
+function matchClickUpLists(lists, query) {
+  const q = query.toLowerCase().trim();
+  if (!q) return [];
+  const exact = lists.filter((l) => l.name.toLowerCase() === q);
+  if (exact.length) return exact;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  return lists.filter((l) => {
+    const hay = `${l.name} ${l.path}`.toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
+}
+
 // ---------- Tool implementations ----------
 
 const toolImpls = {
@@ -261,11 +319,10 @@ const toolImpls = {
       const data = await ncGet(
         `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
       );
-      if (data.list[0]) {
-        const tot = amount_total !== undefined ? amount_total : data.list[0]["Amount total"];
-        const paid = amount_paid !== undefined ? amount_paid : data.list[0]["Amount paid"];
-        if (tot != null && paid != null) updates["Amount owing"] = tot - paid;
-      }
+      if (!data.list[0]) return { error: `Person ${person_id} not found` };
+      const tot = amount_total !== undefined ? amount_total : data.list[0]["Amount total"];
+      const paid = amount_paid !== undefined ? amount_paid : data.list[0]["Amount paid"];
+      if (tot != null && paid != null) updates["Amount owing"] = tot - paid;
     }
     await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [updates]);
     return { id: person_id, updated_fields: Object.keys(updates).filter((k) => k !== "Id" && k !== "Last touch") };
@@ -394,7 +451,7 @@ const toolImpls = {
     };
   },
 
-  async list_clickup_tasks({ list_id = null, list_ids = null, search = null, statuses = null, include_closed = false, limit = 25 }) {
+  async list_clickup_tasks({ list_id = null, list_ids = null, cohort = null, search = null, statuses = null, include_closed = false, limit = 25 }) {
     const token = process.env.CLICKUP_TOKEN;
     if (!token) return { error: "CLICKUP_TOKEN not configured" };
     const teamRes = await fetch("https://api.clickup.com/api/v2/team", { headers: { authorization: token } });
@@ -403,24 +460,25 @@ const toolImpls = {
     const teamId = teams[0].id;
 
     // ClickUp's team-task endpoint returns empty without list/space/folder filters.
-    // If no list specified, default to scanning the most active lists workspace-wide.
+    // Resolve scope: explicit list_ids > list_id > cohort name (via discovery) > Daily Task Board fallback.
     let scopedListIds = list_ids;
     if (!scopedListIds && list_id) scopedListIds = [list_id];
+    if (!scopedListIds && cohort) {
+      try {
+        const lists = await getClickUpLists();
+        const matches = matchClickUpLists(lists, cohort);
+        if (matches.length === 0) {
+          return { error: `No ClickUp lists matched cohort "${cohort}". Use find_clickup_list to discover available lists.` };
+        }
+        scopedListIds = matches.map((l) => l.id);
+      } catch (e) {
+        return { error: `Failed to resolve cohort lists: ${e.message}` };
+      }
+    }
     if (!scopedListIds) {
-      // Default search scope: high-traffic lists across UST programs
-      scopedListIds = [
-        "901613028919", // Operations · BAU · Daily Task Board
-        "901613217899", // 2026 UST Programs · May 9-week · 👥People
-        "901613218193", // Feb 35-day · Enrollments
-        "901613218192", // Feb 35-day · Onboarded
-        "901613217869", // Mar 35-day · Enrollments
-        "901613217867", // Mar 35-day · Pre-Program
-        "901613217871", // Mar 35-day · Onboarded
-        "901613217890", // April 35-day · Enrollments
-        "901613217886", // April 35-day · Onboarded
-        "901613218209", // June 35-day · Enrollments
-        "901613218203", // June 35-day · Onboarded
-      ];
+      const dailyId = process.env.CLICKUP_DAILY_TASK_LIST_ID;
+      if (!dailyId) return { error: "No list_id/list_ids/cohort given and CLICKUP_DAILY_TASK_LIST_ID not set" };
+      scopedListIds = [dailyId];
     }
 
     const params = new URLSearchParams();
@@ -513,6 +571,20 @@ const toolImpls = {
       return { error: `ClickUp ${res.status}: ${data.err || data.error || JSON.stringify(data)}` };
     }
     return { task_id, deleted: true };
+  },
+
+  async find_clickup_list({ query }) {
+    let lists;
+    try {
+      lists = await getClickUpLists();
+    } catch (e) {
+      return { error: `Failed to discover ClickUp lists: ${e.message}` };
+    }
+    const matches = matchClickUpLists(lists, query);
+    return {
+      matches: matches.map((l) => ({ id: l.id, name: l.name, path: l.path })),
+      total_lists_in_workspace: lists.length,
+    };
   },
 
   async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null }) {
@@ -630,7 +702,11 @@ const toolImpls = {
           [{ Id: person_id }]
         );
       } catch (e) {
-        return { id: touchpointId, person_link_error: e.message };
+        return {
+          ok: false,
+          error: `Touchpoint ${touchpointId} created but failed to link to person ${person_id}: ${e.message}`,
+          partial: { touchpoint_id: touchpointId, link_failed: true },
+        };
       }
     }
     return { id: touchpointId, person_id: person_id || null };
@@ -767,18 +843,33 @@ const tools = [
   {
     name: "list_clickup_tasks",
     description:
-      "List ClickUp tasks across the workspace, optionally filtered by list, status, or text search. When to use: 'show me recent tasks', 'what's outstanding', 'find tasks about Sarah', 'any open follow-ups'. When NOT to use: for People/participant queries (use list_people), for agent activity (use list_recent_actions).",
+      "List ClickUp tasks, optionally filtered by list, cohort, status, or text search. When to use: 'show me recent tasks', 'what's outstanding', 'find tasks about Sarah', 'any open follow-ups'. Pass cohort='May 9 2026' (or any cohort/program name fragment) to scope to that cohort's lists — discovered dynamically, no hardcoded IDs. With no list_id/list_ids/cohort, defaults to the Daily Task Board only. When NOT to use: for People/participant queries (use list_people), for agent activity (use list_recent_actions).",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
-        list_id: { type: "string", description: "ClickUp list ID. Omit to search across workspace." },
+        list_id: { type: "string", description: "Specific ClickUp list ID. Use when you already know the exact list." },
+        list_ids: { type: "array", items: { type: "string" }, description: "Multiple ClickUp list IDs to search at once." },
+        cohort: { type: "string", description: "Cohort/program name fragment (e.g. 'May 9 2026', 'July 35-day', 'Daily Task Board'). Resolves to list IDs via discovery — preferred over hardcoded list_id when the user names a cohort." },
         search: { type: "string", description: "Case-insensitive substring match on task name/description" },
         statuses: { type: "array", items: { type: "string" }, description: "ClickUp status names like 'to do', 'in progress'" },
         include_closed: { type: "boolean", description: "Include closed tasks (default false)" },
         limit: { type: "number", description: "Max tasks (default 25, max 50)" },
       },
       required: [],
+    },
+  },
+  {
+    name: "find_clickup_list",
+    description:
+      "Find ClickUp list IDs by name fragment via dynamic discovery (no hardcoded IDs). When to use: you need a specific list's ID and don't have it (e.g. 'is there a list for the July cohort?', 'find the Pre-Program list', 'what enrolment lists exist?'). Returns matches with id + name + full hierarchy path. Cached 1 hour. When NOT to use: list_clickup_tasks's `cohort` param can resolve names internally — only call find_clickup_list separately if you want to inspect what's available before searching.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Name fragment to match (e.g. 'May 9 People', '35-day onboarded'). Case-insensitive, fuzzy multi-word — every token must appear in name or path." },
+      },
+      required: ["query"],
     },
   },
   {
@@ -1010,7 +1101,7 @@ QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
 - "Show me current participants / give me the roster / who's where in onboarding" → list_people. The roster lives in the People table, not the audit log.
 - "What did you (the agent) do today / show me recent activity / what was the last thing you ran" → list_recent_actions.
-- "What ClickUp tasks are open / find tasks about X / show me follow-ups" → list_clickup_tasks.
+- "What ClickUp tasks are open / find tasks about X / show me follow-ups" → list_clickup_tasks. For cohort-specific searches ("any tasks for July cohort?"), pass the cohort parameter (e.g. cohort='May 9 2026') — list IDs are discovered dynamically, not hardcoded. Use find_clickup_list when you need to inspect what cohort/program lists exist.
 - "Tell me about [specific person]" → lookup_person (by email if given, else fuzzy by name).
 
 The audit log is for "what did the AGENT do". The People table is for "who are the participants". Don't confuse them. If a question is about people/data, use list_people or lookup_person.
@@ -1020,9 +1111,10 @@ Every voice note, @mention, and DM you handle is automatically logged to the Age
 
 CONVERSATION CONTEXT:
 When you're responding to a Slack message, the transcript may include prior context under a "## Thread context" or "## Recent channel context" heading, followed by "## Current message to act on" with the latest message. Use the prior context to resolve references like "that person", "what we just discussed", "the same thing again". Treat the thread context as a real conversation history — your previous replies (labeled "Compass:") are yours; messages from named users are theirs. If the current message obviously builds on prior turns, don't re-ask things already answered.
+If the transcript starts with "## Context status" (instead of "## Thread context" or "## Recent channel context"), Slack context fetching failed — the user may be referencing prior messages you genuinely can't see. Ask them for a brief summary if the current message is ambiguous, rather than guessing.
 
 QUESTIONS / DECISIONS NEEDED:
-When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list 901613028919) instead of using ask_for_clarification. Title prefix: "❓". Examples:
+When you encounter ambiguity or a decision that needs a human but ISN'T blocking the current voice-note action, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification. Title prefix: "❓". Examples:
 - User says "we should probably standardise the cohort email format" — that's a decision for Yohan, not blocking. Create a ❓ task.
 - During a person.upsert, if you notice the email looks wrong but you can still complete the action — create a ❓ task to follow up, but proceed.
 Use ask_for_clarification ONLY when you cannot proceed without an answer (e.g., "Reach out to Daniel" with no Daniel in the system).
@@ -1154,7 +1246,11 @@ async function postToSlack(channel, text, threadTs = null) {
     },
     body: JSON.stringify(body),
   });
-  return res.json();
+  const data = await res.json();
+  // Slack returns HTTP 200 even on logical failures (channel_not_found, not_in_channel, etc).
+  // Throw so the call-site try/catch can log it instead of pretending the post succeeded.
+  if (!data.ok) throw new Error(`Slack chat.postMessage failed: ${data.error || JSON.stringify(data)}`);
+  return data;
 }
 
 // Generic Slack Web API call (GET-style with query string).
@@ -1215,40 +1311,43 @@ async function formatSlackMessages(messages, botId) {
 }
 
 // Fetch full thread (parent + replies) when the user is responding inside a thread.
+// Throws on Slack errors so the caller can surface them to the agent (rather than silently returning empty).
 async function fetchThreadContext(channel, threadTs, limit = 30) {
-  try {
-    const data = await slackApi("conversations.replies", { channel, ts: threadTs, limit });
-    const botId = await getBotUserId();
-    return await formatSlackMessages(data.messages || [], botId);
-  } catch (e) {
-    console.error("[slack] thread fetch failed:", e.message);
-    return "";
-  }
+  const data = await slackApi("conversations.replies", { channel, ts: threadTs, limit });
+  const botId = await getBotUserId();
+  return await formatSlackMessages(data.messages || [], botId);
 }
 
 // Fetch recent channel messages (top-level only) for context when the user posts at the channel level.
+// Throws on Slack errors so the caller can surface them to the agent.
 async function fetchRecentChannelContext(channel, limit = 8) {
-  try {
-    const data = await slackApi("conversations.history", { channel, limit });
-    const botId = await getBotUserId();
-    // Reverse to chronological (Slack returns newest-first)
-    const messages = (data.messages || []).slice().reverse();
-    return await formatSlackMessages(messages, botId);
-  } catch (e) {
-    console.error("[slack] channel history fetch failed:", e.message);
-    return "";
-  }
+  const data = await slackApi("conversations.history", { channel, limit });
+  const botId = await getBotUserId();
+  // Reverse to chronological (Slack returns newest-first)
+  const messages = (data.messages || []).slice().reverse();
+  return await formatSlackMessages(messages, botId);
 }
 
 // Wrap the user's transcript with relevant Slack context so the agent isn't blind to prior messages.
 // If thread_ts is set, fetches the thread. Otherwise fetches recent channel messages.
+// On fetch failure, prepends a "context status" note so the agent knows context was unavailable
+// (vs. simply absent) and can ask the user to re-summarize if needed.
 async function enrichTranscriptWithContext(transcript, slackContext) {
   if (!slackContext?.channel) return transcript;
   let context = "";
-  if (slackContext.thread_ts) {
-    context = await fetchThreadContext(slackContext.channel, slackContext.thread_ts);
-  } else {
-    context = await fetchRecentChannelContext(slackContext.channel);
+  let contextNote = null;
+  try {
+    if (slackContext.thread_ts) {
+      context = await fetchThreadContext(slackContext.channel, slackContext.thread_ts);
+    } else {
+      context = await fetchRecentChannelContext(slackContext.channel);
+    }
+  } catch (e) {
+    console.error("[slack] context fetch failed:", e.message);
+    contextNote = `Prior Slack context could not be fetched (${e.message}). The user may be referring to earlier messages I can't see — ask for a quick summary if their message is ambiguous.`;
+  }
+  if (contextNote) {
+    return `## Context status\n${contextNote}\n\n## Current message to act on\n${transcript}`;
   }
   if (!context) return transcript;
   const label = slackContext.thread_ts ? "Thread context (chronological — most recent last)" : "Recent channel context (chronological)";
@@ -1261,37 +1360,6 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
-
-// ---------- Admin: one-off introspection (no auth, remove later) ----------
-
-app.get("/admin/clickup-structure", async (_req, res) => {
-  const token = process.env.CLICKUP_TOKEN;
-  if (!token) return res.status(400).json({ error: "CLICKUP_TOKEN not set" });
-  const headers = { authorization: token };
-  const teamsRes = await fetch("https://api.clickup.com/api/v2/team", { headers });
-  const teams = (await teamsRes.json()).teams || [];
-  const out = { teams: [] };
-  for (const team of teams) {
-    const spaces = ((await fetch(`https://api.clickup.com/api/v2/team/${team.id}/space?archived=false`, { headers }).then((r) => r.json())).spaces) || [];
-    const teamData = { id: team.id, name: team.name, spaces: [] };
-    for (const space of spaces) {
-      const folders = ((await fetch(`https://api.clickup.com/api/v2/space/${space.id}/folder?archived=false`, { headers }).then((r) => r.json())).folders) || [];
-      const folderless = ((await fetch(`https://api.clickup.com/api/v2/space/${space.id}/list?archived=false`, { headers }).then((r) => r.json())).lists) || [];
-      teamData.spaces.push({
-        id: space.id,
-        name: space.name,
-        folders: folders.map((f) => ({
-          id: f.id,
-          name: f.name,
-          lists: (f.lists || []).map((l) => ({ id: l.id, name: l.name })),
-        })),
-        folderless_lists: folderless.map((l) => ({ id: l.id, name: l.name })),
-      });
-    }
-    out.teams.push(teamData);
-  }
-  res.json(out);
-});
 
 // ---------- Google OAuth (Gmail) ----------
 
@@ -1337,7 +1405,14 @@ app.get("/oauth/google/callback", async (req, res) => {
   });
   const tok = await tokenRes.json();
   if (!tokenRes.ok || !tok.refresh_token) {
-    return res.status(500).send(`Token exchange failed: ${JSON.stringify(tok)}`);
+    // Don't echo the raw response — it can contain access_token / refresh_token even on partial errors.
+    const safe = {
+      status: tokenRes.status,
+      error: tok.error,
+      error_description: tok.error_description,
+      has_refresh_token: !!tok.refresh_token,
+    };
+    return res.status(500).send(`Token exchange failed: ${JSON.stringify(safe)}`);
   }
 
   // Render the refresh token in plain HTML so the operator can copy it once.
