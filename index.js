@@ -688,6 +688,68 @@ const toolImpls = {
     return result;
   },
 
+  async update_clickup_task({ task_id, name = null, description = null, priority = null, due_date = null, status = null, add_assignees = null, remove_assignees = null }) {
+    const token = process.env.CLICKUP_TOKEN;
+    if (!token) return { error: "CLICKUP_TOKEN not configured on server" };
+
+    const body = {};
+    if (name != null) body.name = name;
+    if (description != null) {
+      const normalized = description
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t");
+      body.description = normalized;
+      body.markdown_content = normalized;
+    }
+    if (priority != null) body.priority = priority;
+    if (due_date != null) body.due_date = new Date(due_date).getTime();
+    if (status != null) body.status = status;
+
+    // ClickUp's PUT /task accepts assignees as { add: [...], rem: [...] }, NOT a flat array.
+    const unresolved = [];
+    if ((Array.isArray(add_assignees) && add_assignees.length) ||
+        (Array.isArray(remove_assignees) && remove_assignees.length)) {
+      let users;
+      try {
+        users = await getClickUpUsers();
+      } catch (e) {
+        return { error: `Failed to resolve assignees: ${e.message}` };
+      }
+      const resolveList = (arr) => {
+        const ids = [];
+        for (const a of arr || []) {
+          if (typeof a === "number" || /^\d+$/.test(String(a))) {
+            ids.push(Number(a));
+            continue;
+          }
+          const id = resolveClickUpAssignee(users, a);
+          if (id) ids.push(Number(id));
+          else unresolved.push(a);
+        }
+        return ids;
+      };
+      const add = resolveList(add_assignees);
+      const rem = resolveList(remove_assignees);
+      if (add.length || rem.length) body.assignees = { add, rem };
+    }
+
+    if (Object.keys(body).length === 0) {
+      return { error: "Provide at least one field to update (name, description, priority, due_date, status, add_assignees, remove_assignees)" };
+    }
+
+    const res = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
+      method: "PUT",
+      headers: { authorization: token, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `ClickUp ${res.status}: ${data.err || data.error || JSON.stringify(data)}` };
+    const result = { id: data.id, url: data.url, name: data.name, updated_fields: Object.keys(body) };
+    if (unresolved.length > 0) result.unresolved_assignees = unresolved;
+    return result;
+  },
+
   async update_person({ person_id, fields }) {
     const payload = { Id: person_id, ...fields, "Last touch": todayISO() };
     const updated = await ncPatch(`/api/v2/tables/${PEOPLE_TABLE_ID}/records`, [payload]);
@@ -1067,6 +1129,34 @@ const tools = [
         },
       },
       required: ["name"],
+    },
+  },
+  {
+    name: "update_clickup_task",
+    description:
+      "Update an existing ClickUp task. When to use: change assignees ('reassign to me'), edit name/description/priority/due date/status, or add/remove people. When NOT to use: to mark complete (let the user close it), to delete (use delete_clickup_task). Pass only the fields you want to change. Assignees use friendly names ('nathan', 'yohan', 'valerie') or numeric IDs. Use add_assignees + remove_assignees rather than replacing — ClickUp's API requires the add/remove pattern for assignee changes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "ClickUp task ID (after /t/ in the URL)" },
+        name: { type: "string", description: "New task title" },
+        description: { type: "string", description: "New markdown body. Use real newlines." },
+        priority: { type: "number", enum: [1, 2, 3, 4], description: "1=urgent, 2=high, 3=normal, 4=low" },
+        due_date: { type: "string", description: "ISO 8601 date or datetime" },
+        status: { type: "string", description: "ClickUp status name (e.g. 'in progress', 'complete')" },
+        add_assignees: {
+          type: "array",
+          items: { type: "string" },
+          description: "Names or numeric IDs to ADD as assignees.",
+        },
+        remove_assignees: {
+          type: "array",
+          items: { type: "string" },
+          description: "Names or numeric IDs to REMOVE.",
+        },
+      },
+      required: ["task_id"],
     },
   },
   {
