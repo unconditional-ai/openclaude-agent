@@ -920,6 +920,177 @@ const toolImpls = {
     const ids = (Array.isArray(created) ? created : [created]).map((r) => r.Id ?? r.id);
     return { table_id, count: ids.length, ids };
   },
+
+  // Phone numbers are stored in varied formats ("+61 400 555 090", "0400555090",
+  // "+61400555090"). NocoDB's "like" filter is exact substring against stored bytes,
+  // so we try a few variants of the query against the Phone column. Returns matching
+  // people in the same shape as lookup_person.
+  async find_person_by_phone({ query }) {
+    const raw = String(query || "").trim();
+    if (!raw) return { error: "query required" };
+    const stripped = raw.replace(/\D/g, "");
+    const variants = new Set();
+    if (raw) variants.add(raw);
+    if (stripped && stripped.length >= 6) variants.add(stripped);
+    // Australian numbers: try with and without +61 country prefix
+    if (stripped.startsWith("0") && stripped.length === 10) variants.add("61" + stripped.slice(1));
+    if (stripped.startsWith("61") && stripped.length === 11) variants.add("0" + stripped.slice(2));
+    // Last 7 digits as a final fallback (works only if stored value has no spaces)
+    if (stripped.length >= 7) variants.add(stripped.slice(-7));
+
+    const tried = [];
+    for (const v of variants) {
+      tried.push(v);
+      const where = `(Phone,like,%${v}%)`;
+      const data = await ncGet(
+        `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(where)}&limit=10`
+      );
+      if (data.list && data.list.length > 0) {
+        return {
+          found: true,
+          count: data.list.length,
+          matched_variant: v,
+          matches: data.list.map((p) => ({
+            id: p.Id,
+            name: p.Name,
+            email: p["Primary email"],
+            phone: p.Phone,
+            status: p.Status,
+            cohort: p["Cohort name"] || null,
+          })),
+        };
+      }
+    }
+    return { found: false, query: raw, variants_tried: tried };
+  },
+
+  // Returns a single person's full state — fields, payment, stages, cohort, notes.
+  // Saves the agent from chaining lookup_person + a follow-up record fetch.
+  async get_person_full({ person_id }) {
+    const data = await ncGet(
+      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+    );
+    if (!data.list || !data.list[0]) return { error: `Person ${person_id} not found` };
+    const p = data.list[0];
+    const stages = STAGE_ORDER.reduce((acc, s) => {
+      acc[s] = !!p[STAGE_COLUMN_MAP[s]];
+      return acc;
+    }, {});
+    return {
+      id: p.Id,
+      name: p.Name,
+      email: p["Primary email"],
+      phone: p.Phone,
+      status: p.Status,
+      owner: p.Owner,
+      source: p.Source,
+      cohort: p["Cohort name"] || null,
+      timezone: p.Timezone,
+      payment: {
+        status: p["Payment status"] || null,
+        total: p["Amount total"] ?? null,
+        paid: p["Amount paid"] ?? null,
+        owing: p["Amount owing"] ?? null,
+        risk: p["Payment risk"] || null,
+      },
+      stages,
+      next_action: p["Next action"] || null,
+      room: p.Room || null,
+      notes: p.Notes || null,
+      last_touch: p["Last touch"] || null,
+      created_at: p.CreatedAt || null,
+    };
+  },
+
+  // Drafts a Gmail with an .ics calendar attachment for an onboarding (or other) call.
+  // Reuses the existing gmail.compose OAuth scope — no Calendar API needed. Yohan
+  // reviews + sends from his Gmail like any other draft.
+  async draft_calendar_invite_email({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null }) {
+    if (!datetime) return { error: "datetime required (ISO 8601)" };
+    const startUTC = new Date(datetime);
+    if (isNaN(startUTC.getTime())) return { error: `Invalid datetime: ${datetime}` };
+    if (!Number.isFinite(duration_minutes) || duration_minutes <= 0 || duration_minutes > 480) {
+      return { error: "duration_minutes must be between 1 and 480" };
+    }
+    const endUTC = new Date(startUTC.getTime() + duration_minutes * 60000);
+
+    const data = await ncGet(
+      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+    );
+    if (!data.list || !data.list[0]) return { error: `Person ${person_id} not found` };
+    const p = data.list[0];
+    const recipientName = p.Name || "there";
+    const recipientEmail = p["Primary email"];
+    if (!recipientEmail) return { error: `Person ${person_id} has no Primary email` };
+
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    const fromAddress = await getGmailFromAddress(accessToken);
+
+    const finalTitle = title || `UST Onboarding Call with ${recipientName}`;
+    const finalDescription =
+      description ||
+      `${duration_minutes}-minute onboarding call to kick off your UST 9-week training. Looking forward to it.`;
+    const uid = `compass-${Date.now()}-${Math.random().toString(36).slice(2)}@unconditional.earth`;
+    const ics = buildICS({
+      uid,
+      startUTC,
+      endUTC,
+      title: finalTitle,
+      description: finalDescription,
+      organizerName: "Yohan Dante",
+      organizerEmail: fromAddress,
+      attendeeName: recipientName,
+      attendeeEmail: recipientEmail,
+      location,
+    });
+
+    // Format the time for the email body in AU-friendly form (Brisbane TZ).
+    const formattedTime = startUTC.toLocaleString("en-AU", {
+      dateStyle: "full",
+      timeStyle: "short",
+      timeZone: "Australia/Brisbane",
+    });
+    const html = `<div style="font-family:system-ui,arial;font-size:15px;line-height:1.6;color:#222">
+<p>Hi ${recipientName},</p>
+<p>Confirming our ${duration_minutes}-minute onboarding call:</p>
+<p><strong>${formattedTime}</strong> (Brisbane time)</p>
+${location ? `<p>Location: ${location}</p>` : ""}
+<p>I've attached a calendar invite — clicking it will add the event to your calendar.</p>
+<p>Looking forward to it.</p>
+<p>— Yohan</p>
+</div>`;
+
+    const raw = buildCalendarInviteMime({
+      from: `Yohan Dante <${fromAddress}>`,
+      to: `${recipientName} <${recipientEmail}>`,
+      subject: finalTitle,
+      html,
+      ics,
+    });
+
+    const draftRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ message: { raw } }),
+    });
+    const draftData = await draftRes.json();
+    if (!draftRes.ok) return { error: `Gmail draft failed: ${JSON.stringify(draftData)}` };
+    return {
+      person_id,
+      draft_id: draftData.id,
+      to: recipientEmail,
+      subject: finalTitle,
+      start_utc: startUTC.toISOString(),
+      end_utc: endUTC.toISOString(),
+      duration_minutes,
+      gmail_url: `https://mail.google.com/mail/u/0/#drafts/${draftData.id}`,
+    };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1345,6 +1516,45 @@ const tools = [
         },
       },
       required: ["table_id", "records"],
+    },
+  },
+  {
+    name: "find_person_by_phone",
+    description: "Find People records matching a phone number. When to use: voice transcript mentions a phone number (e.g. 'plus six one four hundred...' becomes '+61 400...'). Tries the query as-given, with non-digits stripped, with/without +61 country code, and last-7-digits as a fallback. When NOT to use: use lookup_person for email/name searches.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Phone number in any format. Will try several normalisations." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "get_person_full",
+    description: "Fetch one person's full state in a single call: identity, payment, all 10 onboarding stages as booleans, cohort, owner, notes, last touch. When to use: you need the complete picture of a person (e.g. 'where is Sarah at?'). Saves chaining lookup_person + a follow-up record fetch. When NOT to use: for searching across multiple people (use list_people / lookup_person).",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: { person_id: { type: "number" } },
+      required: ["person_id"],
+    },
+  },
+  {
+    name: "draft_calendar_invite_email",
+    description: "Draft a Gmail with an .ics calendar attachment for an onboarding (or other) call. The recipient gets an email with the calendar event attached — clicking it adds to their calendar. When to use: 'schedule onboarding call with Sarah for Tuesday 3pm', 'send Joseph a calendar invite for Monday'. When NOT to use: for a draft email without calendar (use draft_email or send_welcome_email). Yohan reviews + sends from his Gmail like any other draft. The draft creates an .ics with REQUEST method, suitable for adding to most calendar apps.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        person_id: { type: "number", description: "NocoDB People record ID. Looked up to get name + email." },
+        datetime: { type: "string", description: "ISO 8601 datetime for the call start (e.g. '2026-05-13T14:00:00+10:00' or '2026-05-13T04:00:00Z'). Include timezone." },
+        duration_minutes: { type: "number", description: "Default 45." },
+        title: { type: "string", description: "Default: 'UST Onboarding Call with [Name]'." },
+        description: { type: "string", description: "Default: short onboarding-call description." },
+        location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
+      },
+      required: ["person_id", "datetime"],
     },
   },
 ];
@@ -1885,6 +2095,88 @@ function buildMimeMessage({ from, to, subject, html, replyTo = null }) {
   ].join("\r\n");
   const raw = headers.join("\r\n") + "\r\n\r\n" + body;
   // Gmail API wants base64url
+  return Buffer.from(raw, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Format a Date as the ICS local-UTC timestamp (YYYYMMDDTHHMMSSZ).
+function formatICSDate(d) {
+  return d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+// Escape a string for inclusion in an ICS field per RFC 5545 §3.3.11.
+function escapeICS(s) {
+  return String(s || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/;/g, "\\;")
+    .replace(/,/g, "\\,")
+    .replace(/\n/g, "\\n");
+}
+
+// Build a minimal RFC 5545 VCALENDAR/VEVENT for an onboarding invite.
+function buildICS({ uid, startUTC, endUTC, title, description, organizerName, organizerEmail, attendeeName, attendeeEmail, location }) {
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Compass//Onboarding//EN",
+    "METHOD:REQUEST",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    `DTSTAMP:${formatICSDate(new Date())}`,
+    `DTSTART:${formatICSDate(startUTC)}`,
+    `DTEND:${formatICSDate(endUTC)}`,
+    `SUMMARY:${escapeICS(title)}`,
+    `DESCRIPTION:${escapeICS(description)}`,
+    `ORGANIZER;CN=${escapeICS(organizerName)}:mailto:${organizerEmail}`,
+    `ATTENDEE;CN=${escapeICS(attendeeName)};RSVP=TRUE;PARTSTAT=NEEDS-ACTION:mailto:${attendeeEmail}`,
+  ];
+  if (location) lines.push(`LOCATION:${escapeICS(location)}`);
+  lines.push("STATUS:CONFIRMED", "END:VEVENT", "END:VCALENDAR");
+  return lines.join("\r\n");
+}
+
+// Build a multipart/mixed MIME message containing both an HTML/plain body and
+// an ICS attachment, suitable for Gmail's drafts.create endpoint.
+function buildCalendarInviteMime({ from, to, subject, html, ics }) {
+  const outer = `_o_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  const inner = `_i_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  const text = html.replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  const headers = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/mixed; boundary="${outer}"`,
+  ];
+  const body = [
+    `--${outer}`,
+    `Content-Type: multipart/alternative; boundary="${inner}"`,
+    "",
+    `--${inner}`,
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    text,
+    "",
+    `--${inner}`,
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: 7bit",
+    "",
+    html,
+    "",
+    `--${inner}--`,
+    "",
+    `--${outer}`,
+    'Content-Type: text/calendar; method=REQUEST; charset=UTF-8; name="invite.ics"',
+    "Content-Transfer-Encoding: 7bit",
+    'Content-Disposition: attachment; filename="invite.ics"',
+    "",
+    ics,
+    "",
+    `--${outer}--`,
+    "",
+  ].join("\r\n");
+  const raw = headers.join("\r\n") + "\r\n\r\n" + body;
   return Buffer.from(raw, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
