@@ -1592,6 +1592,17 @@ const tools = [
     },
   },
   {
+    name: "stay_silent",
+    description: "Terminate the agent loop WITHOUT posting any reply to Slack. When to use: the triggering message contains 'compass' but clearly isn't addressed to you ('we need a moral compass', 'lost my compass app on phone', 'compass directional reading'), OR you have nothing genuinely useful to add to a conversation you've been pulled into. The user gets no notification, no message — Compass simply observes and stays out. When NOT to use: when the user is asking you something, even if you can't fully complete the task. Always prefer ask_for_clarification or a brief reply over staying silent if the user is asking you anything. Pass `reason` for the audit trail.",
+    input_schema: {
+      type: "object",
+      properties: {
+        reason: { type: "string", description: "Why you're staying silent. Captured in the audit log only — never sent to the user." },
+      },
+      required: ["reason"],
+    },
+  },
+  {
     name: "list_skills",
     description:
       "List available Skills (workflow playbooks, voice/style guides, process docs). When to use: at the start of complex multi-step work to discover relevant guidance, or when the user references an established process. Skills hold knowledge that doesn't fit in the system prompt and loads on-demand. Returns each skill's name + one-sentence description.",
@@ -1845,6 +1856,10 @@ You have a knowledge store for facts that span sessions — URLs, processes, def
 CONVERSATION CONTEXT:
 When you're responding to a Slack message, the transcript may include prior context under a "## Thread context" or "## Recent channel context" heading, followed by "## Current message to act on" with the latest message. Use the prior context to resolve references like "that person", "what we just discussed", "the same thing again". Treat the thread context as a real conversation history — your previous replies (labeled "Compass:") are yours; messages from named users are theirs. If the current message obviously builds on prior turns, don't re-ask things already answered.
 If the transcript starts with "## Context status" (instead of "## Thread context" or "## Recent channel context"), Slack context fetching failed — the user may be referencing prior messages you genuinely can't see. Ask them for a brief summary if the current message is ambiguous, rather than guessing.
+If the thread context contains your own past error messages (e.g. "⚠️ Error: ..."), those are PAST failures from a since-fixed bug. Don't repeat them, don't apologise for them at length — just continue from the user's most recent ask as if the errors didn't happen. A brief acknowledgement is fine ("I see I had some issues earlier — those should be sorted now") but don't dwell.
+
+WHEN NOT TO RESPOND (stay_silent):
+You're triggered by @-mentions, DMs, thread-replies in threads you've previously posted in, AND any channel message that mentions the word "compass" (case-insensitive). The last category sometimes catches messages that aren't actually addressed to you — phrases like "we need a moral compass" or "lost my compass app on my phone". When you can clearly tell the message is NOT addressed to you, call the stay_silent tool with a short reason. The agent loop terminates without posting anything to Slack — silently observed, no noise. Use this conservatively: if there's any chance the user is asking you something, prefer ask_for_clarification or a brief reply.
 
 QUESTIONS / DECISIONS NEEDED:
 When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification.
@@ -1953,6 +1968,22 @@ async function runAgent(transcript) {
         clarification_needed: true,
         question: clarification.input.question,
         summary: clarification.input.question,
+        iterations: iteration,
+        trace,
+      };
+    }
+
+    // Check for stay_silent — terminate loop early WITHOUT posting to Slack.
+    // Used when the trigger message wasn't actually directed at Compass (false-
+    // positive name match) or there's nothing useful to add. The /run handler
+    // checks result.silent and skips the postToSlack call.
+    const silent = toolUseBlocks.find((b) => b.name === "stay_silent");
+    if (silent) {
+      trace.push({ tool: "stay_silent", input: silent.input });
+      return {
+        ok: true,
+        silent: true,
+        summary: `(silent: ${silent.input.reason || "no reason given"})`,
         iterations: iteration,
         trace,
       };
@@ -2487,8 +2518,8 @@ app.post("/run", async (req, res) => {
   // Audit log — fire-and-forget, don't block the response on it
   logAgentAction({ transcript, slack_context, result, elapsedMs });
 
-  // Reply to Slack if context provided
-  if (slack_context?.channel) {
+  // Reply to Slack if context provided AND the agent didn't explicitly choose silence.
+  if (slack_context?.channel && !result.silent) {
     const prefix = result.ok ? ":white_check_mark:" : (result.clarification_needed ? ":thinking_face:" : ":warning:");
     const summary = result.summary || "Done.";
     const trailer = result.trace?.length
@@ -2499,6 +2530,8 @@ app.post("/run", async (req, res) => {
     } catch (e) {
       console.error(`[slack] post failed:`, e);
     }
+  } else if (result.silent) {
+    console.log(`[agent] stayed silent: ${result.summary}`);
   }
 
   res.json({ ...result, elapsedMs });
