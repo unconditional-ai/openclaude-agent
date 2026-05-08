@@ -1787,7 +1787,9 @@ const tools = [
 
 // ---------- System prompt ----------
 
-const SYSTEM_PROMPT = `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
+// Built fresh per /run so today's date doesn't freeze at module-load time.
+// Cache rebuilds once per UTC day (when the date string changes); negligible cost.
+const buildSystemPrompt = () => `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
 
 You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
 
@@ -1889,6 +1891,12 @@ DON'T use "❓" prefix for action items, even if they're for a human. Use a plai
 
 Use ask_for_clarification ONLY when you cannot proceed without an answer (e.g., "Reach out to Daniel" with no Daniel in the system).
 
+VOICE INPUT:
+When the transcript starts with "## Source: voice transcript", you're seeing speech-to-text output (Deepgram). Be forgiving with phonetic near-misses on names — "Yohan" might come back as "you on", "Valerie" as "Valery", participant names spelled phonetically. When a name doesn't exact-match in the People table, retry lookup_person with type='name' and a partial fragment. Phone numbers and emails are mostly handled by Deepgram's smart_format, but light cleanup is sometimes needed; cross-reference with existing records when something looks slightly off rather than failing.
+
+BULK MUTATIONS:
+For mutations affecting more than ~5 records (e.g. "mark all May 9 cohort participants as deposit paid"), summarise the planned action and ask for confirmation before executing. For single-record mutations, act directly.
+
 EMAIL TRANSCRIPTION REPAIR:
 Voice transcripts often mangle emails — "at" becomes ".", "dot" stays as "dot" or ".", and "@" is frequently dropped. If you see something that looks like an email but is missing "@" (e.g. "eva.k.gmail.com" or "sarah dot lee dot example dot com"), reasonably reconstruct it. Common pattern: the LAST domain-like segment (gmail.com, example.com, etc.) is the domain, and "@" goes right before it. So "eva.k.gmail.com" → "eva.k@gmail.com". Never invent emails entirely, but DO repair obvious transcription corruption.
 
@@ -1910,19 +1918,14 @@ FORMATTING:
 Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with single asterisks, _italic_ with underscores, no markdown headings. Don't use **double-asterisk bold** or # headings.
 
 SLACK MENTIONS (notify the right person):
-Known team Slack user IDs — use the <@USER_ID> syntax to ping them in Slack so they get a notification:
+Known team Slack user IDs — use the <@USER_ID> syntax to ping them so they get a notification:
 - Yohan: <@${process.env.YOHAN_SLACK_ID || "set YOHAN_SLACK_ID env"}>
 - Valerie: <@${process.env.VALERIE_SLACK_ID || "set VALERIE_SLACK_ID env"}>
 - Nathan: <@${process.env.NATHAN_SLACK_ID || "set NATHAN_SLACK_ID env"}>
 
-When to @-mention them: only when your reply asks them (or recommends they) take an action ("Valerie should call Joseph", "Yohan, please confirm the deposit"). Use the mention in place of (or alongside) their name — e.g. write "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number" instead of just "Valerie should prioritise...". The mention pings them; the bare name doesn't.
+@-mention them when your reply recommends they take an action — e.g. "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
 
-When NOT to @-mention them:
-- Casual references ("the call Yohan ran on Tuesday")
-- Reporting on their past actions ("Valerie marked the deposit paid")
-- When the speaker IS that person (don't @ Yohan if Yohan is the one talking to you)
-- Don't @ participants/clients — they aren't in this Slack workspace
-- Don't @ anyone else by guessing — only the IDs listed above are known.`;
+For everything else, refer to them by bare name without the @ — casual references ("the call Yohan ran on Tuesday"), reports of past actions ("Valerie marked the deposit paid"), and replies to the person who's talking to you (no need to @ Yohan when Yohan is asking the question). Participants and clients aren't in this workspace, so refer to them by name only. Stick to the three IDs above; for anyone else, use plain names.`;
 
 // ---------- Agent loop ----------
 
@@ -1960,7 +1963,7 @@ async function runAgent(transcript) {
       model: AGENT_MODEL,
       max_tokens: 2048,
       system: [
-        { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+        { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
       ],
       tools: cachedTools,
       messages,
@@ -2525,6 +2528,12 @@ app.post("/run", async (req, res) => {
     } catch (e) {
       console.error(`[agent] context enrichment failed (continuing with raw transcript):`, e.message);
     }
+  }
+  // n8n's voice path passes file_id in slack_context. Mark the transcript so the
+  // agent knows it's looking at speech-to-text output and can be forgiving about
+  // phonetic near-misses on names, garbled emails, etc.
+  if (slack_context?.file_id) {
+    enrichedTranscript = `## Source: voice transcript\n\n${enrichedTranscript}`;
   }
   let result;
   try {
