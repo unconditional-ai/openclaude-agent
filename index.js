@@ -188,6 +188,49 @@ function matchClickUpLists(lists, query) {
   });
 }
 
+// ---------- ClickUp user discovery (lazy, cached) ----------
+// Used by create_clickup_task to resolve friendly names ("nathan", "yohan", "valerie")
+// to ClickUp user IDs for the assignees parameter. Same TTL/refresh semantics as the
+// list cache.
+
+let _clickupUserCache = null;
+
+async function getClickUpUsers() {
+  const now = Date.now();
+  if (_clickupUserCache && _clickupUserCache.expires_at > now) return _clickupUserCache.users;
+  const token = process.env.CLICKUP_TOKEN;
+  if (!token) throw new Error("CLICKUP_TOKEN not set");
+  const teams = (await clickupGet("https://api.clickup.com/api/v2/team", token)).teams || [];
+  const users = [];
+  for (const team of teams) {
+    for (const m of (team.members || [])) {
+      const u = m.user;
+      if (!u) continue;
+      users.push({ id: String(u.id), username: u.username || "", email: u.email || "" });
+    }
+  }
+  _clickupUserCache = { users, expires_at: now + CLICKUP_LIST_CACHE_TTL_MS };
+  console.log(`[clickup] cached ${users.length} workspace members`);
+  return users;
+}
+
+function resolveClickUpAssignee(users, name) {
+  const q = String(name).toLowerCase().trim();
+  // Try email exact match first (most reliable)
+  let hit = users.find((u) => u.email.toLowerCase() === q);
+  if (hit) return hit.id;
+  // Then username contains
+  hit = users.find((u) => u.username.toLowerCase() === q);
+  if (hit) return hit.id;
+  // Then fuzzy: any token of the username matches q
+  hit = users.find((u) => u.username.toLowerCase().split(/\s+/).some((tok) => tok === q));
+  if (hit) return hit.id;
+  // Then partial substring
+  hit = users.find((u) => u.username.toLowerCase().includes(q));
+  if (hit) return hit.id;
+  return null;
+}
+
 // ---------- Tool implementations ----------
 
 const toolImpls = {
@@ -588,11 +631,33 @@ const toolImpls = {
     };
   },
 
-  async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null }) {
+  async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null, assignees = null }) {
     const token = process.env.CLICKUP_TOKEN;
     const targetList = list_id || process.env.CLICKUP_DEFAULT_LIST_ID;
     if (!token) return { error: "CLICKUP_TOKEN not configured on server" };
     if (!targetList) return { error: "No list_id provided and CLICKUP_DEFAULT_LIST_ID not set" };
+
+    // Resolve friendly names to ClickUp user IDs.
+    let assigneeIds = null;
+    const unresolved = [];
+    if (Array.isArray(assignees) && assignees.length > 0) {
+      try {
+        const users = await getClickUpUsers();
+        assigneeIds = [];
+        for (const a of assignees) {
+          // Allow numeric IDs to pass through unchanged
+          if (typeof a === "number" || /^\d+$/.test(String(a))) {
+            assigneeIds.push(Number(a));
+            continue;
+          }
+          const id = resolveClickUpAssignee(users, a);
+          if (id) assigneeIds.push(Number(id));
+          else unresolved.push(a);
+        }
+      } catch (e) {
+        return { error: `Failed to resolve assignees: ${e.message}` };
+      }
+    }
 
     // Defensive: tool inputs occasionally arrive with the literal characters
     // backslash + n (or t/r) instead of real newlines. Normalize so users don't see
@@ -608,6 +673,7 @@ const toolImpls = {
     const body = { name, description: normalized, markdown_content: normalized };
     if (priority) body.priority = priority; // 1=urgent, 2=high, 3=normal, 4=low
     if (due_date) body.due_date = new Date(due_date).getTime();
+    if (assigneeIds && assigneeIds.length > 0) body.assignees = assigneeIds;
 
     const res = await fetch(`https://api.clickup.com/api/v2/list/${targetList}/task`, {
       method: "POST",
@@ -616,7 +682,10 @@ const toolImpls = {
     });
     const data = await res.json();
     if (!res.ok) return { error: `ClickUp ${res.status}: ${data.err || data.error || JSON.stringify(data)}` };
-    return { id: data.id, url: data.url, name: data.name };
+    const result = { id: data.id, url: data.url, name: data.name };
+    if (assigneeIds) result.assignees_set = assigneeIds;
+    if (unresolved.length > 0) result.unresolved_assignees = unresolved;
+    return result;
   },
 
   async update_person({ person_id, fields }) {
@@ -729,6 +798,65 @@ const toolImpls = {
       }
     }
     return { id: touchpointId, person_id: person_id || null };
+  },
+
+  // ---------- Generic NocoDB CRUD (use sparingly — these can change schema!) ----------
+
+  async list_tables() {
+    // Discover the base ID from a known table (PEOPLE_TABLE_ID), then list siblings.
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
+    if (!baseId) return { error: "Could not determine base ID from People table metadata" };
+    const data = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = (data.list || data.tables || data || []).map((t) => ({
+      id: t.id,
+      title: t.title,
+      table_name: t.table_name,
+      description: t.description || null,
+    }));
+    return { base_id: baseId, tables };
+  },
+
+  async add_table_column({ table_id, name, type = "SingleLineText" }) {
+    // type must be a NocoDB UI data type (uidt). Common: SingleLineText, LongText,
+    // Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON.
+    const created = await ncPost(`/api/v2/meta/tables/${table_id}/columns`, {
+      column_name: name,
+      title: name,
+      uidt: type,
+    });
+    return { table_id, column_id: created.id || null, name, type };
+  },
+
+  async create_table({ name, columns }) {
+    if (!Array.isArray(columns) || columns.length === 0) {
+      return { error: "columns must be a non-empty array of {name, type} objects" };
+    }
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
+    if (!baseId) return { error: "Could not determine base ID" };
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: name,
+      title: name,
+      columns: columns.map((c) => ({
+        column_name: c.name,
+        title: c.name,
+        uidt: c.type || "SingleLineText",
+      })),
+    });
+    return { table_id: created.id, title: created.title, columns_created: columns.length };
+  },
+
+  async bulk_create_records({ table_id, records }) {
+    if (!Array.isArray(records) || records.length === 0) {
+      return { error: "records must be a non-empty array of objects" };
+    }
+    if (records.length > 100) {
+      return { error: `bulk_create_records accepts up to 100 records per call (got ${records.length}). Split into smaller batches.` };
+    }
+    const created = await ncPost(`/api/v2/tables/${table_id}/records`, records);
+    const ids = (Array.isArray(created) ? created : [created]).map((r) => r.Id ?? r.id);
+    return { table_id, count: ids.length, ids };
   },
 };
 
@@ -932,6 +1060,11 @@ const tools = [
         priority: { type: "number", enum: [1, 2, 3, 4] },
         due_date: { type: "string", description: "ISO 8601 date or datetime, e.g. '2026-05-12' or '2026-05-12T15:00:00+10:00'" },
         list_id: { type: "string", description: "Specific ClickUp list ID. Omit to use default." },
+        assignees: {
+          type: "array",
+          items: { type: "string" },
+          description: "Who the task is FOR. Pass friendly names (e.g. ['nathan'], ['yohan'], ['valerie']) or numeric ClickUp user IDs. Names resolve to ClickUp users at runtime via the workspace member list. Omit if no specific owner. The unresolved_assignees field in the result tells you if any name didn't match.",
+        },
       },
       required: ["name"],
     },
@@ -1061,6 +1194,69 @@ const tools = [
       required: ["name"],
     },
   },
+
+  // Generic NocoDB CRUD — schema-altering tools require explicit user confirmation.
+  {
+    name: "list_tables",
+    description: "List all tables in the NocoDB base. When to use: user asks 'what tables do we have?' or you need to find a table_id before adding a column or bulk-creating records. Returns id, title, table_name, description for each.",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "create_table",
+    description: "Create a new NocoDB table in the base. When to use: ONLY after explicit user confirmation (use ask_for_clarification first if unsure). Common type values: SingleLineText, LongText, Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON. Includes Title and Id columns automatically. When NOT to use: speculatively, or when an existing table could fit.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Table name (e.g. 'Invoices', 'Vendors')." },
+        columns: {
+          type: "array",
+          description: "Array of {name, type} objects. type is a NocoDB UI data type — defaults to SingleLineText.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              type: { type: "string", description: "SingleLineText, LongText, Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON" },
+            },
+            required: ["name"],
+          },
+        },
+      },
+      required: ["name", "columns"],
+    },
+  },
+  {
+    name: "add_table_column",
+    description: "Add a column to an existing NocoDB table. When to use: ONLY after explicit user confirmation. Use list_tables to find the table_id. Common types as above.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        name: { type: "string", description: "Column name (will also be the title)." },
+        type: { type: "string", description: "NocoDB UI data type — defaults to SingleLineText" },
+      },
+      required: ["table_id", "name"],
+    },
+  },
+  {
+    name: "bulk_create_records",
+    description: "Bulk-insert records into a NocoDB table. When to use: importing CSV-like data, batch-creating from a list of items the user dictated. Up to 100 records per call. Field keys must match the table's column titles exactly. When NOT to use: for People records — use create_person which has stage cascade + cohort linking; for single-record creates of any kind, use the specific tool if one exists.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        records: {
+          type: "array",
+          description: "Array of {column_title: value, ...} objects. Max 100 per call.",
+          items: { type: "object" },
+        },
+      },
+      required: ["table_id", "records"],
+    },
+  },
 ];
 
 // ---------- System prompt ----------
@@ -1158,6 +1354,12 @@ ANTI-PATTERNS:
 - Do NOT toggle FUTURE stages that weren't mentioned (don't mark agreement_signed if user only said agreement_sent).
 - Do NOT make up emails, phone numbers, or other PII not in the transcript.
 
+SCHEMA CHANGES (create_table / add_table_column):
+These are DESTRUCTIVE in the sense that they alter the database structure for everyone. Rules:
+- ALWAYS confirm with the user before calling create_table or add_table_column. Use ask_for_clarification with a concrete proposal: "I'd create a table called 'Invoices' with columns: Number (text), Amount (decimal), Issued (date), Status (single select). OK to proceed?"
+- Prefer adding to an existing table over creating a new one. Use list_tables first to check.
+- bulk_create_records is safer (data only, no schema change) — still confirm if importing more than ~10 records at once.
+
 When you're done, return a concise summary suitable for posting to Slack.
 
 FORMATTING:
@@ -1189,11 +1391,27 @@ async function runAgent(transcript) {
   while (iteration < maxIterations) {
     iteration++;
 
+    // Prompt caching: the system prompt and tool catalog are identical across every
+    // iteration of this loop AND across every /run call (until the agent process
+    // restarts). Marking them with cache_control: ephemeral lets Anthropic serve
+    // cache HITS for everything except the growing messages array. Cache reads are
+    // ~10× cheaper than fresh tokens AND are excluded from the input-token rate
+    // limit (per the dashboard "excluding cache reads"), so this also prevents
+    // 30k/min rate-limit errors during long tool-use chains.
+    //
+    // Two cache breakpoints: end of system prompt, end of tool array (which caches
+    // everything up to and including that tool definition).
+    const cachedTools = tools.length === 0 ? tools : [
+      ...tools.slice(0, -1),
+      { ...tools[tools.length - 1], cache_control: { type: "ephemeral" } },
+    ];
     const response = await anthropic.messages.create({
       model: AGENT_MODEL,
       max_tokens: 2048,
-      system: SYSTEM_PROMPT,
-      tools,
+      system: [
+        { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+      ],
+      tools: cachedTools,
       messages,
     });
 
