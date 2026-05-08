@@ -1826,20 +1826,27 @@ async function runAgent(transcript) {
   while (iteration < maxIterations) {
     iteration++;
 
-    // Prompt caching: the system prompt and tool catalog are identical across every
-    // iteration of this loop AND across every /run call (until the agent process
+    // Prompt caching: the system prompt + always-loaded tools are identical across
+    // every iteration of this loop AND across every /run call (until the agent
     // restarts). Marking them with cache_control: ephemeral lets Anthropic serve
     // cache HITS for everything except the growing messages array. Cache reads are
     // ~10× cheaper than fresh tokens AND are excluded from the input-token rate
-    // limit (per the dashboard "excluding cache reads"), so this also prevents
-    // 30k/min rate-limit errors during long tool-use chains.
+    // limit (per the dashboard "excluding cache reads"), preventing 30k/min
+    // rate-limit errors during long tool-use chains.
     //
-    // Two cache breakpoints: end of system prompt, end of tool array (which caches
-    // everything up to and including that tool definition).
-    const cachedTools = tools.length === 0 ? tools : [
-      ...tools.slice(0, -1),
-      { ...tools[tools.length - 1], cache_control: { type: "ephemeral" } },
-    ];
+    // Anthropic disallows cache_control on tools with defer_loading=true (the two
+    // features conflict). We put the breakpoint on the LAST non-deferred tool, so
+    // everything before it (system + tool_search + always-loaded tools) gets cached.
+    let cachedTools = tools;
+    let lastCacheableIdx = -1;
+    for (let i = tools.length - 1; i >= 0; i--) {
+      if (!tools[i].defer_loading) { lastCacheableIdx = i; break; }
+    }
+    if (lastCacheableIdx >= 0) {
+      cachedTools = tools.map((t, i) =>
+        i === lastCacheableIdx ? { ...t, cache_control: { type: "ephemeral" } } : t
+      );
+    }
     const response = await anthropic.messages.create({
       model: AGENT_MODEL,
       max_tokens: 2048,
