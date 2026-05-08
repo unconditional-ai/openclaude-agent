@@ -1005,6 +1005,109 @@ const toolImpls = {
   // Drafts a Gmail with an .ics calendar attachment for an onboarding (or other) call.
   // Reuses the existing gmail.compose OAuth scope — no Calendar API needed. Yohan
   // reviews + sends from his Gmail like any other draft.
+  // Native Google Calendar event creation. Requires calendar.events OAuth scope.
+  // The event lands on Yohan's calendar; attendees see the event but DO NOT receive
+  // a Google notification email by default — Yohan reviews and explicitly opts in
+  // to send invites by passing send_invites=true (which triggers Google Calendar's
+  // own notification path). This preserves the "human reviews before send" model.
+  async create_calendar_event({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null, send_invites = false }) {
+    if (!datetime) return { error: "datetime required (ISO 8601)" };
+    const startUTC = new Date(datetime);
+    if (isNaN(startUTC.getTime())) return { error: `Invalid datetime: ${datetime}` };
+    if (!Number.isFinite(duration_minutes) || duration_minutes <= 0 || duration_minutes > 480) {
+      return { error: "duration_minutes must be between 1 and 480" };
+    }
+    const endUTC = new Date(startUTC.getTime() + duration_minutes * 60000);
+
+    const data = await ncGet(
+      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+    );
+    if (!data.list || !data.list[0]) return { error: `Person ${person_id} not found` };
+    const p = data.list[0];
+    const recipientName = p.Name || "Attendee";
+    const recipientEmail = p["Primary email"];
+    if (!recipientEmail) return { error: `Person ${person_id} has no Primary email` };
+
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+
+    const eventBody = {
+      summary: title || `UST Onboarding Call with ${recipientName}`,
+      description: description || `${duration_minutes}-minute onboarding call to kick off your UST 9-week training.`,
+      start: { dateTime: startUTC.toISOString() },
+      end: { dateTime: endUTC.toISOString() },
+      attendees: [{ email: recipientEmail, displayName: recipientName }],
+    };
+    if (location) eventBody.location = location;
+
+    const sendUpdates = send_invites ? "all" : "none";
+    const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=${sendUpdates}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify(eventBody),
+    });
+    const evt = await res.json();
+    if (!res.ok) return { error: `Calendar API ${res.status}: ${evt.error?.message || JSON.stringify(evt)}` };
+    return {
+      person_id,
+      event_id: evt.id,
+      html_link: evt.htmlLink,
+      start_utc: evt.start?.dateTime,
+      end_utc: evt.end?.dateTime,
+      attendees: (evt.attendees || []).map((a) => ({ email: a.email, status: a.responseStatus })),
+      invites_sent: send_invites,
+      hint: send_invites
+        ? "Google sent a Calendar invite email to the attendee."
+        : "Event created on Yohan's calendar — attendee was NOT notified. Either tell user to send invites manually from Calendar, or call again with send_invites=true if user confirms.",
+    };
+  },
+
+  // Read free/busy from Yohan's primary Calendar. Use before suggesting a time slot.
+  async check_calendar_availability({ start, end, calendar_id = "primary" }) {
+    if (!start || !end) return { error: "start and end required (ISO 8601)" };
+    const startUTC = new Date(start);
+    const endUTC = new Date(end);
+    if (isNaN(startUTC.getTime()) || isNaN(endUTC.getTime())) {
+      return { error: "Invalid start or end datetime" };
+    }
+    if (endUTC <= startUTC) return { error: "end must be after start" };
+
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+
+    // Use Google's freeBusy API — returns just busy ranges, no event content.
+    const res = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        timeMin: startUTC.toISOString(),
+        timeMax: endUTC.toISOString(),
+        items: [{ id: calendar_id }],
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `Calendar API ${res.status}: ${data.error?.message || JSON.stringify(data)}` };
+    const busy = data.calendars?.[calendar_id]?.busy || [];
+    return {
+      window_start: startUTC.toISOString(),
+      window_end: endUTC.toISOString(),
+      calendar_id,
+      busy_count: busy.length,
+      busy,
+      free: busy.length === 0,
+    };
+  },
+
   async draft_calendar_invite_email({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null }) {
     if (!datetime) return { error: "datetime required (ISO 8601)" };
     const startUTC = new Date(datetime);
@@ -1541,8 +1644,40 @@ const tools = [
     },
   },
   {
+    name: "create_calendar_event",
+    description: "Create a native Google Calendar event on Yohan's calendar with the participant as an attendee. PREFERRED over draft_calendar_invite_email when scheduling — the event lands on Yohan's calendar so he can see it alongside other commitments. By DEFAULT does NOT send an invite email (send_invites=false) — just creates the event silently. Yohan can then review the calendar entry and either send invites manually from Calendar UI, or you can call again with send_invites=true if user explicitly says 'send the invite'. Use check_calendar_availability first if there's any chance of conflict.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        person_id: { type: "number", description: "NocoDB People record ID. Looked up to get name + email for the attendee." },
+        datetime: { type: "string", description: "ISO 8601 datetime for the call start. Include timezone (e.g. '2026-05-13T15:00:00+10:00')." },
+        duration_minutes: { type: "number", description: "Default 45." },
+        title: { type: "string", description: "Default: 'UST Onboarding Call with [Name]'." },
+        description: { type: "string", description: "Default: short onboarding description." },
+        location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
+        send_invites: { type: "boolean", description: "Default false. Set true ONLY when the user explicitly confirms they want Google to email the invite to the attendee. Otherwise the event sits on Yohan's calendar quietly, ready for him to send manually." },
+      },
+      required: ["person_id", "datetime"],
+    },
+  },
+  {
+    name: "check_calendar_availability",
+    description: "Check Yohan's primary calendar for busy ranges in a window. When to use: before suggesting a time slot for an onboarding call ('is Tuesday 3pm free?'). Returns busy=[] if free, otherwise a list of busy intervals. Uses Google's freeBusy API — only returns busy ranges, not event titles, so it doesn't expose private details.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        start: { type: "string", description: "ISO 8601 window start. Include timezone." },
+        end: { type: "string", description: "ISO 8601 window end. Include timezone." },
+        calendar_id: { type: "string", description: "Default 'primary' (Yohan's main calendar). Override only if asked." },
+      },
+      required: ["start", "end"],
+    },
+  },
+  {
     name: "draft_calendar_invite_email",
-    description: "Draft a Gmail with an .ics calendar attachment for an onboarding (or other) call. The recipient gets an email with the calendar event attached — clicking it adds to their calendar. When to use: 'schedule onboarding call with Sarah for Tuesday 3pm', 'send Joseph a calendar invite for Monday'. When NOT to use: for a draft email without calendar (use draft_email or send_welcome_email). Yohan reviews + sends from his Gmail like any other draft. The draft creates an .ics with REQUEST method, suitable for adding to most calendar apps.",
+    description: "Fallback when create_calendar_event isn't appropriate: draft a Gmail with an .ics attachment. PREFER create_calendar_event when scheduling on Yohan's calendar (which is most of the time). Use this only when: user wants the invite to flow through Yohan's email-review process exactly like any other draft, or the recipient explicitly asked for an .ics file by email. Yohan reviews + sends from Gmail like any other draft.",
     defer_loading: true,
     input_schema: {
       type: "object",
@@ -1927,7 +2062,15 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 // ---------- Google OAuth (Gmail) ----------
 
 const GOOGLE_REDIRECT = `https://openclaude-agent.onrender.com/oauth/google/callback`;
-const GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
+// Scopes granted when the user OAuths.
+//   gmail.compose      — create Gmail drafts (existing tools)
+//   calendar.events    — create / update Calendar events on the user's calendar
+//   calendar.readonly  — list events for free-busy lookups
+const GOOGLE_SCOPE = [
+  "https://www.googleapis.com/auth/gmail.compose",
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.readonly",
+].join(" ");
 const oauthStateStore = new Map(); // state → expiry timestamp
 
 app.get("/oauth/google/start", (_req, res) => {
@@ -1982,13 +2125,19 @@ app.get("/oauth/google/callback", async (req, res) => {
   res.setHeader("content-type", "text/html");
   res.send(`<!doctype html>
 <html>
-<head><title>Compass Gmail OAuth — done</title>
-<style>body{font-family:system-ui;max-width:680px;margin:40px auto;padding:24px;color:#222} pre{background:#f4f4f4;padding:16px;border-radius:8px;word-break:break-all;white-space:pre-wrap} .ok{color:#2c7}</style></head>
+<head><title>Compass Google OAuth — done</title>
+<style>body{font-family:system-ui;max-width:680px;margin:40px auto;padding:24px;color:#222} pre{background:#f4f4f4;padding:16px;border-radius:8px;word-break:break-all;white-space:pre-wrap} .ok{color:#2c7} ul{padding-left:24px}</style></head>
 <body>
-<h1 class="ok">✓ Gmail access authorized</h1>
+<h1 class="ok">✓ Google access authorized</h1>
+<p>Compass now has the following access on your Google account:</p>
+<ul>
+<li><strong>Gmail compose</strong> — draft emails (you still review + send)</li>
+<li><strong>Calendar events</strong> — create / update Calendar events on your calendar</li>
+<li><strong>Calendar read</strong> — check free/busy before suggesting times</li>
+</ul>
 <p>Copy the refresh token below and set it as <code>GOOGLE_REFRESH_TOKEN</code> in Render → Environment.</p>
 <pre>${tok.refresh_token}</pre>
-<p>Once set, the agent can draft and send Gmail messages on your behalf. You can close this tab.</p>
+<p>You can close this tab.</p>
 </body></html>`);
 });
 
