@@ -20,6 +20,8 @@ const {
   COHORTS_LINK_COLUMN_ID,
   TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
+  KNOWLEDGE_TABLE_ID,
+
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
   PORT = 10000,
@@ -1194,6 +1196,54 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       gmail_url: `https://mail.google.com/mail/u/0/#drafts/${draftData.id}`,
     };
   },
+
+  // ---------- Compass knowledge (long-term memory) ----------
+  // pin_knowledge writes a fact to a NocoDB table. recall_knowledge searches it.
+  // Use case: Valerie says "this is the Drive folder for curriculum" — Compass pins
+  // the fact, then later when Yohan asks "where's the cohort 12 curriculum?",
+  // Compass calls recall_knowledge('curriculum') and finds the pinned URL.
+
+  async pin_knowledge({ topic, content, tags = null, added_by = null, source = null }) {
+    if (!KNOWLEDGE_TABLE_ID) return { error: "KNOWLEDGE_TABLE_ID not configured" };
+    if (!topic || !content) return { error: "topic and content are both required" };
+    const payload = {
+      Topic: topic,
+      Content: content,
+      Tags: tags || null,
+      "Added by": added_by || null,
+      Source: source || null,
+    };
+    const created = await ncPost(`/api/v2/tables/${KNOWLEDGE_TABLE_ID}/records`, [payload]);
+    const id = Array.isArray(created) ? created[0].Id : created.Id;
+    return { id, topic, content_preview: String(content).slice(0, 120) };
+  },
+
+  async recall_knowledge({ query = null, tag = null, limit = 5 }) {
+    if (!KNOWLEDGE_TABLE_ID) return { error: "KNOWLEDGE_TABLE_ID not configured" };
+    // Build a NocoDB filter: substring match on Topic OR Content if query given,
+    // and exact tag match if tag given.
+    const conditions = [];
+    if (query) {
+      const q = String(query).trim();
+      // Use NocoDB's "or" combinator with two like clauses.
+      conditions.push(`((Topic,like,%${q}%)~or(Content,like,%${q}%))`);
+    }
+    if (tag) {
+      conditions.push(`(Tags,like,%${String(tag).trim()}%)`);
+    }
+    const where = conditions.length > 0 ? `&where=${encodeURIComponent(conditions.join("~and"))}` : "";
+    const url = `/api/v2/tables/${KNOWLEDGE_TABLE_ID}/records?limit=${Math.min(limit, 25)}&sort=-CreatedAt${where}`;
+    const data = await ncGet(url);
+    const items = (data.list || []).map((r) => ({
+      id: r.Id,
+      topic: r.Topic,
+      content: r.Content,
+      tags: r.Tags || null,
+      added_by: r["Added by"] || null,
+      added_at: r.CreatedAt,
+    }));
+    return { count: items.length, items };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1692,6 +1742,36 @@ const tools = [
       required: ["person_id", "datetime"],
     },
   },
+  {
+    name: "pin_knowledge",
+    description: "Save a piece of long-term knowledge so future Compass sessions can find it. When to use: user shares a fact, link, process, or 'remember this' — e.g. 'this is where curriculum lives: <URL>', 'use this Zoom link for onboarding calls', 'cohort May 9 prep doc is here'. Pin both the topic (a short label) and the full content. Use tags for cross-cutting categories like 'curriculum', 'links', 'pricing'. When NOT to use: for People-record updates (use update_person), for tasks (use create_clickup_task), for personal voice/style (those are skills, edited in code).",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "Short label, 2-8 words. e.g. 'UST curriculum Drive folder', 'Default Zoom link for onboarding'." },
+        content: { type: "string", description: "Full content / fact / URL / instructions. Markdown allowed." },
+        tags: { type: "string", description: "Optional comma-separated tags for grouping (e.g. 'curriculum, links')." },
+        added_by: { type: "string", description: "Slack display name of the person who shared the fact, if known. Optional." },
+        source: { type: "string", description: "Optional context: where the user said it (Slack channel, thread link)." },
+      },
+      required: ["topic", "content"],
+    },
+  },
+  {
+    name: "recall_knowledge",
+    description: "Search Compass's long-term knowledge for previously-pinned facts. When to use: user references something general that's not a person/cohort/task and might have been pinned earlier — 'where's the curriculum?', 'what was that Drive folder Valerie shared?', 'what Zoom link do we use?'. Searches both Topic and Content fields with a substring match. Pass a tag to narrow by category. Returns most-recently-pinned matches first.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Substring to match against Topic and Content. Optional if tag provided." },
+        tag: { type: "string", description: "Optional category filter (e.g. 'curriculum')." },
+        limit: { type: "number", description: "Max results (default 5, max 25)." },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ---------- System prompt ----------
@@ -1758,6 +1838,9 @@ The audit log is for "what did the AGENT do". The People table is for "who are t
 
 SELF-AWARENESS / AUDIT TRAIL:
 Every voice note, @mention, and DM you handle is automatically logged to the Agent actions table via list_recent_actions. Don't say you have no memory — you have a full audit trail.
+
+LONG-TERM KNOWLEDGE (pin_knowledge / recall_knowledge):
+You have a knowledge store for facts that span sessions — URLs, processes, defaults, "remember this for later" requests. When a user shares something with phrasing like "this is where X lives", "use this link", "remember that...", "if anyone asks about X you can find it here" — call pin_knowledge with a short topic + the full content. When a user later asks for general info that's not a person/cohort/task, call recall_knowledge first before saying you don't know. Tags help: use them for cross-cutting categories like 'curriculum', 'links', 'pricing', 'processes'. Always include `added_by` (the user's name from thread/channel context) so the audit trail of who taught you what is preserved.
 
 CONVERSATION CONTEXT:
 When you're responding to a Slack message, the transcript may include prior context under a "## Thread context" or "## Recent channel context" heading, followed by "## Current message to act on" with the latest message. Use the prior context to resolve references like "that person", "what we just discussed", "the same thing again". Treat the thread context as a real conversation history — your previous replies (labeled "Compass:") are yours; messages from named users are theirs. If the current message obviously builds on prior turns, don't re-ask things already answered.
