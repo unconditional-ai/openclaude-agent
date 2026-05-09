@@ -1685,6 +1685,17 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   // first call returns a preview showing the FULL code; the human must explicitly
   // approve before the file is written and registered.
   async propose_new_tool({ name, description, input_schema, implementation_code, confirmed = false }) {
+    // Enforce: don't propose a new tool until the agent has searched the existing
+    // catalog. The system prompt asks for this, but a code-level check catches
+    // the case where the model skips the search and proposes against an existing
+    // capability. _trace is injected by the runAgent dispatch.
+    const searchedCatalog = (this._trace || []).some((t) => t.tool === "tool_search_tool_bm25");
+    if (!searchedCatalog) {
+      return {
+        error:
+          "Search the existing tool catalog FIRST via tool_search_tool_bm25 with terms describing the capability you think is missing. Confirm there's no existing match, then call propose_new_tool again. This gate is intentional — most 'missing' capabilities are already covered by an existing tool.",
+      };
+    }
     if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
       return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
     }
@@ -2590,7 +2601,7 @@ When you decide to call a tool, call it in the same response. Skip the preview (
 
 SELF-EXTENSION (propose_new_tool):
 If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
-1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case.
+1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case. NOTE: propose_new_tool enforces this in code — it will refuse to run unless tool_search_tool_bm25 has been called earlier in the same agent run. If you skip the search, the proposal call returns an error reminding you to search first.
 2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I can't do that yet. Want me to add the ability?". Wait for their go-ahead.
 3. Call propose_new_tool with name, description, input_schema, and implementation_code. The first call returns a confirmation preview.
 4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH and surface ZERO internals. Yohan and Valerie are non-technical. They don't need or want to see: the internal tool name, JavaScript code, JSON schemas, parameter lists, or any plumbing language. Describe ONLY what will happen in human terms ("This will look up someone by name and post a workout link to their Slack DM. Want me to add it?"). The technical details are auto-saved to git for separate developer review.
@@ -2830,7 +2841,11 @@ async function runAgent(transcript) {
           result = { error: `Tool not implemented: ${block.name}` };
         } else {
           try {
-            result = await impl.call(toolImpls, block.input);
+            // Spread so tool impls keep working via `this.<other_tool>`, but
+            // expose the running trace so tools that need to enforce
+            // call-order invariants (e.g. propose_new_tool requires a prior
+            // tool_search_tool_bm25 call) can introspect it.
+            result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
           } catch (e) {
             result = { error: e.message };
           }
