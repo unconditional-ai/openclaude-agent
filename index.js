@@ -80,6 +80,16 @@ async function ncPatch(path, body) {
   return res.json();
 }
 
+async function ncDelete(path, body) {
+  const res = await fetch(`${NOCODB_URL}${path}`, {
+    method: "DELETE",
+    headers: ncHeaders,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`NocoDB DELETE ${path} → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 const STAGE_ORDER = [
   "onboarding_call_done",
   "deposit_paid",
@@ -233,6 +243,33 @@ function resolveClickUpAssignee(users, name) {
   return null;
 }
 
+// ---------- Confirmation gating ----------
+// High-stakes tools (calendar writes, payment changes, deletes) gate themselves
+// behind a `confirmed: true` arg. First call returns a preview describing what
+// WILL happen; the agent shows it to the user, waits for an explicit go-ahead,
+// then re-calls the same tool with confirmed=true plus the originally proposed
+// args. This is enforced per-tool (not loop-level) because each tool knows the
+// shape of its own preview. Tradeoff: relies on the agent honoring the
+// `to_proceed` instruction rather than holding state in the runtime — simpler,
+// no infrastructure, but the agent must remember to flip confirmed on retry.
+function pendingConfirmation(action_summary, replay_args) {
+  // Strip undefined entries so the agent doesn't replay them as nulls — most of
+  // these tools distinguish 'undefined' (don't touch) from 'null' (clear field).
+  const cleaned = {};
+  for (const [k, v] of Object.entries(replay_args)) {
+    if (v !== undefined) cleaned[k] = v;
+  }
+  return {
+    status: "confirmation_required",
+    action_summary,
+    replay_args: cleaned,
+    to_proceed:
+      "DO NOT execute yet. Reply to the user describing action_summary and ask them to confirm. " +
+      "On their explicit go-ahead (e.g. 'yes', 'go ahead', thumbsup react), call this same tool again " +
+      "with the args from replay_args (which already includes confirmed: true).",
+  };
+}
+
 // ---------- Tool implementations ----------
 
 const toolImpls = {
@@ -351,7 +388,18 @@ const toolImpls = {
     };
   },
 
-  async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk }) {
+  async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk, confirmed = false }) {
+    if (!confirmed) {
+      const proposed = [];
+      if (payment_status !== undefined) proposed.push(`Payment status → ${payment_status}`);
+      if (amount_total !== undefined) proposed.push(`Amount total → ${amount_total}`);
+      if (amount_paid !== undefined) proposed.push(`Amount paid → ${amount_paid}`);
+      if (payment_risk !== undefined) proposed.push(`Payment risk → ${payment_risk}`);
+      return pendingConfirmation(
+        `Update payment for person_id=${person_id}: ${proposed.join("; ") || "(no fields)"}`,
+        { person_id, payment_status, amount_total, amount_paid, payment_risk, confirmed: true }
+      );
+    }
     const updates = { Id: person_id, "Last touch": todayISO() };
     if (payment_status !== undefined) updates["Payment status"] = payment_status;
     if (amount_total !== undefined) updates["Amount total"] = amount_total;
@@ -605,7 +653,13 @@ const toolImpls = {
     };
   },
 
-  async delete_clickup_task({ task_id }) {
+  async delete_clickup_task({ task_id, confirmed = false }) {
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Delete ClickUp task ${task_id} (irreversible).`,
+        { task_id, confirmed: true }
+      );
+    }
     const token = process.env.CLICKUP_TOKEN;
     if (!token) return { error: "CLICKUP_TOKEN not configured" };
     const res = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
@@ -923,6 +977,71 @@ const toolImpls = {
     return { table_id, count: ids.length, ids };
   },
 
+  // Generic NocoDB read for any table. Supports filter (where), sort, fields,
+  // limit, offset. Use list_tables first to discover table IDs. Read-only —
+  // no confirmation gate. For specialized People queries prefer list_people /
+  // lookup_person which already understand the People schema.
+  async query_table({ table_id, where = null, fields = null, sort = null, limit = 25, offset = 0 }) {
+    if (!table_id) return { error: "table_id required (use list_tables to discover)" };
+    if (limit > 200) return { error: "limit cannot exceed 200" };
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (where) params.set("where", where);
+    if (Array.isArray(fields) && fields.length > 0) params.set("fields", fields.join(","));
+    if (sort) params.set("sort", sort);
+    const data = await ncGet(`/api/v2/tables/${table_id}/records?${params.toString()}`);
+    return {
+      table_id,
+      count: data.list?.length || 0,
+      total_in_table: data.pageInfo?.totalRows ?? null,
+      has_more: !!data.pageInfo?.isLastPage === false,
+      records: data.list || [],
+    };
+  },
+
+  // Generic NocoDB bulk update by Id. Each record must include 'Id' plus the
+  // fields to set. CONFIRMATION GATED — touches multiple rows at once.
+  async bulk_update_records({ table_id, records, confirmed = false }) {
+    if (!table_id) return { error: "table_id required" };
+    if (!Array.isArray(records) || records.length === 0) {
+      return { error: "records must be a non-empty array of objects, each with 'Id'" };
+    }
+    if (records.length > 100) {
+      return { error: `bulk_update_records accepts up to 100 records per call (got ${records.length}).` };
+    }
+    const missingId = records.findIndex((r) => r?.Id == null);
+    if (missingId !== -1) {
+      return { error: `record at index ${missingId} is missing 'Id' (required for update)` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Update ${records.length} row${records.length === 1 ? "" : "s"} in table ${table_id}. Affected Ids: ${records.map((r) => r.Id).join(", ")}.`,
+        { table_id, records, confirmed: true }
+      );
+    }
+    const updated = await ncPatch(`/api/v2/tables/${table_id}/records`, records);
+    return { table_id, count: Array.isArray(updated) ? updated.length : 1 };
+  },
+
+  // Generic NocoDB delete by Id. CONFIRMATION GATED — irreversible.
+  async delete_records({ table_id, record_ids, confirmed = false }) {
+    if (!table_id) return { error: "table_id required" };
+    if (!Array.isArray(record_ids) || record_ids.length === 0) {
+      return { error: "record_ids must be a non-empty array" };
+    }
+    if (record_ids.length > 100) {
+      return { error: `delete_records accepts up to 100 ids per call (got ${record_ids.length}).` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Delete ${record_ids.length} row${record_ids.length === 1 ? "" : "s"} from table ${table_id} (irreversible). Ids: ${record_ids.join(", ")}.`,
+        { table_id, record_ids, confirmed: true }
+      );
+    }
+    const body = record_ids.map((id) => ({ Id: id }));
+    const result = await ncDelete(`/api/v2/tables/${table_id}/records`, body);
+    return { table_id, deleted: record_ids.length, result };
+  },
+
   // Phone numbers are stored in varied formats ("+61 400 555 090", "0400555090",
   // "+61400555090"). NocoDB's "like" filter is exact substring against stored bytes,
   // so we try a few variants of the query against the Phone column. Returns matching
@@ -1012,7 +1131,7 @@ const toolImpls = {
   // a Google notification email by default — Yohan reviews and explicitly opts in
   // to send invites by passing send_invites=true (which triggers Google Calendar's
   // own notification path). This preserves the "human reviews before send" model.
-  async create_calendar_event({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null, send_invites = false }) {
+  async create_calendar_event({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null, send_invites = false, confirmed = false }) {
     if (!datetime) return { error: "datetime required (ISO 8601)" };
     const startUTC = new Date(datetime);
     if (isNaN(startUTC.getTime())) return { error: `Invalid datetime: ${datetime}` };
@@ -1020,6 +1139,12 @@ const toolImpls = {
       return { error: "duration_minutes must be between 1 and 480" };
     }
     const endUTC = new Date(startUTC.getTime() + duration_minutes * 60000);
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Create calendar event for person_id=${person_id}: ${title || "UST Onboarding Call"} — ${startUTC.toISOString()} for ${duration_minutes}min${location ? ` at ${location}` : ""}${send_invites ? " (invite email WILL be sent to attendee)" : " (no invite email — attendee not notified)"}`,
+        { person_id, datetime, duration_minutes, title, description, location, send_invites, confirmed: true }
+      );
+    }
 
     const data = await ncGet(
       `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
@@ -1107,6 +1232,58 @@ const toolImpls = {
       busy_count: busy.length,
       busy,
       free: busy.length === 0,
+    };
+  },
+
+  // Read values from a Google Sheet. Read-only — uses the spreadsheets.readonly
+  // scope. Accepts a bare spreadsheet ID or a full sheets.google.com URL (we
+  // extract the ID from the /d/<ID>/ segment). `range` is A1 notation
+  // ('Sheet1!A1:D', 'A:F', or just 'Sheet1' for the whole tab).
+  async read_google_sheet({ sheet_id, range = null, max_rows = 500 }) {
+    if (!sheet_id) return { error: "sheet_id required (the spreadsheet ID or full Sheets URL)" };
+    let id = String(sheet_id).trim();
+    const urlMatch = id.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    if (urlMatch) id = urlMatch[1];
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+      return { error: `Could not extract a valid spreadsheet ID from: ${sheet_id}` };
+    }
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    // If no range given, fetch sheet metadata to discover the first tab name.
+    let resolvedRange = range;
+    if (!resolvedRange) {
+      const metaRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=sheets.properties.title`,
+        { headers: { authorization: `Bearer ${accessToken}` } }
+      );
+      const meta = await metaRes.json();
+      if (!metaRes.ok) {
+        return { error: `Sheets API ${metaRes.status}: ${meta.error?.message || JSON.stringify(meta)}` };
+      }
+      const firstTab = meta.sheets?.[0]?.properties?.title;
+      if (!firstTab) return { error: "Spreadsheet has no sheets" };
+      resolvedRange = firstTab;
+    }
+    const valRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(resolvedRange)}`,
+      { headers: { authorization: `Bearer ${accessToken}` } }
+    );
+    const val = await valRes.json();
+    if (!valRes.ok) {
+      return { error: `Sheets API ${valRes.status}: ${val.error?.message || JSON.stringify(val)}` };
+    }
+    const rows = val.values || [];
+    const truncated = rows.length > max_rows;
+    return {
+      sheet_id: id,
+      range: val.range || resolvedRange,
+      row_count: rows.length,
+      truncated,
+      rows: truncated ? rows.slice(0, max_rows) : rows,
     };
   },
 
@@ -1320,19 +1497,28 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   async create_slack_reminder({ text, time, user = null }) {
     if (!text || !time) return { error: "text and time are both required" };
     let userId = null;
+    let friendlyName = null;
     if (user) {
       if (typeof user === "string" && /^U[A-Z0-9]+$/.test(user)) {
         userId = user;
+        const reverse = {
+          [process.env.YOHAN_SLACK_ID]: "yohan",
+          [process.env.VALERIE_SLACK_ID]: "valerie",
+          [process.env.NATHAN_SLACK_ID]: "nathan",
+        };
+        friendlyName = reverse[userId] || null;
       } else {
         const map = {
           yohan: process.env.YOHAN_SLACK_ID,
           valerie: process.env.VALERIE_SLACK_ID,
           nathan: process.env.NATHAN_SLACK_ID,
         };
-        userId = map[String(user).toLowerCase().trim()];
+        const key = String(user).toLowerCase().trim();
+        userId = map[key];
         if (!userId) {
           return { error: `Unknown user: ${user}. Use 'yohan' / 'valerie' / 'nathan' or a Slack user_id.` };
         }
+        friendlyName = key;
       }
     }
     const params = new URLSearchParams({ text, time: String(time) });
@@ -1347,7 +1533,43 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     });
     const data = await res.json();
     if (!data.ok) {
-      return { error: `Slack reminders.add failed: ${data.error || JSON.stringify(data)}` };
+      // Slack bot tokens can only set reminders for the bot itself. When the caller
+      // asked for a reminder on another user, Slack rejects with cannot_add_bot,
+      // not_allowed_token_type, user_not_found, etc. Fall back to a ClickUp task
+      // assigned to that person — same intent (a future nudge), different surface.
+      const slackErr = data.error || JSON.stringify(data);
+      const otherUserErrors = new Set([
+        "cannot_add_bot",
+        "cannot_add_others",
+        "not_allowed_token_type",
+        "user_not_found",
+        "no_perm",
+      ]);
+      if (userId && otherUserErrors.has(slackErr)) {
+        const dueMs = /^\d+$/.test(String(time)) ? Number(time) * 1000 : null;
+        const taskName = `Reminder: ${text}`;
+        const taskDesc = dueMs
+          ? `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${new Date(dueMs).toISOString()}`
+          : `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${time}`;
+        const fallback = await this.create_clickup_task({
+          name: taskName,
+          description: taskDesc,
+          due_date: dueMs,
+          assignees: friendlyName ? [friendlyName] : null,
+        });
+        if (fallback?.error) {
+          return { error: `Slack reminders.add failed (${slackErr}); ClickUp fallback also failed: ${fallback.error}` };
+        }
+        return {
+          ok: true,
+          fallback: "clickup_task",
+          reason: `Slack rejected reminders.add with '${slackErr}' — bot tokens can't set reminders for other users. Created a ClickUp task instead.`,
+          task_id: fallback.id,
+          task_url: fallback.url,
+          assignee: friendlyName || userId,
+        };
+      }
+      return { error: `Slack reminders.add failed: ${slackErr}` };
     }
     return {
       ok: true,
@@ -1455,6 +1677,162 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       ),
     };
   },
+
+  // ---------- Self-extension ----------
+  // Generates a new tool from natural-language intent + JS code, persists it to
+  // tools/generated/<name>.js, and hot-loads it into the live tool registry so
+  // it's callable in the same agent run that created it. Confirmation gated —
+  // first call returns a preview showing the FULL code; the human must explicitly
+  // approve before the file is written and registered.
+  async propose_new_tool({ name, description, input_schema, implementation_code, confirmed = false }) {
+    // Enforce: don't propose a new tool until the agent has searched the existing
+    // catalog. The system prompt asks for this, but a code-level check catches
+    // the case where the model skips the search and proposes against an existing
+    // capability. _trace is injected by the runAgent dispatch.
+    const searchedCatalog = (this._trace || []).some((t) => t.tool === "tool_search_tool_bm25");
+    if (!searchedCatalog) {
+      return {
+        error:
+          "Search the existing tool catalog FIRST via tool_search_tool_bm25 with terms describing the capability you think is missing. Confirm there's no existing match, then call propose_new_tool again. This gate is intentional — most 'missing' capabilities are already covered by an existing tool.",
+      };
+    }
+    if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
+      return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
+    }
+    if (toolImpls[name]) {
+      return { error: `Tool '${name}' already exists. Pick a different name or update via the existing tool.` };
+    }
+    if (!description) return { error: "description required (when-to-use guidance for future agent runs)" };
+    if (!input_schema || typeof input_schema !== "object") {
+      return { error: "input_schema required (JSON Schema object)" };
+    }
+    if (!implementation_code || typeof implementation_code !== "string") {
+      return { error: "implementation_code required (a JS function expression — e.g. 'async function ({ x }) { ... }')" };
+    }
+    // Reject paths/escape attempts in the name (defense-in-depth — regex above
+    // already restricts the charset, but make the intent obvious).
+    if (name.includes("/") || name.includes("..")) {
+      return { error: "name must not contain path separators" };
+    }
+    // Pre-flight syntax check before bothering the human with a confirmation.
+    try {
+      new Function(`return (${implementation_code})`);
+    } catch (e) {
+      return { error: `implementation_code failed to parse: ${e.message}` };
+    }
+    if (!confirmed) {
+      // Custom preview shape (not pendingConfirmation) — Yohan and Valerie are
+      // non-technical, so the user-facing summary must NOT include JS code,
+      // JSON schemas, or even the internal tool name. The full code is included
+      // as code_for_dev_review for the agent's own context (and is visible in
+      // git after approval), but the agent is instructed to describe behavior
+      // in plain English when replying.
+      return {
+        status: "confirmation_required",
+        behavior_for_user: description,
+        replay_args: { name, description, input_schema, implementation_code, confirmed: true },
+        internal_name: name,
+        code_for_dev_review: implementation_code,
+        to_proceed:
+          "DO NOT execute yet. Reply to the user in plain English: explain what the new action will do and what happens when it runs, using the behavior_for_user field. Ask them to confirm. " +
+          "DO NOT mention the internal_name, paste implementation_code, paste input_schema JSON, or surface ANY internals in the user-facing reply — the user is non-technical and doesn't need to see plumbing. " +
+          "On their explicit go-ahead, call propose_new_tool again with replay_args (which already has confirmed: true).",
+      };
+    }
+    const dir = path.join(__dirname, "tools", "generated");
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${name}.js`);
+    if (fs.existsSync(filePath)) {
+      return { error: `File ${filePath} already exists on disk. Manually remove it before reproposing.` };
+    }
+    const fileContents =
+      `// Auto-generated by propose_new_tool on ${new Date().toISOString()}\n` +
+      `// Edit or delete to revoke. Hot-loaded at runtime; persisted to disk so it survives restart.\n` +
+      `module.exports = {\n` +
+      `  name: ${JSON.stringify(name)},\n` +
+      `  description: ${JSON.stringify(description)},\n` +
+      `  defer_loading: true,\n` +
+      `  input_schema: ${JSON.stringify(input_schema, null, 2)},\n` +
+      `  impl: ${implementation_code},\n` +
+      `};\n`;
+    fs.writeFileSync(filePath, fileContents);
+    let mod;
+    try {
+      delete require.cache[require.resolve(filePath)];
+      mod = require(filePath);
+    } catch (e) {
+      // Roll back — bad code on disk would block the auto-loader on restart.
+      try { fs.unlinkSync(filePath); } catch {}
+      return { error: `Generated tool failed to load (file removed): ${e.message}` };
+    }
+    if (typeof mod.impl !== "function") {
+      try { fs.unlinkSync(filePath); } catch {}
+      return { error: "implementation_code did not evaluate to a function (file removed)" };
+    }
+    tools.push({
+      name: mod.name,
+      description: mod.description,
+      defer_loading: true,
+      input_schema: mod.input_schema,
+    });
+    toolImpls[mod.name] = mod.impl;
+    return {
+      ok: true,
+      name,
+      file: filePath,
+      note: "Tool is now registered and persisted. You can call it in this same run to fulfil the original request.",
+    };
+  },
+
+  // Revoke a previously generated tool. Only operates on tools/generated/<name>.js
+  // — built-in tools cannot be deleted. Confirmation gated. The tool is removed
+  // from the live registry AND the file is deleted, so it doesn't reappear on
+  // restart.
+  async delete_generated_tool({ name, confirmed = false }) {
+    if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
+      return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
+    }
+    const filePath = path.join(__dirname, "tools", "generated", `${name}.js`);
+    if (!fs.existsSync(filePath)) {
+      return { error: `No generated tool file at ${filePath}. Built-in tools cannot be deleted with this action.` };
+    }
+    if (!toolImpls[name]) {
+      return { error: `Tool '${name}' is not registered (file exists but not loaded). Inspect or remove ${filePath} manually.` };
+    }
+    let proposedDescription = "";
+    try {
+      const mod = require(filePath);
+      proposedDescription = mod.description || "";
+    } catch {}
+    if (!confirmed) {
+      return {
+        status: "confirmation_required",
+        behavior_for_user: proposedDescription
+          ? `Remove the action that does the following: ${proposedDescription}`
+          : `Remove a previously added action.`,
+        replay_args: { name, confirmed: true },
+        internal_name: name,
+        to_proceed:
+          "DO NOT execute yet. Reply to the user in plain English describing the action being removed (use behavior_for_user). " +
+          "DO NOT mention the internal_name, file paths, or any plumbing in the user-facing reply. " +
+          "On their explicit go-ahead, call delete_generated_tool again with replay_args.",
+      };
+    }
+    // Remove from the live tools array.
+    const idx = tools.findIndex((t) => t.name === name);
+    if (idx !== -1) tools.splice(idx, 1);
+    delete toolImpls[name];
+    try {
+      delete require.cache[require.resolve(filePath)];
+    } catch {}
+    fs.unlinkSync(filePath);
+    return {
+      ok: true,
+      removed: name,
+      file: filePath,
+      note: "Tool unregistered and file deleted. It will not reappear on restart.",
+    };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1466,6 +1844,34 @@ const tools = [
   {
     type: "tool_search_tool_bm25_20251119",
     name: "tool_search_tool_bm25",
+  },
+  {
+    name: "propose_new_tool",
+    description:
+      "Propose and register a NEW agent tool that doesn't exist yet. When to use: the user asks for something no existing tool supports AND you've already searched via tool_search_tool_bm25 to confirm the gap. CONFIRMATION GATED: first call shows the FULL proposed code to the user — they review and explicitly approve before anything is written or executed. Once approved the tool is persisted to tools/generated/<name>.js (git-visible, revokable by deleting the file) and hot-loaded into the live process so you can call it immediately to fulfil the original request. Only propose tools that are SMALL, SCOPED, and SAFE — single-purpose impls, no shelling out, no filesystem writes outside the tool's narrow purpose, no secrets exfiltration.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Tool name. Lowercase letters/digits/underscores, starts with a letter (e.g. 'create_invoice', 'log_workout')." },
+        description: { type: "string", description: "When-to-use guidance for future agent runs. Same shape as descriptions on existing tools." },
+        input_schema: { type: "object", description: "JSON Schema for the tool's input args. Must be a valid JSON Schema object with type and properties." },
+        implementation_code: { type: "string", description: "A JavaScript function expression — e.g. 'async function ({ x, y }) { ... return { ok: true }; }'. Inside the function, `this` is bound to the tool registry, so you can call other tools via `this.lookup_person(...)`. Available globals: require, process, fetch, console, __dirname. Keep it small and scoped." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed tool definition." },
+      },
+      required: ["name", "description", "input_schema", "implementation_code"],
+    },
+  },
+  {
+    name: "delete_generated_tool",
+    description: "Revoke a previously generated tool. Only works on tools that were minted via propose_new_tool (the file must exist under tools/generated/). Built-in tools cannot be deleted with this action. CONFIRMATION GATED: first call returns a plain-English preview of the action being removed; second call with confirmed: true unregisters and deletes the file.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The name of the generated tool to remove. If the user describes the tool by behavior rather than name, look up matches via tool_search_tool_bm25 first." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly confirmed the removal." },
+      },
+      required: ["name"],
+    },
   },
   {
     name: "lookup_person",
@@ -1520,7 +1926,7 @@ const tools = [
   {
     name: "update_payment",
     description:
-      "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together.",
+      "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together. CONFIRMATION GATED: first call with proposed values returns a preview; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
@@ -1533,6 +1939,7 @@ const tools = [
         payment_risk: { type: "string", enum: ["Low", "Medium", "High"] },
         amount_total: { type: "number" },
         amount_paid: { type: "number" },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed change." },
       },
       required: ["person_id"],
     },
@@ -1634,12 +2041,13 @@ const tools = [
   },
   {
     name: "delete_clickup_task",
-    description: "Delete a ClickUp task by its ID. When to use: a task is no longer relevant, was created in error, or the user explicitly asks to delete it. When NOT to use: to mark a task complete (let the user close it in ClickUp).",
+    description: "Delete a ClickUp task by its ID. When to use: a task is no longer relevant, was created in error, or the user explicitly asks to delete it. When NOT to use: to mark a task complete (let the user close it in ClickUp). CONFIRMATION GATED: first call returns a preview; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         task_id: { type: "string", description: "The ClickUp task ID (visible in the task URL after /t/)" },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the deletion." },
       },
       required: ["task_id"],
     },
@@ -1894,6 +2302,55 @@ const tools = [
     },
   },
   {
+    name: "query_table",
+    description: "Read records from any NocoDB table with filter / sort / fields / pagination. When to use: ad-hoc questions across data the agent doesn't have a specialized lookup for ('show me touchpoints from this week', 'list agent actions where success was false', 'find rows in the Invoices table for May'). Read-only. Use list_tables first to discover table_id. PREFER list_people / lookup_person / list_clickup_tasks when those fit — they understand their schemas. 'where' is NocoDB filter syntax: '(Name,like,Joseph%)', '(Status,eq,Open)~and(Amount,gt,500)'. 'sort' is column name or '-column' for descending.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string", description: "NocoDB table ID (use list_tables to discover)." },
+        where: { type: "string", description: "NocoDB filter syntax. Examples: '(Name,like,Joseph%)', '(Stage,eq,Onboarding)~and(Amount,gt,500)'." },
+        fields: { type: "array", items: { type: "string" }, description: "Subset of column names to return. Omit for all." },
+        sort: { type: "string", description: "Column name (asc) or '-column' (desc)." },
+        limit: { type: "number", description: "Max rows. Default 25, hard cap 200." },
+        offset: { type: "number", description: "Skip this many rows. For pagination." },
+      },
+      required: ["table_id"],
+    },
+  },
+  {
+    name: "bulk_update_records",
+    description: "Bulk-update records in any NocoDB table by Id. When to use: applying a change across many rows at once ('mark these 5 people as paid', 'set status to Archived for these tasks'). Each record must include 'Id' plus the fields to set. PREFER specialized tools (update_person, update_payment, etc.) when one fits. CONFIRMATION GATED: first call returns a preview, second call with confirmed: true executes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        records: {
+          type: "array",
+          description: "Array of {Id, column_title: value, ...} objects. 'Id' required on every record. Max 100 per call.",
+          items: { type: "object" },
+        },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed update." },
+      },
+      required: ["table_id", "records"],
+    },
+  },
+  {
+    name: "delete_records",
+    description: "Delete records from any NocoDB table by Id. Irreversible. PREFER soft-delete approaches (set a status field) where possible. CONFIRMATION GATED: first call returns a preview listing the affected Ids, second call with confirmed: true executes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        record_ids: { type: "array", items: { type: "number" }, description: "List of NocoDB record Ids to delete. Max 100 per call." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed deletion." },
+      },
+      required: ["table_id", "record_ids"],
+    },
+  },
+  {
     name: "find_person_by_phone",
     description: "Find People records matching a phone number. When to use: voice transcript mentions a phone number (e.g. 'plus six one four hundred...' becomes '+61 400...'). Tries the query as-given, with non-digits stripped, with/without +61 country code, and last-7-digits as a fallback. When NOT to use: use lookup_person for email/name searches.",
     defer_loading: true,
@@ -1917,7 +2374,7 @@ const tools = [
   },
   {
     name: "create_calendar_event",
-    description: "Create a native Google Calendar event on Yohan's calendar with the participant as an attendee. PREFERRED over draft_calendar_invite_email when scheduling — the event lands on Yohan's calendar so he can see it alongside other commitments. By DEFAULT does NOT send an invite email (send_invites=false) — just creates the event silently. Yohan can then review the calendar entry and either send invites manually from Calendar UI, or you can call again with send_invites=true if user explicitly says 'send the invite'. Use check_calendar_availability first if there's any chance of conflict.",
+    description: "Create a native Google Calendar event on Yohan's calendar with the participant as an attendee. PREFERRED over draft_calendar_invite_email when scheduling — the event lands on Yohan's calendar so he can see it alongside other commitments. By DEFAULT does NOT send an invite email (send_invites=false) — just creates the event silently. Yohan can then review the calendar entry and either send invites manually from Calendar UI, or you can call again with send_invites=true if user explicitly says 'send the invite'. Use check_calendar_availability first if there's any chance of conflict. CONFIRMATION GATED: first call returns a preview of the event; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
@@ -1929,6 +2386,7 @@ const tools = [
         description: { type: "string", description: "Default: short onboarding description." },
         location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
         send_invites: { type: "boolean", description: "Default false. Set true ONLY when the user explicitly confirms they want Google to email the invite to the attendee. Otherwise the event sits on Yohan's calendar quietly, ready for him to send manually." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed event." },
       },
       required: ["person_id", "datetime"],
     },
@@ -1962,6 +2420,20 @@ const tools = [
         location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
       },
       required: ["person_id", "datetime"],
+    },
+  },
+  {
+    name: "read_google_sheet",
+    description: "Read values from a Google Sheet. When to use: user references / pastes / uploads a Google Sheet and wants you to act on its contents ('here's the spreadsheet of new participants — add them', 'check this sheet for who's missing a phone number'). Read-only. Accepts a bare spreadsheet ID or a full sheets.google.com URL — the tool extracts the ID. Range is A1 notation ('Sheet1!A1:D', 'A:F', or just a tab name 'Sheet1'). Omit range to default to the first tab. Returns rows as array-of-arrays; row 0 is typically the header row. Use bulk_create_records / create_person follow-ups to act on the data.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        sheet_id: { type: "string", description: "Spreadsheet ID (e.g. '1abc...') or full sheets.google.com URL." },
+        range: { type: "string", description: "A1 notation ('Sheet1!A1:D', 'A:F', or 'Sheet1'). Omit for the first tab." },
+        max_rows: { type: "number", description: "Truncate to this many rows. Default 500." },
+      },
+      required: ["sheet_id"],
     },
   },
   {
@@ -2024,14 +2496,14 @@ const tools = [
   },
   {
     name: "create_slack_reminder",
-    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Time accepts Unix epoch seconds OR natural language Slack parses server-side ('in 30 minutes', 'tomorrow at 3pm', 'next Monday 9am'). Defaults to setting the reminder for the bot if no user given; pass 'yohan'/'valerie'/'nathan' or a user_id to set it for someone else.",
+    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Always pass `time` as Unix epoch seconds — compute it from the current date (provided in your context) plus the requested offset. Slack also accepts natural language but the ClickUp fallback can only set a structured due_date when `time` is numeric, so prefer epoch seconds even when Slack would parse the phrase. For 'remind me' requests pass the from_user_id from the '## Slack message reference' block at the top of the transcript — that's the sender. For 'remind <name>' pass 'yohan'/'valerie'/'nathan' or a user_id. Slack bot tokens can't set reminders for other users; if that fails this tool automatically falls back to creating a ClickUp task assigned to the intended recipient.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         text: { type: "string", description: "What the reminder should say." },
-        time: { type: "string", description: "Unix epoch seconds or Slack natural language ('in 1 hour', 'tomorrow at 3pm', 'next Monday 9am')." },
-        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or Slack user_id. Omit to set the reminder for the bot itself." },
+        time: { type: "string", description: "Unix epoch seconds — compute from current date + requested offset. Natural language ('in 1 hour', 'tomorrow at 3pm') also works for the Slack call but loses the due_date when this tool falls back to a ClickUp task, so prefer epoch seconds." },
+        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or a Slack user_id. For 'remind me' use the from_user_id from the '## Slack message reference' block. Omit only if the request is explicitly for the bot itself." },
       },
       required: ["text", "time"],
     },
@@ -2126,6 +2598,29 @@ Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-langu
 
 ACT, DON'T NARRATE:
 When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities.
+
+SELF-EXTENSION (propose_new_tool):
+If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
+1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case. NOTE: propose_new_tool enforces this in code — it will refuse to run unless tool_search_tool_bm25 has been called earlier in the same agent run. If you skip the search, the proposal call returns an error reminding you to search first.
+2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I can't do that yet. Want me to add the ability?". Wait for their go-ahead.
+3. Call propose_new_tool with name, description, input_schema, and implementation_code. The first call returns a confirmation preview.
+4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH and surface ZERO internals. Yohan and Valerie are non-technical. They don't need or want to see: the internal tool name, JavaScript code, JSON schemas, parameter lists, or any plumbing language. Describe ONLY what will happen in human terms ("This will look up someone by name and post a workout link to their Slack DM. Want me to add it?"). The technical details are auto-saved to git for separate developer review.
+5. On their explicit go-ahead, call propose_new_tool again with the replay_args from the preview (which already has confirmed: true). The tool is persisted to tools/generated/<name>.js (git-visible, deletable to revoke) and hot-loaded.
+6. Immediately use the new tool to fulfil the original request. After it runs, describe the outcome in plain English — again, no need to mention that a "new action" was added or what it's called.
+Implementation code runs inside the bot's process. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: require, process, fetch, console, __dirname. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
+
+To revoke a previously minted tool, use delete_generated_tool. Same plain-English confirmation rules — describe the action being removed in human terms, not its internal name.
+
+DIRECT DATA MANIPULATION:
+For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
+For WRITES the default flips: PREFER specialized tools (update_person, update_payment, toggle_stage, create_person, add_note, log_touchpoint) over bulk_update_records / delete_records when one fits. The specialized write tools encode invariants you'd otherwise have to remember every call: update_payment auto-recomputes Amount owing; toggle_stage applies the documented stage cascade (welcome_email_sent → deposit_paid, etc.); add_note timestamps and appends instead of overwriting. Skipping them means silent drift in production data that's hard to spot weeks later. Use bulk_update_records / delete_records when the target is a non-People table, when you're applying the same change across many rows, or when no specialized tool covers the field.
+
+CONFIRMATION GATING:
+A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
+1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
+2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
+3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
+This is a guardrail Yohan asked for on writes that touch money / calendar / destructive operations. Do NOT skip it. If the user's original ask is already specific and unambiguous, the confirmation step is still required — that's the point. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate; they're either reversible or already gated by drafts/review.
 
 QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
@@ -2346,7 +2841,11 @@ async function runAgent(transcript) {
           result = { error: `Tool not implemented: ${block.name}` };
         } else {
           try {
-            result = await impl.call(toolImpls, block.input);
+            // Spread so tool impls keep working via `this.<other_tool>`, but
+            // expose the running trace so tools that need to enforce
+            // call-order invariants (e.g. propose_new_tool requires a prior
+            // tool_search_tool_bm25 call) can introspect it.
+            result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
           } catch (e) {
             result = { error: e.message };
           }
@@ -2531,13 +3030,18 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const GOOGLE_REDIRECT = `https://openclaude-agent.onrender.com/oauth/google/callback`;
 // Scopes granted when the user OAuths.
-//   gmail.compose      — create Gmail drafts (existing tools)
-//   calendar.events    — create / update Calendar events on the user's calendar
-//   calendar.readonly  — list events for free-busy lookups
+//   gmail.compose         — create Gmail drafts (existing tools)
+//   calendar.events       — create / update Calendar events on the user's calendar
+//   calendar.readonly     — list events for free-busy lookups
+//   spreadsheets.readonly — read Google Sheets (read_google_sheet tool)
+// NOTE: existing refresh tokens issued before adding spreadsheets.readonly will
+// NOT carry the new scope. Re-run the OAuth flow at /oauth/google/start to mint
+// a fresh refresh token before read_google_sheet will work.
 const GOOGLE_SCOPE = [
   "https://www.googleapis.com/auth/gmail.compose",
   "https://www.googleapis.com/auth/calendar.events",
   "https://www.googleapis.com/auth/calendar.readonly",
+  "https://www.googleapis.com/auth/spreadsheets.readonly",
 ].join(" ");
 const oauthStateStore = new Map(); // state → expiry timestamp
 
@@ -2671,6 +3175,42 @@ function loadSkills() {
   }
 }
 loadSkills();
+
+// Generated tools — agent-authored tools created via propose_new_tool. Files
+// live in tools/generated/<name>.js as CommonJS modules exporting
+// { name, description, input_schema, impl }. They're visible in git so changes
+// are reviewable and revokable (delete the file + redeploy to remove).
+function loadGeneratedTools() {
+  const dir = path.join(__dirname, "tools", "generated");
+  if (!fs.existsSync(dir)) return;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".js")) continue;
+    const fullPath = path.join(dir, file);
+    try {
+      delete require.cache[require.resolve(fullPath)];
+      const mod = require(fullPath);
+      if (!mod.name || !mod.impl || !mod.input_schema) {
+        console.error(`[tools/generated] ${file} missing name/impl/input_schema — skipping`);
+        continue;
+      }
+      if (toolImpls[mod.name]) {
+        console.error(`[tools/generated] ${file} name '${mod.name}' collides with existing tool — skipping`);
+        continue;
+      }
+      tools.push({
+        name: mod.name,
+        description: mod.description || "",
+        defer_loading: mod.defer_loading ?? true,
+        input_schema: mod.input_schema,
+      });
+      toolImpls[mod.name] = mod.impl;
+      console.log(`[tools/generated] loaded ${mod.name} from ${file}`);
+    } catch (e) {
+      console.error(`[tools/generated] failed to load ${file}: ${e.message}`);
+    }
+  }
+}
+loadGeneratedTools();
 
 function renderTemplate(name, vars) {
   let html = EMAIL_TEMPLATES[name];
@@ -2864,7 +3404,17 @@ app.post("/run", async (req, res) => {
   // reply's. Reacting will land on the thread parent. For top-level messages
   // (most common), thread_ts equals event.ts so this targets the right message.
   if (slack_context?.channel) {
-    const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n\n`;
+    const fromId = slack_context.user_id || null;
+    const teamMap = {
+      [process.env.YOHAN_SLACK_ID]: "yohan",
+      [process.env.VALERIE_SLACK_ID]: "valerie",
+      [process.env.NATHAN_SLACK_ID]: "nathan",
+    };
+    const fromName = fromId ? (teamMap[fromId] || null) : null;
+    const fromLine = fromId
+      ? `from_user_id: ${fromId}${fromName ? ` (${fromName})` : ""}\n`
+      : "";
+    const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n${fromLine}\n`;
     enrichedTranscript = ref + enrichedTranscript;
   }
   let result;
