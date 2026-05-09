@@ -1520,68 +1520,78 @@ ${location ? `<p>Location: ${location}</p>` : ""}
         }
         friendlyName = key;
       }
+    } else {
+      return {
+        error:
+          "user required. Pass the from_user_id from the '## Slack message reference' block at the top of the transcript for 'remind me' requests, or 'yohan' / 'valerie' / 'nathan' / a Slack user_id for someone else.",
+      };
     }
-    const params = new URLSearchParams({ text, time: String(time) });
-    if (userId) params.set("user", userId);
-    const res = await fetch("https://slack.com/api/reminders.add", {
+    const postAt = /^\d+$/.test(String(time)) ? Number(time) : null;
+    if (postAt === null) {
+      return {
+        error:
+          "time must be Unix epoch seconds. Compute from the current date in your context plus the requested offset (e.g. now + 300 for 'in 5 minutes'). Slack natural-language strings are not accepted by chat.scheduleMessage.",
+      };
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (postAt <= nowSec) {
+      return { error: `time must be in the future (got post_at=${postAt}, now=${nowSec})` };
+    }
+    if (postAt > nowSec + 120 * 86400) {
+      return { error: "time cannot be more than 120 days in the future (Slack chat.scheduleMessage limit)" };
+    }
+    // chat.scheduleMessage works with bot tokens for any user the bot can DM —
+    // unlike reminders.add which silently no-ops the `user` param on bot tokens.
+    // The bot will DM the target user at post_at with the reminder text.
+    const res = await fetch("https://slack.com/api/chat.scheduleMessage", {
       method: "POST",
       headers: {
         authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-        "content-type": "application/x-www-form-urlencoded",
+        "content-type": "application/json; charset=utf-8",
       },
-      body: params.toString(),
+      body: JSON.stringify({
+        channel: userId,
+        text: `:bell: Reminder: ${text}`,
+        post_at: postAt,
+      }),
     });
     const data = await res.json();
     if (!data.ok) {
-      // Slack bot tokens can only set reminders for the bot itself. When the caller
-      // asked for a reminder on another user, Slack rejects with cannot_add_bot,
-      // not_allowed_token_type, user_not_found, etc. Fall back to a ClickUp task
-      // assigned to that person — same intent (a future nudge), different surface.
+      // Hard failure (channel can't open, user_not_found, etc) — fall back to a
+      // ClickUp task assigned to the intended recipient. Same intent, different
+      // surface.
       const slackErr = data.error || JSON.stringify(data);
-      const otherUserErrors = new Set([
-        "cannot_add_bot",
-        "cannot_add_others",
-        "not_allowed_token_type",
-        "user_not_found",
-        "no_perm",
-      ]);
-      if (userId && otherUserErrors.has(slackErr)) {
-        const dueMs = /^\d+$/.test(String(time)) ? Number(time) * 1000 : null;
-        const taskName = `Reminder: ${text}`;
-        const taskDesc = dueMs
-          ? `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${new Date(dueMs).toISOString()}`
-          : `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${time}`;
-        const fallback = await this.create_clickup_task({
-          name: taskName,
-          description: taskDesc,
-          due_date: dueMs,
-          assignees: friendlyName ? [friendlyName] : null,
-        });
-        if (fallback?.error) {
-          return { error: `Slack reminders.add failed (${slackErr}); ClickUp fallback also failed: ${fallback.error}` };
-        }
-        return {
-          ok: true,
-          fallback: "clickup_task",
-          reason: `Slack rejected reminders.add with '${slackErr}' — bot tokens can't set reminders for other users. Created a ClickUp task instead.`,
-          task_id: fallback.id,
-          task_url: fallback.url,
-          assignee: friendlyName || userId,
-        };
+      const dueMs = postAt * 1000;
+      const fallback = await this.create_clickup_task({
+        name: `Reminder: ${text}`,
+        description: `Auto-created because Slack rejected chat.scheduleMessage (${slackErr}).\n\n**When:** ${new Date(dueMs).toISOString()}`,
+        due_date: dueMs,
+        assignees: friendlyName ? [friendlyName] : null,
+      });
+      if (fallback?.error) {
+        return { error: `Slack chat.scheduleMessage failed (${slackErr}); ClickUp fallback also failed: ${fallback.error}` };
       }
-      return { error: `Slack reminders.add failed: ${slackErr}` };
+      return {
+        ok: true,
+        fallback: "clickup_task",
+        reason: `Slack rejected chat.scheduleMessage with '${slackErr}'. Created a ClickUp task instead.`,
+        task_id: fallback.id,
+        task_url: fallback.url,
+        assignee: friendlyName || userId,
+      };
     }
     return {
       ok: true,
-      reminder_id: data.reminder?.id,
-      text: data.reminder?.text,
-      time: data.reminder?.time,
-      user: data.reminder?.user,
+      scheduled_message_id: data.scheduled_message_id,
+      channel: data.channel,
+      post_at: data.post_at,
+      user: userId,
+      friendly_name: friendlyName,
     };
   },
 
   async list_slack_reminders() {
-    const res = await fetch("https://slack.com/api/reminders.list", {
+    const res = await fetch("https://slack.com/api/chat.scheduledMessages.list", {
       method: "POST",
       headers: {
         authorization: `Bearer ${SLACK_BOT_TOKEN}`,
@@ -1590,17 +1600,15 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     });
     const data = await res.json();
     if (!data.ok) {
-      return { error: `Slack reminders.list failed: ${data.error || JSON.stringify(data)}` };
+      return { error: `Slack chat.scheduledMessages.list failed: ${data.error || JSON.stringify(data)}` };
     }
     return {
-      count: (data.reminders || []).length,
-      reminders: (data.reminders || []).map((r) => ({
+      count: (data.scheduled_messages || []).length,
+      reminders: (data.scheduled_messages || []).map((r) => ({
         id: r.id,
+        channel: r.channel_id,
         text: r.text,
-        time: r.time,
-        complete_ts: r.complete_ts || null,
-        user: r.user,
-        creator: r.creator,
+        post_at: r.post_at,
       })),
     };
   },
@@ -2496,21 +2504,21 @@ const tools = [
   },
   {
     name: "create_slack_reminder",
-    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Always pass `time` as Unix epoch seconds — compute it from the current date (provided in your context) plus the requested offset. Slack also accepts natural language but the ClickUp fallback can only set a structured due_date when `time` is numeric, so prefer epoch seconds even when Slack would parse the phrase. For 'remind me' requests pass the from_user_id from the '## Slack message reference' block at the top of the transcript — that's the sender. For 'remind <name>' pass 'yohan'/'valerie'/'nathan' or a user_id. Slack bot tokens can't set reminders for other users; if that fails this tool automatically falls back to creating a ClickUp task assigned to the intended recipient.",
+    description: "Schedule a future ping to a Slack user. Implementation: a DM from the bot at the requested time with a reminder message — NOT a native Slack /remind reminder (bot tokens can't create those). Behaviorally equivalent for the user's intent ('ping me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Always pass `time` as Unix epoch seconds — compute from the current date in your context plus the requested offset. Always pass `user`: for 'remind me' use the from_user_id from the '## Slack message reference' block; for 'remind <name>' use 'yohan'/'valerie'/'nathan' or a Slack user_id. Slack limits the schedule window to 120 days. If Slack rejects (rare — usually a hard failure like user_not_found), the tool falls back to a ClickUp task assigned to the intended recipient.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
-        text: { type: "string", description: "What the reminder should say." },
-        time: { type: "string", description: "Unix epoch seconds — compute from current date + requested offset. Natural language ('in 1 hour', 'tomorrow at 3pm') also works for the Slack call but loses the due_date when this tool falls back to a ClickUp task, so prefer epoch seconds." },
-        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or a Slack user_id. For 'remind me' use the from_user_id from the '## Slack message reference' block. Omit only if the request is explicitly for the bot itself." },
+        text: { type: "string", description: "What the reminder DM should say." },
+        time: { type: "number", description: "Unix epoch seconds — compute from current date in your context + requested offset. Natural-language phrases are NOT accepted (Slack's chat.scheduleMessage requires a numeric post_at). Must be in the future and within 120 days." },
+        user: { type: "string", description: "REQUIRED. 'yohan' / 'valerie' / 'nathan' or a Slack user_id. For 'remind me' use the from_user_id from the '## Slack message reference' block — that's the sender." },
       },
-      required: ["text", "time"],
+      required: ["text", "time", "user"],
     },
   },
   {
     name: "list_slack_reminders",
-    description: "List Slack reminders the bot can see. When to use: user asks 'what reminders do I have?' or 'is there a reminder for X?'. Returns id, text, scheduled time, completion status.",
+    description: "List the bot's pending scheduled-message reminders (DMs the bot has scheduled but not yet sent). When to use: user asks 'what reminders do I have?' or 'is there a reminder for X?'. Returns id, channel, text, post_at. Note: this only lists what the bot scheduled via create_slack_reminder, NOT native Slack /remind reminders the user set themselves.",
     defer_loading: true,
     input_schema: { type: "object", properties: {}, required: [] },
   },
