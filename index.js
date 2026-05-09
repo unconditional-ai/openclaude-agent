@@ -1320,19 +1320,28 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   async create_slack_reminder({ text, time, user = null }) {
     if (!text || !time) return { error: "text and time are both required" };
     let userId = null;
+    let friendlyName = null;
     if (user) {
       if (typeof user === "string" && /^U[A-Z0-9]+$/.test(user)) {
         userId = user;
+        const reverse = {
+          [process.env.YOHAN_SLACK_ID]: "yohan",
+          [process.env.VALERIE_SLACK_ID]: "valerie",
+          [process.env.NATHAN_SLACK_ID]: "nathan",
+        };
+        friendlyName = reverse[userId] || null;
       } else {
         const map = {
           yohan: process.env.YOHAN_SLACK_ID,
           valerie: process.env.VALERIE_SLACK_ID,
           nathan: process.env.NATHAN_SLACK_ID,
         };
-        userId = map[String(user).toLowerCase().trim()];
+        const key = String(user).toLowerCase().trim();
+        userId = map[key];
         if (!userId) {
           return { error: `Unknown user: ${user}. Use 'yohan' / 'valerie' / 'nathan' or a Slack user_id.` };
         }
+        friendlyName = key;
       }
     }
     const params = new URLSearchParams({ text, time: String(time) });
@@ -1347,7 +1356,43 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     });
     const data = await res.json();
     if (!data.ok) {
-      return { error: `Slack reminders.add failed: ${data.error || JSON.stringify(data)}` };
+      // Slack bot tokens can only set reminders for the bot itself. When the caller
+      // asked for a reminder on another user, Slack rejects with cannot_add_bot,
+      // not_allowed_token_type, user_not_found, etc. Fall back to a ClickUp task
+      // assigned to that person — same intent (a future nudge), different surface.
+      const slackErr = data.error || JSON.stringify(data);
+      const otherUserErrors = new Set([
+        "cannot_add_bot",
+        "cannot_add_others",
+        "not_allowed_token_type",
+        "user_not_found",
+        "no_perm",
+      ]);
+      if (userId && otherUserErrors.has(slackErr)) {
+        const dueMs = /^\d+$/.test(String(time)) ? Number(time) * 1000 : null;
+        const taskName = `Reminder: ${text}`;
+        const taskDesc = dueMs
+          ? `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${new Date(dueMs).toISOString()}`
+          : `Auto-created from a Slack reminder request (Slack bot tokens can't set reminders for other users).\n\n**When:** ${time}`;
+        const fallback = await this.create_clickup_task({
+          name: taskName,
+          description: taskDesc,
+          due_date: dueMs,
+          assignees: friendlyName ? [friendlyName] : null,
+        });
+        if (fallback?.error) {
+          return { error: `Slack reminders.add failed (${slackErr}); ClickUp fallback also failed: ${fallback.error}` };
+        }
+        return {
+          ok: true,
+          fallback: "clickup_task",
+          reason: `Slack rejected reminders.add with '${slackErr}' — bot tokens can't set reminders for other users. Created a ClickUp task instead.`,
+          task_id: fallback.id,
+          task_url: fallback.url,
+          assignee: friendlyName || userId,
+        };
+      }
+      return { error: `Slack reminders.add failed: ${slackErr}` };
     }
     return {
       ok: true,
@@ -2024,14 +2069,14 @@ const tools = [
   },
   {
     name: "create_slack_reminder",
-    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Time accepts Unix epoch seconds OR natural language Slack parses server-side ('in 30 minutes', 'tomorrow at 3pm', 'next Monday 9am'). Defaults to setting the reminder for the bot if no user given; pass 'yohan'/'valerie'/'nathan' or a user_id to set it for someone else.",
+    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Time accepts Unix epoch seconds OR natural language Slack parses server-side ('in 30 minutes', 'tomorrow at 3pm', 'next Monday 9am'). For 'remind me' requests pass the from_user_id from the '## Slack message reference' block at the top of the transcript — that's the sender. For 'remind <name>' pass 'yohan'/'valerie'/'nathan' or a user_id. Slack bot tokens can't set reminders for other users; if that fails this tool automatically falls back to creating a ClickUp task assigned to the intended recipient.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         text: { type: "string", description: "What the reminder should say." },
         time: { type: "string", description: "Unix epoch seconds or Slack natural language ('in 1 hour', 'tomorrow at 3pm', 'next Monday 9am')." },
-        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or Slack user_id. Omit to set the reminder for the bot itself." },
+        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or a Slack user_id. For 'remind me' use the from_user_id from the '## Slack message reference' block. Omit only if the request is explicitly for the bot itself." },
       },
       required: ["text", "time"],
     },
@@ -2864,7 +2909,17 @@ app.post("/run", async (req, res) => {
   // reply's. Reacting will land on the thread parent. For top-level messages
   // (most common), thread_ts equals event.ts so this targets the right message.
   if (slack_context?.channel) {
-    const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n\n`;
+    const fromId = slack_context.user_id || null;
+    const teamMap = {
+      [process.env.YOHAN_SLACK_ID]: "yohan",
+      [process.env.VALERIE_SLACK_ID]: "valerie",
+      [process.env.NATHAN_SLACK_ID]: "nathan",
+    };
+    const fromName = fromId ? (teamMap[fromId] || null) : null;
+    const fromLine = fromId
+      ? `from_user_id: ${fromId}${fromName ? ` (${fromName})` : ""}\n`
+      : "";
+    const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n${fromLine}\n`;
     enrichedTranscript = ref + enrichedTranscript;
   }
   let result;
