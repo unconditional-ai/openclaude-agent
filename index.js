@@ -80,6 +80,16 @@ async function ncPatch(path, body) {
   return res.json();
 }
 
+async function ncDelete(path, body) {
+  const res = await fetch(`${NOCODB_URL}${path}`, {
+    method: "DELETE",
+    headers: ncHeaders,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`NocoDB DELETE ${path} → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 const STAGE_ORDER = [
   "onboarding_call_done",
   "deposit_paid",
@@ -967,6 +977,71 @@ const toolImpls = {
     return { table_id, count: ids.length, ids };
   },
 
+  // Generic NocoDB read for any table. Supports filter (where), sort, fields,
+  // limit, offset. Use list_tables first to discover table IDs. Read-only —
+  // no confirmation gate. For specialized People queries prefer list_people /
+  // lookup_person which already understand the People schema.
+  async query_table({ table_id, where = null, fields = null, sort = null, limit = 25, offset = 0 }) {
+    if (!table_id) return { error: "table_id required (use list_tables to discover)" };
+    if (limit > 200) return { error: "limit cannot exceed 200" };
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (where) params.set("where", where);
+    if (Array.isArray(fields) && fields.length > 0) params.set("fields", fields.join(","));
+    if (sort) params.set("sort", sort);
+    const data = await ncGet(`/api/v2/tables/${table_id}/records?${params.toString()}`);
+    return {
+      table_id,
+      count: data.list?.length || 0,
+      total_in_table: data.pageInfo?.totalRows ?? null,
+      has_more: !!data.pageInfo?.isLastPage === false,
+      records: data.list || [],
+    };
+  },
+
+  // Generic NocoDB bulk update by Id. Each record must include 'Id' plus the
+  // fields to set. CONFIRMATION GATED — touches multiple rows at once.
+  async bulk_update_records({ table_id, records, confirmed = false }) {
+    if (!table_id) return { error: "table_id required" };
+    if (!Array.isArray(records) || records.length === 0) {
+      return { error: "records must be a non-empty array of objects, each with 'Id'" };
+    }
+    if (records.length > 100) {
+      return { error: `bulk_update_records accepts up to 100 records per call (got ${records.length}).` };
+    }
+    const missingId = records.findIndex((r) => r?.Id == null);
+    if (missingId !== -1) {
+      return { error: `record at index ${missingId} is missing 'Id' (required for update)` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Update ${records.length} row${records.length === 1 ? "" : "s"} in table ${table_id}. Affected Ids: ${records.map((r) => r.Id).join(", ")}.`,
+        { table_id, records, confirmed: true }
+      );
+    }
+    const updated = await ncPatch(`/api/v2/tables/${table_id}/records`, records);
+    return { table_id, count: Array.isArray(updated) ? updated.length : 1 };
+  },
+
+  // Generic NocoDB delete by Id. CONFIRMATION GATED — irreversible.
+  async delete_records({ table_id, record_ids, confirmed = false }) {
+    if (!table_id) return { error: "table_id required" };
+    if (!Array.isArray(record_ids) || record_ids.length === 0) {
+      return { error: "record_ids must be a non-empty array" };
+    }
+    if (record_ids.length > 100) {
+      return { error: `delete_records accepts up to 100 ids per call (got ${record_ids.length}).` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Delete ${record_ids.length} row${record_ids.length === 1 ? "" : "s"} from table ${table_id} (irreversible). Ids: ${record_ids.join(", ")}.`,
+        { table_id, record_ids, confirmed: true }
+      );
+    }
+    const body = record_ids.map((id) => ({ Id: id }));
+    const result = await ncDelete(`/api/v2/tables/${table_id}/records`, body);
+    return { table_id, deleted: record_ids.length, result };
+  },
+
   // Phone numbers are stored in varied formats ("+61 400 555 090", "0400555090",
   // "+61400555090"). NocoDB's "like" filter is exact substring against stored bytes,
   // so we try a few variants of the query against the Phone column. Returns matching
@@ -1697,6 +1772,56 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       note: "Tool is now registered and persisted. You can call it in this same run to fulfil the original request.",
     };
   },
+
+  // Revoke a previously generated tool. Only operates on tools/generated/<name>.js
+  // — built-in tools cannot be deleted. Confirmation gated. The tool is removed
+  // from the live registry AND the file is deleted, so it doesn't reappear on
+  // restart.
+  async delete_generated_tool({ name, confirmed = false }) {
+    if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
+      return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
+    }
+    const filePath = path.join(__dirname, "tools", "generated", `${name}.js`);
+    if (!fs.existsSync(filePath)) {
+      return { error: `No generated tool file at ${filePath}. Built-in tools cannot be deleted with this action.` };
+    }
+    if (!toolImpls[name]) {
+      return { error: `Tool '${name}' is not registered (file exists but not loaded). Inspect or remove ${filePath} manually.` };
+    }
+    let proposedDescription = "";
+    try {
+      const mod = require(filePath);
+      proposedDescription = mod.description || "";
+    } catch {}
+    if (!confirmed) {
+      return {
+        status: "confirmation_required",
+        behavior_for_user: proposedDescription
+          ? `Remove the action that does the following: ${proposedDescription}`
+          : `Remove a previously added action.`,
+        replay_args: { name, confirmed: true },
+        internal_name: name,
+        to_proceed:
+          "DO NOT execute yet. Reply to the user in plain English describing the action being removed (use behavior_for_user). " +
+          "DO NOT mention the internal_name, file paths, or any plumbing in the user-facing reply. " +
+          "On their explicit go-ahead, call delete_generated_tool again with replay_args.",
+      };
+    }
+    // Remove from the live tools array.
+    const idx = tools.findIndex((t) => t.name === name);
+    if (idx !== -1) tools.splice(idx, 1);
+    delete toolImpls[name];
+    try {
+      delete require.cache[require.resolve(filePath)];
+    } catch {}
+    fs.unlinkSync(filePath);
+    return {
+      ok: true,
+      removed: name,
+      file: filePath,
+      note: "Tool unregistered and file deleted. It will not reappear on restart.",
+    };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1723,6 +1848,18 @@ const tools = [
         confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed tool definition." },
       },
       required: ["name", "description", "input_schema", "implementation_code"],
+    },
+  },
+  {
+    name: "delete_generated_tool",
+    description: "Revoke a previously generated tool. Only works on tools that were minted via propose_new_tool (the file must exist under tools/generated/). Built-in tools cannot be deleted with this action. CONFIRMATION GATED: first call returns a plain-English preview of the action being removed; second call with confirmed: true unregisters and deletes the file.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The name of the generated tool to remove. If the user describes the tool by behavior rather than name, look up matches via tool_search_tool_bm25 first." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly confirmed the removal." },
+      },
+      required: ["name"],
     },
   },
   {
@@ -2154,6 +2291,55 @@ const tools = [
     },
   },
   {
+    name: "query_table",
+    description: "Read records from any NocoDB table with filter / sort / fields / pagination. When to use: ad-hoc questions across data the agent doesn't have a specialized lookup for ('show me touchpoints from this week', 'list agent actions where success was false', 'find rows in the Invoices table for May'). Read-only. Use list_tables first to discover table_id. PREFER list_people / lookup_person / list_clickup_tasks when those fit — they understand their schemas. 'where' is NocoDB filter syntax: '(Name,like,Joseph%)', '(Status,eq,Open)~and(Amount,gt,500)'. 'sort' is column name or '-column' for descending.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string", description: "NocoDB table ID (use list_tables to discover)." },
+        where: { type: "string", description: "NocoDB filter syntax. Examples: '(Name,like,Joseph%)', '(Stage,eq,Onboarding)~and(Amount,gt,500)'." },
+        fields: { type: "array", items: { type: "string" }, description: "Subset of column names to return. Omit for all." },
+        sort: { type: "string", description: "Column name (asc) or '-column' (desc)." },
+        limit: { type: "number", description: "Max rows. Default 25, hard cap 200." },
+        offset: { type: "number", description: "Skip this many rows. For pagination." },
+      },
+      required: ["table_id"],
+    },
+  },
+  {
+    name: "bulk_update_records",
+    description: "Bulk-update records in any NocoDB table by Id. When to use: applying a change across many rows at once ('mark these 5 people as paid', 'set status to Archived for these tasks'). Each record must include 'Id' plus the fields to set. PREFER specialized tools (update_person, update_payment, etc.) when one fits. CONFIRMATION GATED: first call returns a preview, second call with confirmed: true executes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        records: {
+          type: "array",
+          description: "Array of {Id, column_title: value, ...} objects. 'Id' required on every record. Max 100 per call.",
+          items: { type: "object" },
+        },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed update." },
+      },
+      required: ["table_id", "records"],
+    },
+  },
+  {
+    name: "delete_records",
+    description: "Delete records from any NocoDB table by Id. Irreversible. PREFER soft-delete approaches (set a status field) where possible. CONFIRMATION GATED: first call returns a preview listing the affected Ids, second call with confirmed: true executes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        record_ids: { type: "array", items: { type: "number" }, description: "List of NocoDB record Ids to delete. Max 100 per call." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed deletion." },
+      },
+      required: ["table_id", "record_ids"],
+    },
+  },
+  {
     name: "find_person_by_phone",
     description: "Find People records matching a phone number. When to use: voice transcript mentions a phone number (e.g. 'plus six one four hundred...' becomes '+61 400...'). Tries the query as-given, with non-digits stripped, with/without +61 country code, and last-7-digits as a fallback. When NOT to use: use lookup_person for email/name searches.",
     defer_loading: true,
@@ -2412,8 +2598,13 @@ If the user asks for something no existing tool covers, you can propose a brand-
 6. Immediately use the new tool to fulfil the original request. After it runs, describe the outcome in plain English — again, no need to mention that a "new action" was added or what it's called.
 Implementation code runs inside the bot's process. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: require, process, fetch, console, __dirname. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
 
+To revoke a previously minted tool, use delete_generated_tool. Same plain-English confirmation rules — describe the action being removed in human terms, not its internal name.
+
+DIRECT DATA MANIPULATION:
+For ad-hoc reads across any NocoDB table use query_table (filter / sort / fields / pagination). For batch writes use bulk_update_records (gated) or delete_records (gated). PREFER specialized tools first when one fits — list_people, lookup_person, update_person, update_payment, etc. understand their schemas and apply the right cascades. Only fall back to query_table / bulk_update_records / delete_records when the specialized tools don't cover what the user asked for, or when the target is a table other than People.
+
 CONFIRMATION GATING:
-A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
+A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
 1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
 2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
 3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
