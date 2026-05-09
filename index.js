@@ -2716,7 +2716,10 @@ Known team Slack user IDs — use the <@USER_ID> syntax to ping them so they get
 
 @-mention them when your reply recommends they take an action — e.g. "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
 
-For everything else, refer to them by bare name without the @ — casual references ("the call Yohan ran on Tuesday"), reports of past actions ("Valerie marked the deposit paid"), and replies to the person who's talking to you (no need to @ Yohan when Yohan is asking the question). Participants and clients aren't in this workspace, so refer to them by name only. Stick to the three IDs above; for anyone else, use plain names.`;
+For everything else, refer to them by bare name without the @ — casual references ("the call Yohan ran on Tuesday"), reports of past actions ("Valerie marked the deposit paid"), and replies to the person who's talking to you (no need to @ Yohan when Yohan is asking the question). Participants and clients aren't in this workspace, so refer to them by name only. Stick to the three IDs above; for anyone else, use plain names.
+
+ADDRESSING THE SENDER:
+The from_user_id in the '## Slack message reference' block at the top of the transcript is the person who messaged you — they're the one reading your reply. Address them in second person ('you'), not by name in third person. So if Nathan writes to you, never say 'Nathan would need to look at that' — say 'you'd need to look at that' or just describe the issue. Same for Yohan and Valerie when they're the sender. Mention other teammates by name when they're not the sender (e.g. 'Yohan should sign off on this' if Nathan is asking).`;
 
 // ---------- Agent loop ----------
 
