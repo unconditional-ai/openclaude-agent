@@ -1636,18 +1636,20 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     }
     if (!confirmed) {
       // Custom preview shape (not pendingConfirmation) — Yohan and Valerie are
-      // non-technical, so the user-facing summary must NOT include JS code or
-      // JSON schemas. The full code is included as code_for_dev_review for the
-      // agent's own context (and is visible in git after approval), but the
-      // agent is instructed to describe behavior in plain English when replying.
+      // non-technical, so the user-facing summary must NOT include JS code,
+      // JSON schemas, or even the internal tool name. The full code is included
+      // as code_for_dev_review for the agent's own context (and is visible in
+      // git after approval), but the agent is instructed to describe behavior
+      // in plain English when replying.
       return {
         status: "confirmation_required",
-        action_summary: `Add a new action called "${name}". What it does: ${description}`,
+        behavior_for_user: description,
         replay_args: { name, description, input_schema, implementation_code, confirmed: true },
+        internal_name: name,
         code_for_dev_review: implementation_code,
         to_proceed:
-          "DO NOT execute yet. Reply to the user in plain English: explain what the new action will do, what inputs it takes (in plain words, not schema JSON), and ask them to confirm. " +
-          "DO NOT paste implementation_code, input_schema JSON, or any code into the user-facing reply — the user is non-technical. " +
+          "DO NOT execute yet. Reply to the user in plain English: explain what the new action will do and what happens when it runs, using the behavior_for_user field. Ask them to confirm. " +
+          "DO NOT mention the internal_name, paste implementation_code, paste input_schema JSON, or surface ANY internals in the user-facing reply — the user is non-technical and doesn't need to see plumbing. " +
           "On their explicit go-ahead, call propose_new_tool again with replay_args (which already has confirmed: true).",
       };
     }
@@ -2403,11 +2405,11 @@ When you decide to call a tool, call it in the same response. Skip the preview (
 SELF-EXTENSION (propose_new_tool):
 If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
 1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case.
-2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I don't have an action for X. Want me to add one?". Wait for their go-ahead.
+2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I can't do that yet. Want me to add the ability?". Wait for their go-ahead.
 3. Call propose_new_tool with name, description, input_schema, and implementation_code. The first call returns a confirmation preview.
-4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH. Yohan and Valerie are non-technical. Describe what the new action will do, what inputs it takes (in plain words like "a Slack channel name and a message"), and what happens when it runs. DO NOT paste JavaScript code, JSON schemas, or anything that looks like code into the Slack reply. The code is auto-saved to git for technical review separately — you don't need to surface it.
+4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH and surface ZERO internals. Yohan and Valerie are non-technical. They don't need or want to see: the internal tool name, JavaScript code, JSON schemas, parameter lists, or any plumbing language. Describe ONLY what will happen in human terms ("This will look up someone by name and post a workout link to their Slack DM. Want me to add it?"). The technical details are auto-saved to git for separate developer review.
 5. On their explicit go-ahead, call propose_new_tool again with the replay_args from the preview (which already has confirmed: true). The tool is persisted to tools/generated/<name>.js (git-visible, deletable to revoke) and hot-loaded.
-6. Immediately use the new tool to fulfil the original request.
+6. Immediately use the new tool to fulfil the original request. After it runs, describe the outcome in plain English — again, no need to mention that a "new action" was added or what it's called.
 Implementation code runs inside the bot's process. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: require, process, fetch, console, __dirname. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
 
 CONFIRMATION GATING:
