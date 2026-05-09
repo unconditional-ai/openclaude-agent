@@ -233,6 +233,33 @@ function resolveClickUpAssignee(users, name) {
   return null;
 }
 
+// ---------- Confirmation gating ----------
+// High-stakes tools (calendar writes, payment changes, deletes) gate themselves
+// behind a `confirmed: true` arg. First call returns a preview describing what
+// WILL happen; the agent shows it to the user, waits for an explicit go-ahead,
+// then re-calls the same tool with confirmed=true plus the originally proposed
+// args. This is enforced per-tool (not loop-level) because each tool knows the
+// shape of its own preview. Tradeoff: relies on the agent honoring the
+// `to_proceed` instruction rather than holding state in the runtime — simpler,
+// no infrastructure, but the agent must remember to flip confirmed on retry.
+function pendingConfirmation(action_summary, replay_args) {
+  // Strip undefined entries so the agent doesn't replay them as nulls — most of
+  // these tools distinguish 'undefined' (don't touch) from 'null' (clear field).
+  const cleaned = {};
+  for (const [k, v] of Object.entries(replay_args)) {
+    if (v !== undefined) cleaned[k] = v;
+  }
+  return {
+    status: "confirmation_required",
+    action_summary,
+    replay_args: cleaned,
+    to_proceed:
+      "DO NOT execute yet. Reply to the user describing action_summary and ask them to confirm. " +
+      "On their explicit go-ahead (e.g. 'yes', 'go ahead', thumbsup react), call this same tool again " +
+      "with the args from replay_args (which already includes confirmed: true).",
+  };
+}
+
 // ---------- Tool implementations ----------
 
 const toolImpls = {
@@ -351,7 +378,18 @@ const toolImpls = {
     };
   },
 
-  async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk }) {
+  async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk, confirmed = false }) {
+    if (!confirmed) {
+      const proposed = [];
+      if (payment_status !== undefined) proposed.push(`Payment status → ${payment_status}`);
+      if (amount_total !== undefined) proposed.push(`Amount total → ${amount_total}`);
+      if (amount_paid !== undefined) proposed.push(`Amount paid → ${amount_paid}`);
+      if (payment_risk !== undefined) proposed.push(`Payment risk → ${payment_risk}`);
+      return pendingConfirmation(
+        `Update payment for person_id=${person_id}: ${proposed.join("; ") || "(no fields)"}`,
+        { person_id, payment_status, amount_total, amount_paid, payment_risk, confirmed: true }
+      );
+    }
     const updates = { Id: person_id, "Last touch": todayISO() };
     if (payment_status !== undefined) updates["Payment status"] = payment_status;
     if (amount_total !== undefined) updates["Amount total"] = amount_total;
@@ -605,7 +643,13 @@ const toolImpls = {
     };
   },
 
-  async delete_clickup_task({ task_id }) {
+  async delete_clickup_task({ task_id, confirmed = false }) {
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Delete ClickUp task ${task_id} (irreversible).`,
+        { task_id, confirmed: true }
+      );
+    }
     const token = process.env.CLICKUP_TOKEN;
     if (!token) return { error: "CLICKUP_TOKEN not configured" };
     const res = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
@@ -1012,7 +1056,7 @@ const toolImpls = {
   // a Google notification email by default — Yohan reviews and explicitly opts in
   // to send invites by passing send_invites=true (which triggers Google Calendar's
   // own notification path). This preserves the "human reviews before send" model.
-  async create_calendar_event({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null, send_invites = false }) {
+  async create_calendar_event({ person_id, datetime, duration_minutes = 45, title = null, description = null, location = null, send_invites = false, confirmed = false }) {
     if (!datetime) return { error: "datetime required (ISO 8601)" };
     const startUTC = new Date(datetime);
     if (isNaN(startUTC.getTime())) return { error: `Invalid datetime: ${datetime}` };
@@ -1020,6 +1064,12 @@ const toolImpls = {
       return { error: "duration_minutes must be between 1 and 480" };
     }
     const endUTC = new Date(startUTC.getTime() + duration_minutes * 60000);
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Create calendar event for person_id=${person_id}: ${title || "UST Onboarding Call"} — ${startUTC.toISOString()} for ${duration_minutes}min${location ? ` at ${location}` : ""}${send_invites ? " (invite email WILL be sent to attendee)" : " (no invite email — attendee not notified)"}`,
+        { person_id, datetime, duration_minutes, title, description, location, send_invites, confirmed: true }
+      );
+    }
 
     const data = await ncGet(
       `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
@@ -1107,6 +1157,58 @@ const toolImpls = {
       busy_count: busy.length,
       busy,
       free: busy.length === 0,
+    };
+  },
+
+  // Read values from a Google Sheet. Read-only — uses the spreadsheets.readonly
+  // scope. Accepts a bare spreadsheet ID or a full sheets.google.com URL (we
+  // extract the ID from the /d/<ID>/ segment). `range` is A1 notation
+  // ('Sheet1!A1:D', 'A:F', or just 'Sheet1' for the whole tab).
+  async read_google_sheet({ sheet_id, range = null, max_rows = 500 }) {
+    if (!sheet_id) return { error: "sheet_id required (the spreadsheet ID or full Sheets URL)" };
+    let id = String(sheet_id).trim();
+    const urlMatch = id.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    if (urlMatch) id = urlMatch[1];
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+      return { error: `Could not extract a valid spreadsheet ID from: ${sheet_id}` };
+    }
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    // If no range given, fetch sheet metadata to discover the first tab name.
+    let resolvedRange = range;
+    if (!resolvedRange) {
+      const metaRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=sheets.properties.title`,
+        { headers: { authorization: `Bearer ${accessToken}` } }
+      );
+      const meta = await metaRes.json();
+      if (!metaRes.ok) {
+        return { error: `Sheets API ${metaRes.status}: ${meta.error?.message || JSON.stringify(meta)}` };
+      }
+      const firstTab = meta.sheets?.[0]?.properties?.title;
+      if (!firstTab) return { error: "Spreadsheet has no sheets" };
+      resolvedRange = firstTab;
+    }
+    const valRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(resolvedRange)}`,
+      { headers: { authorization: `Bearer ${accessToken}` } }
+    );
+    const val = await valRes.json();
+    if (!valRes.ok) {
+      return { error: `Sheets API ${valRes.status}: ${val.error?.message || JSON.stringify(val)}` };
+    }
+    const rows = val.values || [];
+    const truncated = rows.length > max_rows;
+    return {
+      sheet_id: id,
+      range: val.range || resolvedRange,
+      row_count: rows.length,
+      truncated,
+      rows: truncated ? rows.slice(0, max_rows) : rows,
     };
   },
 
@@ -1565,7 +1667,7 @@ const tools = [
   {
     name: "update_payment",
     description:
-      "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together.",
+      "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together. CONFIRMATION GATED: first call with proposed values returns a preview; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
@@ -1578,6 +1680,7 @@ const tools = [
         payment_risk: { type: "string", enum: ["Low", "Medium", "High"] },
         amount_total: { type: "number" },
         amount_paid: { type: "number" },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed change." },
       },
       required: ["person_id"],
     },
@@ -1679,12 +1782,13 @@ const tools = [
   },
   {
     name: "delete_clickup_task",
-    description: "Delete a ClickUp task by its ID. When to use: a task is no longer relevant, was created in error, or the user explicitly asks to delete it. When NOT to use: to mark a task complete (let the user close it in ClickUp).",
+    description: "Delete a ClickUp task by its ID. When to use: a task is no longer relevant, was created in error, or the user explicitly asks to delete it. When NOT to use: to mark a task complete (let the user close it in ClickUp). CONFIRMATION GATED: first call returns a preview; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         task_id: { type: "string", description: "The ClickUp task ID (visible in the task URL after /t/)" },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the deletion." },
       },
       required: ["task_id"],
     },
@@ -1962,7 +2066,7 @@ const tools = [
   },
   {
     name: "create_calendar_event",
-    description: "Create a native Google Calendar event on Yohan's calendar with the participant as an attendee. PREFERRED over draft_calendar_invite_email when scheduling — the event lands on Yohan's calendar so he can see it alongside other commitments. By DEFAULT does NOT send an invite email (send_invites=false) — just creates the event silently. Yohan can then review the calendar entry and either send invites manually from Calendar UI, or you can call again with send_invites=true if user explicitly says 'send the invite'. Use check_calendar_availability first if there's any chance of conflict.",
+    description: "Create a native Google Calendar event on Yohan's calendar with the participant as an attendee. PREFERRED over draft_calendar_invite_email when scheduling — the event lands on Yohan's calendar so he can see it alongside other commitments. By DEFAULT does NOT send an invite email (send_invites=false) — just creates the event silently. Yohan can then review the calendar entry and either send invites manually from Calendar UI, or you can call again with send_invites=true if user explicitly says 'send the invite'. Use check_calendar_availability first if there's any chance of conflict. CONFIRMATION GATED: first call returns a preview of the event; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
     defer_loading: true,
     input_schema: {
       type: "object",
@@ -1974,6 +2078,7 @@ const tools = [
         description: { type: "string", description: "Default: short onboarding description." },
         location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
         send_invites: { type: "boolean", description: "Default false. Set true ONLY when the user explicitly confirms they want Google to email the invite to the attendee. Otherwise the event sits on Yohan's calendar quietly, ready for him to send manually." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has confirmed the previewed event." },
       },
       required: ["person_id", "datetime"],
     },
@@ -2007,6 +2112,20 @@ const tools = [
         location: { type: "string", description: "Optional. URL (Zoom/Meet link) or physical address." },
       },
       required: ["person_id", "datetime"],
+    },
+  },
+  {
+    name: "read_google_sheet",
+    description: "Read values from a Google Sheet. When to use: user references / pastes / uploads a Google Sheet and wants you to act on its contents ('here's the spreadsheet of new participants — add them', 'check this sheet for who's missing a phone number'). Read-only. Accepts a bare spreadsheet ID or a full sheets.google.com URL — the tool extracts the ID. Range is A1 notation ('Sheet1!A1:D', 'A:F', or just a tab name 'Sheet1'). Omit range to default to the first tab. Returns rows as array-of-arrays; row 0 is typically the header row. Use bulk_create_records / create_person follow-ups to act on the data.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        sheet_id: { type: "string", description: "Spreadsheet ID (e.g. '1abc...') or full sheets.google.com URL." },
+        range: { type: "string", description: "A1 notation ('Sheet1!A1:D', 'A:F', or 'Sheet1'). Omit for the first tab." },
+        max_rows: { type: "number", description: "Truncate to this many rows. Default 500." },
+      },
+      required: ["sheet_id"],
     },
   },
   {
@@ -2171,6 +2290,13 @@ Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-langu
 
 ACT, DON'T NARRATE:
 When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities.
+
+CONFIRMATION GATING:
+A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
+1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
+2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
+3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
+This is a guardrail Yohan asked for on writes that touch money / calendar / destructive operations. Do NOT skip it. If the user's original ask is already specific and unambiguous, the confirmation step is still required — that's the point. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate; they're either reversible or already gated by drafts/review.
 
 QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
@@ -2576,13 +2702,18 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const GOOGLE_REDIRECT = `https://openclaude-agent.onrender.com/oauth/google/callback`;
 // Scopes granted when the user OAuths.
-//   gmail.compose      — create Gmail drafts (existing tools)
-//   calendar.events    — create / update Calendar events on the user's calendar
-//   calendar.readonly  — list events for free-busy lookups
+//   gmail.compose         — create Gmail drafts (existing tools)
+//   calendar.events       — create / update Calendar events on the user's calendar
+//   calendar.readonly     — list events for free-busy lookups
+//   spreadsheets.readonly — read Google Sheets (read_google_sheet tool)
+// NOTE: existing refresh tokens issued before adding spreadsheets.readonly will
+// NOT carry the new scope. Re-run the OAuth flow at /oauth/google/start to mint
+// a fresh refresh token before read_google_sheet will work.
 const GOOGLE_SCOPE = [
   "https://www.googleapis.com/auth/gmail.compose",
   "https://www.googleapis.com/auth/calendar.events",
   "https://www.googleapis.com/auth/calendar.readonly",
+  "https://www.googleapis.com/auth/spreadsheets.readonly",
 ].join(" ");
 const oauthStateStore = new Map(); // state → expiry timestamp
 
