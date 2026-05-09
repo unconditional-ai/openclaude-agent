@@ -2014,6 +2014,7 @@ async function runAgent(transcript) {
         i === lastCacheableIdx ? { ...t, cache_control: { type: "ephemeral" } } : t
       );
     }
+    const t0 = Date.now();
     const response = await anthropic.messages.create({
       model: AGENT_MODEL,
       max_tokens: 2048,
@@ -2027,6 +2028,31 @@ async function runAgent(transcript) {
     messages.push({ role: "assistant", content: response.content });
 
     const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
+
+    // Per-iteration diagnostic. Logs stop_reason, content block types, tool calls
+    // attempted, text-block size, and elapsed ms. Designed to be grep-friendly so
+    // we can diagnose "Compass said something then stopped" failures without
+    // rerunning the request.
+    const ms = Date.now() - t0;
+    const blockTypes = response.content.map((b) => b.type);
+    const tools_called = toolUseBlocks.map((b) => b.name);
+    const textBlocks = response.content.filter((b) => b.type === "text");
+    const textChars = textBlocks.reduce((n, b) => n + (b.text?.length || 0), 0);
+    const usage = response.usage || {};
+    console.log(`[agent] iter=${iteration} stop=${response.stop_reason} ms=${ms} blocks=[${blockTypes.join(",")}] tools=[${tools_called.join(",")}] text_chars=${textChars} input_tokens=${usage.input_tokens || "?"} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0} output_tokens=${usage.output_tokens || "?"}`);
+
+    // Anomaly: stop_reason=end_turn with NO text content and NO tool calls is a
+    // clear bug — model produced nothing actionable. Log loudly.
+    if (response.stop_reason === "end_turn" && textChars === 0 && tools_called.length === 0) {
+      console.error(`[agent] WARN iter=${iteration} ended with no content (no text, no tools)`);
+    }
+    // Anomaly: stop_reason=end_turn but tool_use blocks were present — model
+    // intended to call tools but the API set end_turn instead of tool_use. We
+    // currently ignore tool_use on end_turn; surface this so we can decide
+    // whether to handle it (e.g. process the calls anyway).
+    if (response.stop_reason === "end_turn" && tools_called.length > 0) {
+      console.error(`[agent] WARN iter=${iteration} end_turn with tool_use blocks ignored: [${tools_called.join(",")}]`);
+    }
 
     // Check for ask_for_clarification — terminate loop early
     const clarification = toolUseBlocks.find((b) => b.name === "ask_for_clarification");
