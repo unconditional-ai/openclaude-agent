@@ -1248,6 +1248,37 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   // Send a direct message to a teammate. Different from /run's reply path —
   // this initiates a NEW message to a specific user, not a reply to the
   // triggering channel/thread. Resolves friendly names via env vars.
+  // Add an emoji reaction to a Slack message. Lighter-touch than replying for
+  // brief acknowledgements ("thanks", "got it", "great"). Channel and message_ts
+  // default to the triggering message when not supplied — most common case.
+  async react_to_message({ emoji, channel = null, message_ts = null }) {
+    if (!emoji) return { error: "emoji required (name without colons, e.g. 'thumbsup')" };
+    // Strip leading/trailing colons if the model included them
+    const name = String(emoji).trim().replace(/^:|:$/g, "");
+    // Defaults to the most recent slack_context — runAgent's caller (the /run
+    // handler) attaches this onto a global-ish scope. We pull from the closure
+    // via process.env... actually we don't have it here. The agent must pass
+    // channel + message_ts explicitly when these aren't the triggering message.
+    if (!channel || !message_ts) {
+      return { error: "channel and message_ts required (no implicit triggering-message context inside tool impl). Use the values you can read from the slack_context block in the transcript." };
+    }
+    const res = await fetch("https://slack.com/api/reactions.add", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({ channel, timestamp: message_ts, name }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      // already_reacted is a benign "we tried to add a reaction we'd already added"
+      if (data.error === "already_reacted") return { ok: true, already: true, name };
+      return { error: `Slack reactions.add failed: ${data.error || JSON.stringify(data)}` };
+    }
+    return { ok: true, channel, message_ts, name };
+  },
+
   async send_slack_dm({ to, message, thread_link = null }) {
     if (!to || !message) return { error: "to and message are both required" };
     let userId = null;
@@ -1820,6 +1851,20 @@ const tools = [
     },
   },
   {
+    name: "react_to_message",
+    description: "Add an emoji reaction to a Slack message. Lighter-touch than replying — use for brief acknowledgements where a written reply would be noise ('thanks', 'got it', 'ok'). The triggering message's channel and message_ts are visible at the top of the transcript under '## Slack message reference' — pass those values. Common emoji names: thumbsup, eyes, white_check_mark, raised_hands, pray, sparkles, heart. Use the emoji name without colons.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        emoji: { type: "string", description: "Slack emoji name without colons, e.g. 'thumbsup', 'eyes', 'white_check_mark'." },
+        channel: { type: "string", description: "Slack channel ID — read from '## Slack message reference' in the transcript." },
+        message_ts: { type: "string", description: "Slack message timestamp — read from '## Slack message reference'." },
+      },
+      required: ["emoji", "channel", "message_ts"],
+    },
+  },
+  {
     name: "send_slack_dm",
     description: "Send a direct message to a teammate. Use this when the user asks you to DM someone ('DM Yohan that...', 'send Nathan a private note about X') or when delivering a private update fits better than replying in the original channel. Different from your normal reply: replies happen automatically in whatever channel/thread triggered you; this tool initiates a NEW message to a specific user. Recipient takes a friendly name ('yohan', 'valerie', 'nathan') or a Slack user_id starting with U. Confirm with the user before using if it isn't obvious from their request.",
     defer_loading: true,
@@ -1912,6 +1957,14 @@ CONVERSATION CONTEXT:
 When you're responding to a Slack message, the transcript may include prior context under a "## Thread context" or "## Recent channel context" heading, followed by "## Current message to act on" with the latest message. Use the prior context to resolve references like "that person", "what we just discussed", "the same thing again". Treat the thread context as a real conversation history — your previous replies (labeled "Compass:") are yours; messages from named users are theirs. If the current message obviously builds on prior turns, don't re-ask things already answered.
 If the transcript starts with "## Context status" (instead of "## Thread context" or "## Recent channel context"), Slack context fetching failed — the user may be referencing prior messages you genuinely can't see. Ask them for a brief summary if the current message is ambiguous, rather than guessing.
 If the thread context contains your own past "⚠️ Error: ..." messages, those are pre-fix bug noise. Acknowledge briefly if natural ("I see I had some issues earlier — sorted now") and continue from the user's most recent ask.
+
+REACTIONS vs REPLIES vs SILENCE:
+You have three response modes for any incoming message:
+- **Reply** (post text in the channel/thread): substantive content — answers, results, information, draft outputs.
+- **React** (call react_to_message + then stay_silent): brief acknowledgements that don't warrant a written reply. "thanks Compass" → 👍 thumbsup. "I'll handle that" → 👀 eyes (seen). "great, done" → ✅ white_check_mark. After reacting, call stay_silent so you don't ALSO post a text reply for the same message.
+- **Stay silent** (call stay_silent without reacting): the message wasn't for you at all — humans talking among themselves, false-positive name match, etc.
+
+A useful rule of thumb: would a thoughtful human teammate type a sentence here, or just give the message a thumbs-up? Match that.
 
 WHEN TO USE stay_silent:
 You're triggered by @-mentions, DMs, thread-replies in threads you've replied in, AND any channel message containing the word "compass" (case-insensitive). Many of these are false positives — humans addressing each other or speaking generally. Call stay_silent when the current message is for someone else or general conversation:
@@ -2615,6 +2668,15 @@ app.post("/run", async (req, res) => {
   // phonetic near-misses on names, garbled emails, etc.
   if (slack_context?.file_id) {
     enrichedTranscript = `## Source: voice transcript\n\n${enrichedTranscript}`;
+  }
+  // Surface the triggering message identifiers to the agent so it can react to
+  // the message (react_to_message tool) without needing them passed in tool args.
+  // Note: for thread replies, slack_context.thread_ts is the PARENT's ts, not the
+  // reply's. Reacting will land on the thread parent. For top-level messages
+  // (most common), thread_ts equals event.ts so this targets the right message.
+  if (slack_context?.channel) {
+    const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n\n`;
+    enrichedTranscript = ref + enrichedTranscript;
   }
   let result;
   try {
