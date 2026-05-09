@@ -3026,6 +3026,34 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
+// /version — what's actually running. Render injects RENDER_GIT_COMMIT /
+// RENDER_GIT_BRANCH for deployed services; fall back to reading the local
+// git HEAD when running outside Render (e.g. dev). The boot timestamp is
+// captured once at module load — useful for noticing stale deploys.
+const BOOT_TIME = new Date().toISOString();
+function readLocalGitSha() {
+  try {
+    const headPath = path.join(__dirname, ".git", "HEAD");
+    if (!fs.existsSync(headPath)) return null;
+    const head = fs.readFileSync(headPath, "utf8").trim();
+    if (head.startsWith("ref: ")) {
+      const refPath = path.join(__dirname, ".git", head.slice(5));
+      return fs.existsSync(refPath) ? fs.readFileSync(refPath, "utf8").trim() : null;
+    }
+    return head;
+  } catch {
+    return null;
+  }
+}
+app.get("/version", (_req, res) => {
+  res.json({
+    commit: process.env.RENDER_GIT_COMMIT || readLocalGitSha() || "unknown",
+    branch: process.env.RENDER_GIT_BRANCH || null,
+    booted_at: BOOT_TIME,
+    service: process.env.RENDER_SERVICE_NAME || null,
+  });
+});
+
 // ---------- Google OAuth (Gmail) ----------
 
 const GOOGLE_REDIRECT = `https://openclaude-agent.onrender.com/oauth/google/callback`;
