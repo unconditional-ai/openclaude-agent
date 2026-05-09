@@ -1244,6 +1244,42 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     }));
     return { count: items.length, items };
   },
+
+  // Send a direct message to a teammate. Different from /run's reply path —
+  // this initiates a NEW message to a specific user, not a reply to the
+  // triggering channel/thread. Resolves friendly names via env vars.
+  async send_slack_dm({ to, message, thread_link = null }) {
+    if (!to || !message) return { error: "to and message are both required" };
+    let userId = null;
+    if (typeof to === "string" && /^U[A-Z0-9]+$/.test(to)) {
+      userId = to;
+    } else {
+      const map = {
+        yohan: process.env.YOHAN_SLACK_ID,
+        valerie: process.env.VALERIE_SLACK_ID,
+        nathan: process.env.NATHAN_SLACK_ID,
+      };
+      userId = map[String(to).toLowerCase().trim()];
+      if (!userId) {
+        return { error: `Unknown recipient: ${to}. Known names: yohan, valerie, nathan. Or pass a Slack user_id starting with U.` };
+      }
+    }
+    const body = thread_link ? `${message}\n\nContext: ${thread_link}` : message;
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      // Slack accepts a user_id as `channel` — auto-opens the DM if needed.
+      body: JSON.stringify({ channel: userId, text: toSlackMrkdwn(body) }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      return { error: `Slack chat.postMessage failed: ${data.error || JSON.stringify(data)}` };
+    }
+    return { ok: true, recipient: userId, ts: data.ts, channel: data.channel };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1781,6 +1817,20 @@ const tools = [
         limit: { type: "number", description: "Max results (default 5, max 25)." },
       },
       required: [],
+    },
+  },
+  {
+    name: "send_slack_dm",
+    description: "Send a direct message to a teammate. Use this when the user asks you to DM someone ('DM Yohan that...', 'send Nathan a private note about X') or when delivering a private update fits better than replying in the original channel. Different from your normal reply: replies happen automatically in whatever channel/thread triggered you; this tool initiates a NEW message to a specific user. Recipient takes a friendly name ('yohan', 'valerie', 'nathan') or a Slack user_id starting with U. Confirm with the user before using if it isn't obvious from their request.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "'yohan', 'valerie', 'nathan', or a Slack user_id like U0B134R1WJW." },
+        message: { type: "string", description: "The message body. Slack mrkdwn (single-asterisk *bold*, _italic_, no markdown headings). Stay brief; this is a direct message, not a doc." },
+        thread_link: { type: "string", description: "Optional Slack permalink to include as 'Context: <link>' so the recipient can jump back to the originating thread." },
+      },
+      required: ["to", "message"],
     },
   },
 ];
