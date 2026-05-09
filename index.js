@@ -2069,13 +2069,13 @@ const tools = [
   },
   {
     name: "create_slack_reminder",
-    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Time accepts Unix epoch seconds OR natural language Slack parses server-side ('in 30 minutes', 'tomorrow at 3pm', 'next Monday 9am'). For 'remind me' requests pass the from_user_id from the '## Slack message reference' block at the top of the transcript — that's the sender. For 'remind <name>' pass 'yohan'/'valerie'/'nathan' or a user_id. Slack bot tokens can't set reminders for other users; if that fails this tool automatically falls back to creating a ClickUp task assigned to the intended recipient.",
+    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Always pass `time` as Unix epoch seconds — compute it from the current date (provided in your context) plus the requested offset. Slack also accepts natural language but the ClickUp fallback can only set a structured due_date when `time` is numeric, so prefer epoch seconds even when Slack would parse the phrase. For 'remind me' requests pass the from_user_id from the '## Slack message reference' block at the top of the transcript — that's the sender. For 'remind <name>' pass 'yohan'/'valerie'/'nathan' or a user_id. Slack bot tokens can't set reminders for other users; if that fails this tool automatically falls back to creating a ClickUp task assigned to the intended recipient.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         text: { type: "string", description: "What the reminder should say." },
-        time: { type: "string", description: "Unix epoch seconds or Slack natural language ('in 1 hour', 'tomorrow at 3pm', 'next Monday 9am')." },
+        time: { type: "string", description: "Unix epoch seconds — compute from current date + requested offset. Natural language ('in 1 hour', 'tomorrow at 3pm') also works for the Slack call but loses the due_date when this tool falls back to a ClickUp task, so prefer epoch seconds." },
         user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or a Slack user_id. For 'remind me' use the from_user_id from the '## Slack message reference' block. Omit only if the request is explicitly for the bot itself." },
       },
       required: ["text", "time"],
