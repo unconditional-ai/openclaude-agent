@@ -1311,6 +1311,150 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     }
     return { ok: true, recipient: userId, ts: data.ts, channel: data.channel };
   },
+
+  // ---------- Slack reminders ----------
+  // Wraps Slack's reminders.add / reminders.list. Time accepts Unix epoch seconds
+  // OR natural language like "in 30 minutes", "tomorrow at 3pm", "next Monday".
+  // Slack parses natural language server-side and is forgiving.
+
+  async create_slack_reminder({ text, time, user = null }) {
+    if (!text || !time) return { error: "text and time are both required" };
+    let userId = null;
+    if (user) {
+      if (typeof user === "string" && /^U[A-Z0-9]+$/.test(user)) {
+        userId = user;
+      } else {
+        const map = {
+          yohan: process.env.YOHAN_SLACK_ID,
+          valerie: process.env.VALERIE_SLACK_ID,
+          nathan: process.env.NATHAN_SLACK_ID,
+        };
+        userId = map[String(user).toLowerCase().trim()];
+        if (!userId) {
+          return { error: `Unknown user: ${user}. Use 'yohan' / 'valerie' / 'nathan' or a Slack user_id.` };
+        }
+      }
+    }
+    const params = new URLSearchParams({ text, time: String(time) });
+    if (userId) params.set("user", userId);
+    const res = await fetch("https://slack.com/api/reminders.add", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: params.toString(),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      return { error: `Slack reminders.add failed: ${data.error || JSON.stringify(data)}` };
+    }
+    return {
+      ok: true,
+      reminder_id: data.reminder?.id,
+      text: data.reminder?.text,
+      time: data.reminder?.time,
+      user: data.reminder?.user,
+    };
+  },
+
+  async list_slack_reminders() {
+    const res = await fetch("https://slack.com/api/reminders.list", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      return { error: `Slack reminders.list failed: ${data.error || JSON.stringify(data)}` };
+    }
+    return {
+      count: (data.reminders || []).length,
+      reminders: (data.reminders || []).map((r) => ({
+        id: r.id,
+        text: r.text,
+        time: r.time,
+        complete_ts: r.complete_ts || null,
+        user: r.user,
+        creator: r.creator,
+      })),
+    };
+  },
+
+  // ---------- JotForm read access ----------
+  // Lets Compass auto-populate People records from intake form submissions
+  // and flag anomalies, instead of someone copy-pasting form data manually.
+  // Auth via JOTFORM_API_KEY env var (https://www.jotform.com/myaccount/api).
+
+  async list_jotform_submissions({ form_id = null, limit = 25, offset = 0, since = null }) {
+    const apiKey = process.env.JOTFORM_API_KEY;
+    if (!apiKey) return { error: "JOTFORM_API_KEY not configured" };
+    const targetForm = form_id || process.env.JOTFORM_INTAKE_FORM_ID;
+    if (!targetForm) {
+      return { error: "form_id required (or set JOTFORM_INTAKE_FORM_ID env var for default)" };
+    }
+    const params = new URLSearchParams({
+      apiKey,
+      limit: String(Math.min(limit, 100)),
+      offset: String(offset),
+      orderby: "created_at",
+    });
+    // since: ISO 8601 — JotForm wants YYYY-MM-DD HH:MM:SS in UTC
+    if (since) {
+      const d = new Date(since);
+      if (!isNaN(d)) {
+        const stamp = d.toISOString().replace("T", " ").slice(0, 19);
+        params.set("filter", JSON.stringify({ "created_at:gt": stamp }));
+      }
+    }
+    const res = await fetch(`https://api.jotform.com/form/${targetForm}/submissions?${params}`);
+    const data = await res.json();
+    if (data.responseCode !== 200) {
+      return { error: `JotForm ${data.responseCode}: ${data.message || JSON.stringify(data)}` };
+    }
+    // Each submission has: id, created_at, status, answers (object keyed by question id)
+    return {
+      form_id: targetForm,
+      count: (data.content || []).length,
+      submissions: (data.content || []).map((s) => ({
+        id: s.id,
+        created_at: s.created_at,
+        status: s.status,
+        // Flatten answers: { "1": { name, answer, type, ... }, ... }
+        // We extract just { question_text: answer_value } for the agent's convenience.
+        answers: Object.fromEntries(
+          Object.values(s.answers || {})
+            .filter((a) => a.answer != null && a.answer !== "")
+            .map((a) => [a.text || a.name || a.qid, a.prettyFormat || a.answer]),
+        ),
+      })),
+    };
+  },
+
+  async get_jotform_submission({ submission_id }) {
+    const apiKey = process.env.JOTFORM_API_KEY;
+    if (!apiKey) return { error: "JOTFORM_API_KEY not configured" };
+    if (!submission_id) return { error: "submission_id required" };
+    const res = await fetch(`https://api.jotform.com/submission/${submission_id}?apiKey=${apiKey}`);
+    const data = await res.json();
+    if (data.responseCode !== 200) {
+      return { error: `JotForm ${data.responseCode}: ${data.message || JSON.stringify(data)}` };
+    }
+    const s = data.content || {};
+    return {
+      id: s.id,
+      form_id: s.form_id,
+      created_at: s.created_at,
+      status: s.status,
+      answers: Object.fromEntries(
+        Object.values(s.answers || {})
+          .filter((a) => a.answer != null && a.answer !== "")
+          .map((a) => [a.text || a.name || a.qid, a.prettyFormat || a.answer]),
+      ),
+    };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1876,6 +2020,51 @@ const tools = [
         thread_link: { type: "string", description: "Optional Slack permalink to include as 'Context: <link>' so the recipient can jump back to the originating thread." },
       },
       required: ["to", "message"],
+    },
+  },
+  {
+    name: "create_slack_reminder",
+    description: "Set a Slack reminder. When to use: user asks for a future ping ('remind me Friday to follow up with Joseph', 'nudge Valerie next Monday about the deposit'). Time accepts Unix epoch seconds OR natural language Slack parses server-side ('in 30 minutes', 'tomorrow at 3pm', 'next Monday 9am'). Defaults to setting the reminder for the bot if no user given; pass 'yohan'/'valerie'/'nathan' or a user_id to set it for someone else.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "What the reminder should say." },
+        time: { type: "string", description: "Unix epoch seconds or Slack natural language ('in 1 hour', 'tomorrow at 3pm', 'next Monday 9am')." },
+        user: { type: "string", description: "'yohan' / 'valerie' / 'nathan' or Slack user_id. Omit to set the reminder for the bot itself." },
+      },
+      required: ["text", "time"],
+    },
+  },
+  {
+    name: "list_slack_reminders",
+    description: "List Slack reminders the bot can see. When to use: user asks 'what reminders do I have?' or 'is there a reminder for X?'. Returns id, text, scheduled time, completion status.",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "list_jotform_submissions",
+    description: "Read recent JotForm submissions for an intake form. When to use: a participant has filled the intake form and you need their answers (phone, timezone, notes) to populate their People record. Defaults to the form configured in JOTFORM_INTAKE_FORM_ID env. Filter by `since` (ISO date) to fetch only new submissions. Each submission's answers come back as a flat object keyed by question text.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        form_id: { type: "string", description: "JotForm form ID. Omit to use the default intake form." },
+        limit: { type: "number", description: "Max submissions, default 25, max 100." },
+        offset: { type: "number", description: "Pagination offset." },
+        since: { type: "string", description: "ISO 8601 — only submissions created after this." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_jotform_submission",
+    description: "Fetch a single JotForm submission by ID. When to use: you have a submission_id (from list_jotform_submissions or a Slack message) and need the full answer set.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: { submission_id: { type: "string" } },
+      required: ["submission_id"],
     },
   },
 ];
