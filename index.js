@@ -24,7 +24,7 @@ const {
   COMPASS_PROMPT_TABLE_ID,
 
   SLACK_BOT_TOKEN,
-  AGENT_MODEL = "claude-sonnet-4-6",
+  AGENT_MODEL = "claude-opus-4-7",
   PORT = 10000,
 } = process.env;
 
