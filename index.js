@@ -1613,6 +1613,76 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     };
   },
 
+  // ---------- Introspection ----------
+  // Lets the agent answer questions about itself (scopes, tool inventory,
+  // deploy version, integration wiring) instead of guessing or stalling.
+  async inspect_slack_config() {
+    // auth.test directly (not via slackApi) so we can read the
+    // x-oauth-scopes response header — slackApi() discards headers.
+    const res = await fetch("https://slack.com/api/auth.test", {
+      headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      return { error: `Slack auth.test failed: ${data.error || JSON.stringify(data)}` };
+    }
+    const scopes = (res.headers.get("x-oauth-scopes") || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return {
+      team: data.team,
+      team_id: data.team_id,
+      bot_user: data.user,
+      bot_user_id: data.user_id,
+      url: data.url,
+      scopes,
+    };
+  },
+
+  async inspect_self() {
+    const allNamed = tools.filter((t) => t.name);
+    const deferred = allNamed.filter((t) => t.defer_loading).map((t) => t.name);
+    const alwaysLoaded = allNamed.filter((t) => !t.defer_loading).map((t) => t.name);
+    return {
+      model: AGENT_MODEL,
+      version: {
+        commit: process.env.RENDER_GIT_COMMIT || readLocalGitSha() || "unknown",
+        branch: process.env.RENDER_GIT_BRANCH || null,
+        service: process.env.RENDER_SERVICE_NAME || null,
+        booted_at: BOOT_TIME,
+      },
+      tools: {
+        always_loaded: alwaysLoaded,
+        deferred,
+        total: alwaysLoaded.length + deferred.length,
+      },
+      // Presence only — never values. Keeps secrets out of agent context
+      // while still letting the agent reason about which integrations are wired.
+      integration_env: {
+        anthropic: { ANTHROPIC_API_KEY: !!process.env.ANTHROPIC_API_KEY },
+        nocodb: {
+          NOCODB_URL: !!process.env.NOCODB_URL,
+          NOCODB_TOKEN: !!process.env.NOCODB_TOKEN,
+        },
+        slack: { SLACK_BOT_TOKEN: !!process.env.SLACK_BOT_TOKEN },
+        google: {
+          GOOGLE_CLIENT_ID: !!process.env.GOOGLE_CLIENT_ID,
+          GOOGLE_CLIENT_SECRET: !!process.env.GOOGLE_CLIENT_SECRET,
+          GOOGLE_REFRESH_TOKEN: !!process.env.GOOGLE_REFRESH_TOKEN,
+        },
+        clickup: {
+          CLICKUP_TOKEN: !!process.env.CLICKUP_TOKEN,
+          CLICKUP_DEFAULT_LIST_ID: !!process.env.CLICKUP_DEFAULT_LIST_ID,
+        },
+        jotform: {
+          JOTFORM_API_KEY: !!process.env.JOTFORM_API_KEY,
+          JOTFORM_INTAKE_FORM_ID: !!process.env.JOTFORM_INTAKE_FORM_ID,
+        },
+      },
+    };
+  },
+
   // ---------- JotForm read access ----------
   // Lets Compass auto-populate People records from intake form submissions
   // and flag anomalies, instead of someone copy-pasting form data manually.
@@ -2514,6 +2584,18 @@ const tools = [
     input_schema: { type: "object", properties: {}, required: [] },
   },
   {
+    name: "inspect_slack_config",
+    description: "Look up the bot's own Slack identity and granted OAuth scopes. When to use: user asks 'what scopes do you have', 'which workspace are you in', 'what's your bot user id', or you need to confirm a Slack capability is available before attempting it. Returns team name + id, bot user + id, workspace URL, and the list of granted scopes (read from Slack's x-oauth-scopes response header on auth.test).",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "inspect_self",
+    description: "Inspect the agent's own runtime configuration: model name, deploy version (git commit, branch, boot time), full tool inventory (split into always-loaded vs deferred), and which integration env vars are configured (truthy/falsy only — never values). When to use: user asks 'what can you do', 'what tools do you have', 'are you on the latest version', 'is X integration set up', or any introspective question about the agent itself.",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
     name: "list_jotform_submissions",
     description: "Read recent JotForm submissions for an intake form. When to use: a participant has filled the intake form and you need their answers (phone, timezone, notes) to populate their People record. Defaults to the form configured in JOTFORM_INTAKE_FORM_ID env. Filter by `since` (ISO date) to fetch only new submissions. Each submission's answers come back as a flat object keyed by question text.",
     defer_loading: true,
@@ -2596,7 +2678,7 @@ TOOL SEARCH:
 Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). Always-loaded core tools: lookup_person, create_person, toggle_stage, list_people, ask_for_clarification, list_skills. For anything else (payment updates, ClickUp tasks, email drafts, audit queries, etc.), search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment") and the relevant tool will be returned for use.
 
 ACT, DON'T NARRATE:
-When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities.
+When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities. If no available tool can answer the question, say so directly rather than promising to check.
 
 SELF-EXTENSION (propose_new_tool):
 If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
