@@ -21,6 +21,7 @@ const {
   TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
   KNOWLEDGE_TABLE_ID,
+  COMPASS_PROMPT_TABLE_ID,
 
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
@@ -1832,6 +1833,130 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       note: "Tool unregistered and file deleted. It will not reappear on restart.",
     };
   },
+
+  // ---- Prompt-body editing (NocoDB-backed, see KERNEL_BOTTOM "PROMPT EDITING" section) ----
+
+  async view_prompt_body() {
+    return {
+      version: cachedPromptVersion,
+      updated_by: cachedPromptUpdatedBy,
+      updated_at: cachedPromptUpdatedAt,
+      length: (cachedPromptBody || "").length,
+      body: cachedPromptBody || SEED_PROMPT_BODY,
+      persistent: !!COMPASS_PROMPT_TABLE_ID,
+      note: COMPASS_PROMPT_TABLE_ID
+        ? "Operator-managed body. Edit via edit_prompt_body or replace_prompt_body."
+        : "COMPASS_PROMPT_TABLE_ID not set — showing the in-code SEED fallback. Edits cannot be persisted in this environment.",
+    };
+  },
+
+  async edit_prompt_body({ old_string, new_string, reason, updated_by, confirmed = false }) {
+    if (typeof old_string !== "string" || old_string.length === 0) {
+      return { error: "old_string is required and must be non-empty" };
+    }
+    if (typeof new_string !== "string") {
+      return { error: "new_string is required (use empty string to delete the matched section)" };
+    }
+    const current = cachedPromptBody || SEED_PROMPT_BODY;
+    const idx = current.indexOf(old_string);
+    if (idx === -1) {
+      return { error: "old_string not found in current prompt body. Use view_prompt_body to see exact text. Whitespace and punctuation must match exactly." };
+    }
+    if (current.indexOf(old_string, idx + 1) !== -1) {
+      return { error: "old_string is not unique in the prompt body — found multiple matches. Provide a longer surrounding context to disambiguate." };
+    }
+    const proposed = current.slice(0, idx) + new_string + current.slice(idx + old_string.length);
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Edit operator-managed prompt body (v${cachedPromptVersion} → v${cachedPromptVersion + 1}). Reason: ${reason || "(none given)"}. Diff:\n${diffPreview(old_string, new_string)}`,
+        { old_string, new_string, reason, updated_by, confirmed: true }
+      );
+    }
+    const { version } = await savePromptBody({ newBody: proposed, reason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version,
+      length: proposed.length,
+      note: "Prompt body updated. The new version is live for subsequent /run calls.",
+    };
+  },
+
+  async replace_prompt_body({ new_body, reason, updated_by, confirmed = false }) {
+    if (typeof new_body !== "string" || new_body.length === 0) {
+      return { error: "new_body is required and must be non-empty" };
+    }
+    const current = cachedPromptBody || SEED_PROMPT_BODY;
+    if (!confirmed) {
+      const sizeChange = new_body.length - current.length;
+      return pendingConfirmation(
+        `FULL REWRITE of operator-managed prompt body (v${cachedPromptVersion} → v${cachedPromptVersion + 1}). Old: ${current.length} chars. New: ${new_body.length} chars (${sizeChange >= 0 ? "+" : ""}${sizeChange}). Reason: ${reason || "(none given)"}. First 400 chars of new body:\n${new_body.slice(0, 400)}${new_body.length > 400 ? "\n…[truncated]" : ""}`,
+        { new_body, reason, updated_by, confirmed: true }
+      );
+    }
+    const { version } = await savePromptBody({ newBody: new_body, reason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version,
+      length: new_body.length,
+      note: "Prompt body fully replaced. The new version is live for subsequent /run calls.",
+    };
+  },
+
+  async view_prompt_history({ limit = 10 } = {}) {
+    if (!COMPASS_PROMPT_TABLE_ID) {
+      return { error: "COMPASS_PROMPT_TABLE_ID not set — no history available in this environment" };
+    }
+    const cap = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 50);
+    const data = await ncGet(`/api/v2/tables/${COMPASS_PROMPT_TABLE_ID}/records?limit=${cap}&sort=-Version&fields=Id,Version,UpdatedBy,Reason,CreatedAt,UpdatedAt`);
+    return {
+      count: data.list?.length || 0,
+      current_version: cachedPromptVersion,
+      versions: (data.list || []).map((r) => ({
+        version: r.Version,
+        updated_by: r.UpdatedBy,
+        updated_at: r.UpdatedAt || r.CreatedAt,
+        reason: r.Reason,
+      })),
+      note: "To inspect or restore a specific version, call revert_prompt_body with that version number.",
+    };
+  },
+
+  async revert_prompt_body({ version, reason, updated_by, confirmed = false }) {
+    if (!COMPASS_PROMPT_TABLE_ID) {
+      return { error: "COMPASS_PROMPT_TABLE_ID not set — cannot revert in this environment" };
+    }
+    const target = parseInt(version, 10);
+    if (!Number.isFinite(target) || target < 1) {
+      return { error: "version must be a positive integer (use view_prompt_history to find one)" };
+    }
+    if (target === cachedPromptVersion) {
+      return { error: `version ${target} is already the current version — no revert needed` };
+    }
+    const data = await ncGet(`/api/v2/tables/${COMPASS_PROMPT_TABLE_ID}/records?where=${encodeURIComponent(`(Version,eq,${target})`)}&limit=1`);
+    if (!data.list?.length) {
+      return { error: `version ${target} not found in compass_prompt history` };
+    }
+    const targetRow = data.list[0];
+    const targetBody = targetRow.Body || "";
+    if (!targetBody) {
+      return { error: `version ${target} has empty Body — cannot revert to it` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Revert operator-managed prompt body to v${target} (currently v${cachedPromptVersion}). Reason: ${reason || "(none given)"}. This will write a new row v${cachedPromptVersion + 1} whose body matches v${target}; v${cachedPromptVersion} stays in history.`,
+        { version: target, reason, updated_by, confirmed: true }
+      );
+    }
+    const fullReason = `revert to v${target}${reason ? ` — ${reason}` : ""}`;
+    const { version: newVersion } = await savePromptBody({ newBody: targetBody, reason: fullReason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version: newVersion,
+      reverted_to: target,
+      length: targetBody.length,
+      note: `Prompt body reverted. v${newVersion} is now live and matches v${target}.`,
+    };
+  },
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -1870,6 +1995,69 @@ const tools = [
         confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly confirmed the removal." },
       },
       required: ["name"],
+    },
+  },
+  {
+    name: "view_prompt_body",
+    description: "Read the current operator-managed section of your own system prompt (the substantive guidance that lives in NocoDB and can be edited from Slack). Use BEFORE calling edit_prompt_body so you know the exact text to match. Returns the body, version, and who last edited it. The kernel mechanics (identity, confirmation-gating flow, tool-search mechanism, self-extension safety floor) are NOT included — those are code-level only.",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "edit_prompt_body",
+    description: "Replace a unique substring of the operator-managed prompt body with new text. Use when the user asks you to change, add, or remove specific guidance ('stop saying X', 'always do Y', 'update the cohort list', 'change the tone'). Call view_prompt_body first to copy the exact text. The match must be UNIQUE in the body — provide enough surrounding context if the literal text appears more than once. CONFIRMATION GATED: first call returns a diff preview; second call with confirmed: true persists. Every edit writes a new version to compass_prompt — nothing is overwritten.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        old_string: { type: "string", description: "Exact substring to replace. Whitespace and punctuation must match. Must be unique." },
+        new_string: { type: "string", description: "Replacement text. Use empty string to delete the matched section." },
+        reason: { type: "string", description: "Short human-readable rationale ('Yohan: stop using emoji in DMs'). Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the person who requested the edit (Yohan / Valerie / Nathan), inferred from the Slack sender. Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed diff." },
+      },
+      required: ["old_string", "new_string", "reason"],
+    },
+  },
+  {
+    name: "replace_prompt_body",
+    description: "Full rewrite of the operator-managed prompt body. Use ONLY for major restructures the user explicitly asks for ('rewrite the whole thing to focus on X'). For routine tweaks, prefer edit_prompt_body — much smaller blast radius. CONFIRMATION GATED: first call shows old size, new size, and the first 400 chars of the new body; second call with confirmed: true persists. The previous version stays in compass_prompt history and can be restored via revert_prompt_body.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        new_body: { type: "string", description: "The complete new body. Replaces the entire operator-managed section." },
+        reason: { type: "string", description: "Why the rewrite. Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the requester (inferred from the Slack sender). Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed rewrite." },
+      },
+      required: ["new_body", "reason"],
+    },
+  },
+  {
+    name: "view_prompt_history",
+    description: "List recent versions of the operator-managed prompt body — version number, who edited it, when, and the reason given. Use to investigate 'when did Compass start doing X' or to find a version to revert to. Returns metadata only, not the full bodies — fetch a specific body by reverting (or read it directly from NocoDB out-of-band).",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max versions to return (1-50, default 10)." },
+      },
+    },
+  },
+  {
+    name: "revert_prompt_body",
+    description: "Restore a previous version of the operator-managed prompt body. Writes a NEW version (Version+1) whose Body matches the target version — the current version stays in history, nothing is destroyed. Use when an edit had unintended consequences and the user wants the prior behaviour back. CONFIRMATION GATED.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        version: { type: "integer", description: "Version number to restore. Find via view_prompt_history." },
+        reason: { type: "string", description: "Why the revert. Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the requester (inferred from the Slack sender). Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the revert." },
+      },
+      required: ["version"],
     },
   },
   {
@@ -2542,13 +2730,36 @@ const tools = [
 
 // ---------- System prompt ----------
 
-// Built fresh per /run so today's date doesn't freeze at module-load time.
-// Cache rebuilds once per UTC day (when the date string changes); negligible cost.
-const buildSystemPrompt = () => `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
+// Architecture: KERNEL_TOP (in code) + editable body (NocoDB) + KERNEL_BOTTOM (in code).
+// The body holds substantive guidance — onboarding stages, principles, tone, edge cases —
+// and can be edited live from Slack via edit_prompt_body. The kernel sandwiches it with
+// identity/date and the small set of mechanics that must NOT be editable from Slack
+// (confirmation-gating flow, tool-search mechanism, self-extension safety floor, and the
+// prompt-editing tool inventory itself — you can't bootstrap a fix via tools you can't
+// see). Body lives in NocoDB table COMPASS_PROMPT_TABLE_ID, append-only: each edit writes
+// a new row with a monotonically increasing Version; the latest is live, older versions
+// are the audit trail. If the env var or the table is unavailable, falls back to
+// SEED_PROMPT_BODY in this file (degraded but functional).
 
-You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
+let cachedPromptBody = null;
+let cachedPromptVersion = 0;
+let cachedPromptUpdatedBy = null;
+let cachedPromptUpdatedAt = null;
 
-Today's date: ${todayISO()}.
+const promptVars = () => ({
+  TODAY: todayISO(),
+  YOHAN_SLACK_ID: process.env.YOHAN_SLACK_ID || "",
+  VALERIE_SLACK_ID: process.env.VALERIE_SLACK_ID || "",
+  NATHAN_SLACK_ID: process.env.NATHAN_SLACK_ID || "",
+  CLICKUP_DAILY_TASK_LIST_ID: process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var",
+});
+
+function substitutePromptVars(text) {
+  const vars = promptVars();
+  return text.replace(/\{\{(\w+)\}\}/g, (m, k) => (k in vars ? vars[k] : m));
+}
+
+const SEED_PROMPT_BODY = `You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
 
 Active cohorts: "May 9 2026", "May 10 2026" (both upcoming).
 
@@ -2592,13 +2803,10 @@ PAYMENT vs STAGES:
 SKILLS:
 You have access to a Skills library — markdown playbooks for specific workflows (e.g. Yohan's voice/style guide, onboarding edge cases). Use list_skills early when starting complex work to see what guidance is available; load_skill to read a specific one. Treat loaded skill content as authoritative for that workflow.
 
-TOOL SEARCH:
-Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). Always-loaded core tools: lookup_person, create_person, toggle_stage, list_people, ask_for_clarification, list_skills. For anything else (payment updates, ClickUp tasks, email drafts, audit queries, etc.), search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment") and the relevant tool will be returned for use.
-
 ACT, DON'T NARRATE:
 When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities.
 
-SELF-EXTENSION (propose_new_tool):
+SELF-EXTENSION (propose_new_tool) — user-facing flow:
 If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
 1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case.
 2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I can't do that yet. Want me to add the ability?". Wait for their go-ahead.
@@ -2606,7 +2814,7 @@ If the user asks for something no existing tool covers, you can propose a brand-
 4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH and surface ZERO internals. Yohan and Valerie are non-technical. They don't need or want to see: the internal tool name, JavaScript code, JSON schemas, parameter lists, or any plumbing language. Describe ONLY what will happen in human terms ("This will look up someone by name and post a workout link to their Slack DM. Want me to add it?"). The technical details are auto-saved to git for separate developer review.
 5. On their explicit go-ahead, call propose_new_tool again with the replay_args from the preview (which already has confirmed: true). The tool is persisted to tools/generated/<name>.js (git-visible, deletable to revoke) and hot-loaded.
 6. Immediately use the new tool to fulfil the original request. After it runs, describe the outcome in plain English — again, no need to mention that a "new action" was added or what it's called.
-Implementation code runs inside the bot's process. The host project is ESM, so each generated tool file is loaded as an ES module. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: process, fetch, console. NOTE: require is NOT available in this ESM context — for dynamic module loading use 'await import("module-name")'. Most impls won't need any imports beyond what fetch/process provide. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
+(See CORE MECHANICS below for the implementation safety floor that applies to every proposed tool.)
 
 To revoke a previously minted tool, use delete_generated_tool. Same plain-English confirmation rules — describe the action being removed in human terms, not its internal name.
 
@@ -2614,12 +2822,8 @@ DIRECT DATA MANIPULATION:
 For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
 For WRITES the default flips: PREFER specialized tools (update_person, update_payment, toggle_stage, create_person, add_note, log_touchpoint) over bulk_update_records / delete_records when one fits. The specialized write tools encode invariants you'd otherwise have to remember every call: update_payment auto-recomputes Amount owing; toggle_stage applies the documented stage cascade (welcome_email_sent → deposit_paid, etc.); add_note timestamps and appends instead of overwriting. Skipping them means silent drift in production data that's hard to spot weeks later. Use bulk_update_records / delete_records when the target is a non-People table, when you're applying the same change across many rows, or when no specialized tool covers the field.
 
-CONFIRMATION GATING:
-A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
-1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
-2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
-3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
-This is a guardrail Yohan asked for on writes that touch money / calendar / destructive operations. Do NOT skip it. If the user's original ask is already specific and unambiguous, the confirmation step is still required — that's the point. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate; they're either reversible or already gated by drafts/review.
+CONFIRMATION-GATED TOOLS (which ones):
+The following tools require confirmation before executing: update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records, edit_prompt_body, replace_prompt_body, revert_prompt_body. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate — they're either reversible or already gated by drafts/review. The gating mechanics (the confirmed/replay_args flow) are described in CORE MECHANICS below; this section is just the list.
 
 QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
@@ -2666,7 +2870,7 @@ ACCURACY:
 Stay grounded in what you can verify. Be skeptical of the quality of your own information — seek clarity when valuable. For UST-specific details (backend setup, file locations, vendor configs, exact column names): check recall_knowledge first; if nothing's pinned, name the person who'd know — "I don't have those details — Nathan would know". When you're unsure, defer to the human; specific verifiable answers beat plausible-sounding step-by-steps.
 
 QUESTIONS / DECISIONS NEEDED:
-When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification.
+When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list {{CLICKUP_DAILY_TASK_LIST_ID}}) instead of using ask_for_clarification.
 
 The "❓" prefix is RESERVED for tasks that are genuinely a question or decision — not just any task assigned to a human. The prefix lets Yohan/Valerie scan their board and see "things needing my judgement" separate from regular action items.
 
@@ -2710,16 +2914,126 @@ Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with sing
 
 SLACK MENTIONS (notify the right person):
 Known team Slack user IDs — use the <@USER_ID> syntax to ping them so they get a notification:
-- Yohan: <@${process.env.YOHAN_SLACK_ID || "set YOHAN_SLACK_ID env"}>
-- Valerie: <@${process.env.VALERIE_SLACK_ID || "set VALERIE_SLACK_ID env"}>
-- Nathan: <@${process.env.NATHAN_SLACK_ID || "set NATHAN_SLACK_ID env"}>
+- Yohan: <@{{YOHAN_SLACK_ID}}>
+- Valerie: <@{{VALERIE_SLACK_ID}}>
+- Nathan: <@{{NATHAN_SLACK_ID}}>
 
-@-mention them when your reply recommends they take an action — e.g. "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
+@-mention them when your reply recommends they take an action — e.g. "<@{{VALERIE_SLACK_ID}}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
 
 For everything else, refer to them by bare name without the @ — casual references ("the call Yohan ran on Tuesday"), reports of past actions ("Valerie marked the deposit paid"), and replies to the person who's talking to you (no need to @ Yohan when Yohan is asking the question). Participants and clients aren't in this workspace, so refer to them by name only. Stick to the three IDs above; for anyone else, use plain names.
 
 ADDRESSING THE SENDER:
 The from_user_id in the '## Slack message reference' block at the top of the transcript is the person who messaged you — they're the one reading your reply. Address them in second person ('you'), not by name in third person. So if Nathan writes to you, never say 'Nathan would need to look at that' — say 'you'd need to look at that' or just describe the issue. Same for Yohan and Valerie when they're the sender. Mention other teammates by name when they're not the sender (e.g. 'Yohan should sign off on this' if Nathan is asking).`;
+
+const KERNEL_TOP = () => `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
+
+Today's date: ${todayISO()}.
+
+—— OPERATOR-MANAGED GUIDANCE ——
+The section below is managed by the UST team via Slack — they can edit it at any time using edit_prompt_body / replace_prompt_body. Treat it as authoritative for substantive behaviour. If the user asks you to change something about how you operate that fits within the operator-managed scope (tone, principles, stage logic, edge cases, etc.), use the prompt-editing tools yourself rather than just promising to remember.`;
+
+const KERNEL_BOTTOM = `—— CORE MECHANICS (not editable from Slack — code-level changes only) ——
+
+CONFIRMATION GATING (the flow):
+The operator-managed section above lists which tools are confirmation-gated. The flow for any gated tool:
+1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
+2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
+3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
+This guardrail must NOT be skipped. Even if the user's original ask is specific and unambiguous, the confirmation step is still required — that's the point.
+
+TOOL SEARCH (the mechanism):
+Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). The always-loaded core is small. For anything else, search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment", "edit prompt") and the relevant tool will be returned for use.
+
+SELF-EXTENSION SAFETY FLOOR (applies to every propose_new_tool call):
+Implementations run inside the bot's process. The host project is ESM, so each generated tool file is loaded as an ES module. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: process, fetch, console. NOTE: require is NOT available in this ESM context — for dynamic module loading use 'await import("module-name")'. Most impls won't need any imports beyond what fetch/process provide. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose, no secrets exfiltration. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
+
+PROMPT EDITING (your own substantive guidance):
+The OPERATOR-MANAGED GUIDANCE section above is stored in NocoDB and can be edited live from Slack. Tools (find them via tool search if not already in your active set):
+- view_prompt_body — read the current operator-managed body and its version.
+- edit_prompt_body({ old_string, new_string, reason }) — replace a unique substring. Confirmation-gated; preview shows the diff.
+- replace_prompt_body({ new_body, reason }) — full rewrite for big refactors. Confirmation-gated.
+- view_prompt_history({ limit }) — recent versions for audit/comparison.
+- revert_prompt_body({ version, reason }) — restore a prior version. Confirmation-gated.
+Every edit is versioned in compass_prompt; no version is ever deleted. The CORE MECHANICS in this section (and the identity line at the top) are NOT editable via these tools — they require a code change to index.js.`;
+
+// Built fresh per /run so today's date doesn't freeze at module-load time.
+// String concatenation only; the body is satisfied from in-memory cache.
+const buildSystemPrompt = () => {
+  const body = substitutePromptVars(cachedPromptBody || SEED_PROMPT_BODY);
+  return `${KERNEL_TOP()}\n\n${body}\n\n${KERNEL_BOTTOM}`;
+};
+
+// ---------- Editable prompt body (NocoDB-backed) ----------
+
+async function loadPromptBody() {
+  if (!COMPASS_PROMPT_TABLE_ID) {
+    console.warn("[prompt] COMPASS_PROMPT_TABLE_ID not set — using SEED_PROMPT_BODY (in-code fallback). Set the env var to enable Slack-driven edits.");
+    cachedPromptBody = SEED_PROMPT_BODY;
+    cachedPromptVersion = 0;
+    return;
+  }
+  try {
+    const data = await ncGet(`/api/v2/tables/${COMPASS_PROMPT_TABLE_ID}/records?limit=1&sort=-Version`);
+    if (!data.list?.length) {
+      console.log("[prompt] compass_prompt is empty — bootstrapping with SEED_PROMPT_BODY (Version=1)");
+      await ncPost(`/api/v2/tables/${COMPASS_PROMPT_TABLE_ID}/records`, [{
+        Body: SEED_PROMPT_BODY,
+        Version: 1,
+        UpdatedBy: "system",
+        Reason: "initial seed from index.js",
+      }]);
+      cachedPromptBody = SEED_PROMPT_BODY;
+      cachedPromptVersion = 1;
+      cachedPromptUpdatedBy = "system";
+      cachedPromptUpdatedAt = new Date().toISOString();
+      return;
+    }
+    const row = data.list[0];
+    cachedPromptBody = row.Body || SEED_PROMPT_BODY;
+    cachedPromptVersion = row.Version || 0;
+    cachedPromptUpdatedBy = row.UpdatedBy || null;
+    cachedPromptUpdatedAt = row.UpdatedAt || row.CreatedAt || null;
+    console.log(`[prompt] loaded body v${cachedPromptVersion} (${cachedPromptBody.length} chars, updated_by=${cachedPromptUpdatedBy || "?"})`);
+  } catch (e) {
+    console.error(`[prompt] load failed: ${e.message} — falling back to SEED_PROMPT_BODY`);
+    cachedPromptBody = SEED_PROMPT_BODY;
+    cachedPromptVersion = 0;
+  }
+}
+
+async function savePromptBody({ newBody, reason, updatedBy }) {
+  if (!COMPASS_PROMPT_TABLE_ID) {
+    throw new Error("COMPASS_PROMPT_TABLE_ID is not set — prompt edits cannot be persisted in this environment");
+  }
+  if (typeof newBody !== "string" || newBody.length === 0) {
+    throw new Error("newBody must be a non-empty string");
+  }
+  const newVersion = (cachedPromptVersion || 0) + 1;
+  await ncPost(`/api/v2/tables/${COMPASS_PROMPT_TABLE_ID}/records`, [{
+    Body: newBody,
+    Version: newVersion,
+    UpdatedBy: updatedBy || "agent",
+    Reason: reason || "(no reason given)",
+  }]);
+  cachedPromptBody = newBody;
+  cachedPromptVersion = newVersion;
+  cachedPromptUpdatedBy = updatedBy || "agent";
+  cachedPromptUpdatedAt = new Date().toISOString();
+  return { version: newVersion };
+}
+
+function diffPreview(oldStr, newStr) {
+  // Tiny line-based diff for previews — not a proper diff, just enough for a human to glance.
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+  const out = [];
+  for (const l of oldLines) out.push(`- ${l}`);
+  for (const l of newLines) out.push(`+ ${l}`);
+  // Trim if huge
+  const joined = out.join("\n");
+  if (joined.length <= 2000) return joined;
+  return joined.slice(0, 2000) + `\n… [truncated; preview is ${joined.length} chars]`;
+}
 
 // ---------- Agent loop ----------
 
@@ -3240,6 +3554,7 @@ async function loadGeneratedTools() {
   }
 }
 await loadGeneratedTools();
+await loadPromptBody();
 
 function renderTemplate(name, vars) {
   let html = EMAIL_TEMPLATES[name];
