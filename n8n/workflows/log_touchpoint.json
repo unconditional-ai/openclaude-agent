@@ -1,0 +1,132 @@
+{
+  "name": "compass:log_touchpoint",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "log_touchpoint",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-log-touchpoint",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openclaude-nocodb.onrender.com/api/v2/tables/m43ehtpo0gs8wi6/records",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify([{ \"Summary\": $json.body.input.summary, \"Channel\": $json.body.input.channel || \"Slack\", \"Direction\": $json.body.input.direction || \"Inbound\", \"Source\": \"Compass agent\", \"Timestamp\": new Date().toISOString(), \"Content\": $json.body.input.content || \"\", \"Handled by\": \"Compass\" }]) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "create-touchpoint",
+      "name": "Create touchpoint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Webhook').item.json.body.input.person_id }}",
+              "rightValue": "",
+              "operator": { "type": "any", "operation": "exists", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-person-id",
+      "name": "Has person_id?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://openclaude-nocodb.onrender.com/api/v2/tables/m43ehtpo0gs8wi6/links/c40g63j2i9pnmbc/records/{{ $json[0].Id || $json.Id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify([{ \"Id\": $('Webhook').item.json.body.input.person_id }]) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {
+          "response": { "response": { "neverError": true, "responseFormat": "autodetect" } }
+        }
+      },
+      "id": "link-to-person",
+      "name": "Link to person",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 200],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ id: $('Create touchpoint').item.json[0]?.Id || $('Create touchpoint').item.json.Id, person_id: $('Webhook').item.json.body.input.person_id || null }) }}",
+        "options": {}
+      },
+      "id": "respond-with-id",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1080, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ id: $json[0]?.Id || $json.Id, person_id: null }) }}",
+        "options": {}
+      },
+      "id": "respond-no-link",
+      "name": "Respond (no link)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [860, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Create touchpoint", "type": "main", "index": 0 }]]
+    },
+    "Create touchpoint": {
+      "main": [[{ "node": "Has person_id?", "type": "main", "index": 0 }]]
+    },
+    "Has person_id?": {
+      "main": [
+        [{ "node": "Link to person", "type": "main", "index": 0 }],
+        [{ "node": "Respond (no link)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Link to person": {
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

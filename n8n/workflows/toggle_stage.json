@@ -1,0 +1,117 @@
+{
+  "name": "compass:toggle_stage",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "toggle_stage",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-toggle-stage",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Validate input + compute the cascade update payload.\n// Stage cascade map is duplicated here because n8n is the source of truth\n// for this workflow's behaviour; the JS impl is being phased out.\n\nconst STAGE_COLUMN_MAP = {\n  onboarding_call_done: '1. Onboarding call done',\n  deposit_paid: '2. Deposit paid',\n  welcome_email_sent: '3. Welcome email sent',\n  form_submitted: '4. Form submitted',\n  contract_sent: '5. Contract sent',\n  contract_signed: '6. Contract signed',\n  calendar_invites_sent: '7. Calendar invites sent',\n  calendar_invites_accepted: '8. Calendar invites accepted',\n  payment_plan_active: '9. Payment plan active',\n  paid_in_full: '10. Paid in full',\n};\nconst STAGE_PREREQUISITES = {\n  welcome_email_sent: ['deposit_paid'],\n  form_submitted: ['welcome_email_sent'],\n  contract_signed: ['contract_sent'],\n  calendar_invites_accepted: ['calendar_invites_sent'],\n  paid_in_full: ['deposit_paid'],\n};\nconst STAGE_DEPENDENTS = {};\nfor (const [stage, prereqs] of Object.entries(STAGE_PREREQUISITES)) {\n  for (const prereq of prereqs) {\n    if (!STAGE_DEPENDENTS[prereq]) STAGE_DEPENDENTS[prereq] = [];\n    STAGE_DEPENDENTS[prereq].push(stage);\n  }\n}\n\nconst input = $input.first().json.body?.input || {};\nconst { person_id, stage, value } = input;\n\nif (!STAGE_COLUMN_MAP[stage]) {\n  return [{ json: { __validation_error: true, error: `Invalid stage: ${stage}. Valid: ${Object.keys(STAGE_COLUMN_MAP).join(', ')}` } }];\n}\nif (typeof value !== 'boolean') {\n  return [{ json: { __validation_error: true, error: `toggle_stage value must be a boolean (true or false). Got ${typeof value}: ${JSON.stringify(value)}` } }];\n}\n\nconst todayISO = new Date().toISOString().slice(0, 10);\nconst updates = { Id: person_id, 'Last touch': todayISO };\nconst affected = new Set([stage]);\nupdates[STAGE_COLUMN_MAP[stage]] = value;\n\nif (value === true) {\n  for (const prereq of STAGE_PREREQUISITES[stage] || []) {\n    if (!affected.has(prereq)) {\n      updates[STAGE_COLUMN_MAP[prereq]] = true;\n      affected.add(prereq);\n    }\n  }\n} else {\n  for (const dep of STAGE_DEPENDENTS[stage] || []) {\n    if (!affected.has(dep)) {\n      updates[STAGE_COLUMN_MAP[dep]] = false;\n      affected.add(dep);\n    }\n  }\n}\n\nconst cascaded = [...affected].filter((s) => s !== stage);\nreturn [{\n  json: {\n    __validation_error: false,\n    updates,\n    response: {\n      id: person_id,\n      stage,\n      value,\n      column: STAGE_COLUMN_MAP[stage],\n      cascaded_stages: cascaded,\n      cascade_reason: cascaded.length === 0 ? null : (value ? 'prerequisites' : 'dependents'),\n    },\n  },\n}];\n"
+      },
+      "id": "compute-cascade",
+      "name": "Validate + compute cascade",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.__validation_error }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-validation-error",
+      "name": "Validation error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ error: $json.error }) }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "respond-error",
+      "name": "Respond error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [860, 180]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "https://openclaude-nocodb.onrender.com/api/v2/tables/mciuo6qr841ald4/records",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify([$json.updates]) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "patch-people",
+      "name": "PATCH NocoDB People",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Validate + compute cascade').item.json.response }}",
+        "options": {}
+      },
+      "id": "respond-ok",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1080, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate + compute cascade", "type": "main", "index": 0 }]]
+    },
+    "Validate + compute cascade": {
+      "main": [[{ "node": "Validation error?", "type": "main", "index": 0 }]]
+    },
+    "Validation error?": {
+      "main": [
+        [{ "node": "Respond error", "type": "main", "index": 0 }],
+        [{ "node": "PATCH NocoDB People", "type": "main", "index": 0 }]
+      ]
+    },
+    "PATCH NocoDB People": {
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}
