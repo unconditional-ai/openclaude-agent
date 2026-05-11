@@ -3022,15 +3022,27 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
-async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, placeholderRef = null) {
-  // Live progress: when /run posted a "On it…" placeholder up front, this
-  // function appends a status line for each tool the agent runs and edits the
-  // placeholder in place. /run replaces the placeholder with the final answer
-  // when this function returns. Falls back to no-op if placeholderRef is null
-  // (no placeholder posted, e.g. boot-time test or post failed).
+async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null) {
+  // Live progress: posts an "On it…" placeholder right before the FIRST tool
+  // dispatch, then edits it in place after each subsequent iteration to add a
+  // status line per tool. /run replaces the placeholder with the final answer
+  // when this function returns. The lazy-on-first-tool design means stay_silent
+  // and pure-text-reply cases never post a placeholder at all — fixing the
+  // "Compass don't reply to this" → flash of 'On it…' then disappears bug.
   const progressLines = [];
   let lastFlushedCount = 0;
+  let placeholderRef = null;
+  async function ensurePlaceholder() {
+    if (placeholderRef || !slack_context?.channel) return;
+    try {
+      const p = await postToSlack(slack_context.channel, "_On it…_", slack_context.thread_ts);
+      placeholderRef = { channel: slack_context.channel, ts: p.ts };
+    } catch (e) {
+      console.warn(`[progress] placeholder post failed: ${e.message}`);
+    }
+  }
   async function flushProgress() {
+    await ensurePlaceholder();
     if (!placeholderRef || progressLines.length === lastFlushedCount) return;
     lastFlushedCount = progressLines.length;
     const text = `_Working on it…_\n\n${progressLines.join("\n")}`;
@@ -3132,6 +3144,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
           stop_reason: "credit_exhausted",
           iterations: iteration,
           trace,
+          placeholderRef,
         };
       }
       // Anything else: rethrow so /run's catch surfaces it normally.
@@ -3157,6 +3170,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         stop_reason: "budget_exhausted",
         iterations: iteration,
         trace,
+        placeholderRef,
       };
     }
 
@@ -3207,6 +3221,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
+        placeholderRef,
       };
     }
 
@@ -3224,6 +3239,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
+        placeholderRef,
       };
     }
 
@@ -3326,6 +3342,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
+        placeholderRef,
       };
     }
 
@@ -3339,6 +3356,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       cost_usd: conversationCostUsd,
       iterations: iteration,
       trace,
+      placeholderRef,
     };
   }
 
@@ -3348,6 +3366,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     cost_usd: conversationCostUsd,
     iterations: iteration,
     trace,
+    placeholderRef,
   };
 }
 
@@ -4417,36 +4436,20 @@ app.post("/run", async (req, res) => {
     enrichedTranscript += `\n\n## Attached files (already uploaded to Files API and visible to you)\n${manifest}\n\nFor CSV / JSON / text content, you can reference these directly in code_execution by file_id (they land in /mnt/user-data/uploads/). For PDFs and images, the model can read them natively from the attached content blocks.`;
   }
 
-  // === Live progress placeholder ===
-  // Post an "On it…" message immediately so the user sees something in the
-  // 1-30 seconds before the first tool call lands. runAgent updates this
-  // message in place after each iteration with one line per tool. This block
-  // replaces it with the final answer (or deletes it if the agent decides to
-  // stay_silent). If posting fails (Slack down, channel-not-in, etc.) the
-  // run still proceeds and falls back to a regular postMessage at the end.
-  let placeholderRef = null;
-  if (slack_context?.channel) {
-    try {
-      const placeholder = await postToSlack(
-        slack_context.channel,
-        "_On it…_",
-        slack_context.thread_ts
-      );
-      if (placeholder?.ts) {
-        placeholderRef = { channel: slack_context.channel, ts: placeholder.ts };
-      }
-    } catch (e) {
-      console.warn(`[progress] placeholder post failed (will fall back to final post): ${e.message}`);
-    }
-  }
-
+  // Note: the live-progress placeholder is now posted lazily by runAgent — it
+  // fires the first time a tool is dispatched, not at /run start. This means
+  // stay_silent runs and pure-text replies never post a placeholder, fixing
+  // the "Compass don't reply to this" → flash of 'On it…' then disappears
+  // bug. /run reads result.placeholderRef below to decide whether to edit
+  // the existing placeholder or post fresh.
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs, placeholderRef);
+    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
   }
+  const placeholderRef = result.placeholderRef || null;
   const elapsedMs = Date.now() - t0;
   console.log(`[agent] done in ${elapsedMs}ms, ok=${result.ok}, iterations=${result.iterations}`);
 
