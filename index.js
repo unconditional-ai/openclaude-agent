@@ -26,7 +26,6 @@ const {
   AGENT_MODEL = "claude-sonnet-4-6",
   PORT = 10000,
   RUN_SHARED_SECRET,
-  ALLOW_TOOL_PROPOSALS,
   N8N_BASE_URL,
   N8N_API_KEY,
   N8N_AUTH_TOKEN,
@@ -51,7 +50,14 @@ for (const [k, v] of Object.entries(requiredEnv)) {
   }
 }
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+// code_execution and the Files API both still need beta opt-in headers as of
+// May 2026. Set once at the client so every messages.create inherits them.
+const anthropic = new Anthropic({
+  apiKey: ANTHROPIC_API_KEY,
+  defaultHeaders: {
+    "anthropic-beta": "code-execution-2025-08-25,files-api-2025-04-14",
+  },
+});
 
 // ---------- NocoDB helpers ----------
 
@@ -455,12 +461,43 @@ async function refreshN8nTools() {
 
 const toolImpls = {
   async lookup_person({ query, type }) {
-    const where = type === "email"
-      ? `(Primary email,eq,${query})`
-      : `(Name,like,%${query}%)`;
-    const data = await ncGet(
-      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(where)}&limit=10`
-    );
+    // Email lookup is case-insensitive in intent, but NocoDB's `eq` operator
+    // is case-sensitive against the stored value. Legacy People rows may have
+    // mixed-case emails ("Joseph.Wise@gmail.com") while new rows are
+    // normalised lowercase. So: try strict eq first (cheap, indexed), and if
+    // it returns 0 fall back to a `like` filter against the normalised
+    // address — `like` evaluates case-insensitively in NocoDB's filter layer
+    // and catches the legacy rows.
+    let where;
+    let data;
+    if (type === "email") {
+      const normalized = String(query || "").trim().toLowerCase();
+      where = `(Primary email,eq,${normalized})`;
+      data = await ncGet(
+        `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(where)}&limit=10`
+      );
+      if (data.list.length === 0) {
+        // Strict-eq missed. Retry case-insensitively. We escape % and _ in the
+        // query so an email containing those literally doesn't become a
+        // wildcard. Then we double-check the match in code (defensive: if
+        // NocoDB ever surprises us with a too-wide match, we filter to exact-
+        // string-equality on the lowercased value).
+        const escaped = normalized.replace(/[%_]/g, "");
+        where = `(Primary email,like,%${escaped}%)`;
+        const fallback = await ncGet(
+          `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(where)}&limit=10`
+        );
+        const exact = (fallback.list || []).filter(
+          (p) => String(p["Primary email"] || "").trim().toLowerCase() === normalized
+        );
+        if (exact.length > 0) data = { list: exact };
+      }
+    } else {
+      where = `(Name,like,%${query}%)`;
+      data = await ncGet(
+        `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(where)}&limit=10`
+      );
+    }
     return {
       count: data.list.length,
       matches: data.list.map((p) => ({
@@ -519,6 +556,43 @@ const toolImpls = {
     amount_paid = null,
     next_action = null,
   }) {
+    // Idempotency by code (not by prompt discipline). The May 2026 credit-
+    // exhaustion incident left ambiguous state because resume runs trusted the
+    // prompt to "lookup before write". Now create_person ALWAYS does the email
+    // lookup itself. Resume after partial failure = re-run, dupes are skipped.
+    if (primary_email) {
+      const normalizedEmail = String(primary_email).trim().toLowerCase();
+      const existing = await this.lookup_person({ query: normalizedEmail, type: "email" });
+      if (existing.count > 0) {
+        const match = existing.matches[0];
+        // Best-effort: link to cohort if requested and not already linked.
+        let cohortLinked = null;
+        if (cohort_name) {
+          const cohort = await this.lookup_cohort({ name: cohort_name });
+          if (cohort.found) {
+            try {
+              await ncPost(
+                `/api/v2/tables/${PEOPLE_TABLE_ID}/links/${COHORTS_LINK_COLUMN_ID}/records/${match.id}`,
+                [{ Id: cohort.id }]
+              );
+              cohortLinked = cohort.name;
+            } catch (e) {
+              // Link may already exist; not worth blowing up the import for.
+              console.log(`[create_person] cohort link skipped for existing ${match.id}: ${e.message}`);
+            }
+          }
+        }
+        return {
+          id: match.id,
+          name: match.name,
+          primary_email: match.primary_email,
+          cohort_linked: cohortLinked,
+          already_existed: true,
+          note: "Person already in system — no duplicate created. Use update_person to modify their fields, or add_note to append to Notes.",
+        };
+      }
+    }
+
     let normalizedSource = "Other";
     if (source && typeof source === "string") {
       const cap = source.charAt(0).toUpperCase() + source.slice(1).toLowerCase();
@@ -527,7 +601,7 @@ const toolImpls = {
 
     const record = {
       Name: name,
-      "Primary email": primary_email,
+      "Primary email": primary_email ? String(primary_email).trim().toLowerCase() : null,
       "Primary phone": primary_phone,
       Status: "Onboarding",
       Owner: "Valerie",
@@ -1116,15 +1190,90 @@ const toolImpls = {
     return { base_id: baseId, tables };
   },
 
-  async add_table_column({ table_id, name, type = "SingleLineText" }) {
+  async add_table_column({ table_id, name, type = "SingleLineText", options = null }) {
     // type must be a NocoDB UI data type (uidt). Common: SingleLineText, LongText,
-    // Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON.
-    const created = await ncPost(`/api/v2/meta/tables/${table_id}/columns`, {
-      column_name: name,
-      title: name,
-      uidt: type,
+    // Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON,
+    // SingleSelect, MultiSelect.
+    //
+    // SingleSelect / MultiSelect REQUIRE options[] — refuse to create them
+    // without one. Silent fallback to a free-text column was the bug behind the
+    // May 2026 "we agreed on a dropdown but got SingleLineText" incident.
+    if (type === "SingleSelect" || type === "MultiSelect") {
+      if (!Array.isArray(options) || options.length === 0) {
+        return {
+          error: `${type} columns require options[]. Pass an array of value strings, e.g. options: ["Foundations", "Mastery"]. Refusing to silently degrade to SingleLineText.`,
+        };
+      }
+    } else if (options) {
+      return { error: `options[] is only valid for SingleSelect or MultiSelect (got type=${type}).` };
+    }
+    const body = { column_name: name, title: name, uidt: type };
+    if (options) body.colOptions = { options: options.map((v) => ({ title: String(v) })) };
+    const created = await ncPost(`/api/v2/meta/tables/${table_id}/columns`, body);
+    return { table_id, column_id: created.id || null, name, type, options: options || null };
+  },
+
+  // Append values to an existing SingleSelect / MultiSelect column. Use this
+  // when a CSV import surfaces a value that's not in the current option list
+  // (e.g. CSV has Source="Podcast" and the column only allows Direct/Referral
+  // /Workshop/Website/Social/Other). Confirmation gated — schema-affecting
+  // change.
+  async add_select_options({ table_id, column_id, new_options, confirmed = false }) {
+    if (!table_id || !column_id) {
+      return { error: "table_id and column_id are required (use list_tables + get_table_meta to discover)" };
+    }
+    if (!Array.isArray(new_options) || new_options.length === 0) {
+      return { error: "new_options must be a non-empty array of value strings" };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Add ${new_options.length} new option${new_options.length === 1 ? "" : "s"} to column ${column_id}: ${new_options.join(", ")}.`,
+        { table_id, column_id, new_options, confirmed: true }
+      );
+    }
+    // NocoDB requires the FULL options list on update — fetch existing first,
+    // then append, then PATCH the column. Include column_name + title in the
+    // body because NocoDB's column-update endpoint validates against the full
+    // identifying tuple, not just the fields you're changing (an early version
+    // of this tool 400'd because it omitted them).
+    const meta = await ncGet(`/api/v2/meta/columns/${column_id}`);
+    const uidt = meta?.uidt;
+    if (uidt !== "SingleSelect" && uidt !== "MultiSelect") {
+      return {
+        error: `Column ${column_id} is type ${uidt || "unknown"}, not SingleSelect/MultiSelect — refusing to add options to it.`,
+      };
+    }
+    const existing = (meta?.colOptions?.options || []).map((o) => o.title);
+    const dedupNew = new_options.map((v) => String(v)).filter((v) => !existing.includes(v));
+    if (dedupNew.length === 0) {
+      return {
+        table_id,
+        column_id,
+        added: 0,
+        note: "All requested options already present.",
+        existing,
+      };
+    }
+    // Preserve the existing option metadata (color, order) — NocoDB strips it
+    // if you only send `{title}`. Pass through the original objects and append
+    // the new ones with just title.
+    const mergedOptions = [
+      ...(meta?.colOptions?.options || []),
+      ...dedupNew.map((title) => ({ title })),
+    ];
+    await ncPatch(`/api/v2/meta/columns/${column_id}`, {
+      column_name: meta.column_name,
+      title: meta.title,
+      uidt,
+      colOptions: { options: mergedOptions },
     });
-    return { table_id, column_id: created.id || null, name, type };
+    return {
+      table_id,
+      column_id,
+      added: dedupNew.length,
+      new_total: mergedOptions.length,
+      added_values: dedupNew,
+    };
   },
 
   async create_table({ name, columns }) {
@@ -1937,162 +2086,19 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     };
   },
 
-  // ---------- Self-extension ----------
-  // Generates a new tool from natural-language intent + JS code, persists it to
-  // tools/generated/<name>.js, and hot-loads it into the live tool registry so
-  // it's callable in the same agent run that created it. Confirmation gated —
-  // first call returns a preview showing the FULL code; the human must explicitly
-  // approve before the file is written and registered.
-  async propose_new_tool({ name, description, input_schema, implementation_code, confirmed = false }) {
-    // RCE surface: this tool hot-loads agent-authored JS into the running
-    // process. Even with confirmation gating, a prompt-injected transcript
-    // could socially engineer a malicious approval flow. Default to disabled
-    // and require an explicit env opt-in.
-    if (ALLOW_TOOL_PROPOSALS !== "1" && ALLOW_TOOL_PROPOSALS !== "true") {
-      return { error: "Tool proposals are disabled on this deployment. An operator must set ALLOW_TOOL_PROPOSALS=1 in env to enable self-extension." };
-    }
-    if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
-      return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
-    }
-    if (toolImpls[name]) {
-      return { error: `Tool '${name}' already exists. Pick a different name or update via the existing tool.` };
-    }
-    if (!description) return { error: "description required (when-to-use guidance for future agent runs)" };
-    if (!input_schema || typeof input_schema !== "object") {
-      return { error: "input_schema required (JSON Schema object)" };
-    }
-    if (!implementation_code || typeof implementation_code !== "string") {
-      return { error: "implementation_code required (a JS function expression — e.g. 'async function ({ x }) { ... }')" };
-    }
-    // Reject paths/escape attempts in the name (defense-in-depth — regex above
-    // already restricts the charset, but make the intent obvious).
-    if (name.includes("/") || name.includes("..")) {
-      return { error: "name must not contain path separators" };
-    }
-    // Pre-flight syntax check before bothering the human with a confirmation.
-    try {
-      new Function(`return (${implementation_code})`);
-    } catch (e) {
-      return { error: `implementation_code failed to parse: ${e.message}` };
-    }
-    if (!confirmed) {
-      // Custom preview shape (not pendingConfirmation) — Yohan and Valerie are
-      // non-technical, so the user-facing summary must NOT include JS code,
-      // JSON schemas, or even the internal tool name. The full code is included
-      // as code_for_dev_review for the agent's own context (and is visible in
-      // git after approval), but the agent is instructed to describe behavior
-      // in plain English when replying.
-      return {
-        status: "confirmation_required",
-        behavior_for_user: description,
-        replay_args: { name, description, input_schema, implementation_code, confirmed: true },
-        internal_name: name,
-        code_for_dev_review: implementation_code,
-        to_proceed:
-          "DO NOT execute yet. Reply to the user in plain English: explain what the new action will do and what happens when it runs, using the behavior_for_user field. Ask them to confirm. " +
-          "DO NOT mention the internal_name, paste implementation_code, paste input_schema JSON, or surface ANY internals in the user-facing reply — the user is non-technical and doesn't need to see plumbing. " +
-          "On their explicit go-ahead, call propose_new_tool again with replay_args (which already has confirmed: true).",
-      };
-    }
-    const dir = path.join(__dirname, "tools", "generated");
-    fs.mkdirSync(dir, { recursive: true });
-    const filePath = path.join(dir, `${name}.js`);
-    if (fs.existsSync(filePath)) {
-      return { error: `File ${filePath} already exists on disk. Manually remove it before reproposing.` };
-    }
-    const fileContents =
-      `// Auto-generated by propose_new_tool on ${new Date().toISOString()}\n` +
-      `// Edit or delete to revoke. Hot-loaded at runtime; persisted to disk so it survives restart.\n` +
-      `export default {\n` +
-      `  name: ${JSON.stringify(name)},\n` +
-      `  description: ${JSON.stringify(description)},\n` +
-      `  defer_loading: true,\n` +
-      `  input_schema: ${JSON.stringify(input_schema, null, 2)},\n` +
-      `  impl: ${implementation_code},\n` +
-      `};\n`;
-    fs.writeFileSync(filePath, fileContents);
-    let mod;
-    try {
-      // ESM dynamic import. Append a unique query so re-proposing a tool of the
-      // same name (after delete) gets fresh code instead of a cached module.
-      const url = `file://${filePath}?t=${Date.now()}`;
-      mod = (await import(url)).default;
-    } catch (e) {
-      // Roll back — bad code on disk would block the auto-loader on restart.
-      try { fs.unlinkSync(filePath); } catch {}
-      return { error: `Generated tool failed to load (file removed): ${e.message}` };
-    }
-    if (typeof mod.impl !== "function") {
-      try { fs.unlinkSync(filePath); } catch {}
-      return { error: "implementation_code did not evaluate to a function (file removed)" };
-    }
-    tools.push({
-      name: mod.name,
-      description: mod.description,
-      defer_loading: true,
-      input_schema: mod.input_schema,
-    });
-    toolImpls[mod.name] = mod.impl;
-    return {
-      ok: true,
-      name,
-      file: filePath,
-      note: "Tool is now registered and persisted. You can call it in this same run to fulfil the original request.",
-    };
-  },
-
-  // Revoke a previously generated tool. Only operates on tools/generated/<name>.js
-  // — built-in tools cannot be deleted. Confirmation gated. The tool is removed
-  // from the live registry AND the file is deleted, so it doesn't reappear on
-  // restart.
-  async delete_generated_tool({ name, confirmed = false }) {
-    if (ALLOW_TOOL_PROPOSALS !== "1" && ALLOW_TOOL_PROPOSALS !== "true") {
-      return { error: "Tool revocation is disabled on this deployment (ALLOW_TOOL_PROPOSALS not enabled)." };
-    }
-    if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
-      return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
-    }
-    const filePath = path.join(__dirname, "tools", "generated", `${name}.js`);
-    if (!fs.existsSync(filePath)) {
-      return { error: `No generated tool file at ${filePath}. Built-in tools cannot be deleted with this action.` };
-    }
-    if (!toolImpls[name]) {
-      return { error: `Tool '${name}' is not registered (file exists but not loaded). Inspect or remove ${filePath} manually.` };
-    }
-    let proposedDescription = "";
-    try {
-      const url = `file://${filePath}?t=${Date.now()}`;
-      const mod = (await import(url)).default;
-      proposedDescription = mod?.description || "";
-    } catch {}
-    if (!confirmed) {
-      return {
-        status: "confirmation_required",
-        behavior_for_user: proposedDescription
-          ? `Remove the action that does the following: ${proposedDescription}`
-          : `Remove a previously added action.`,
-        replay_args: { name, confirmed: true },
-        internal_name: name,
-        to_proceed:
-          "DO NOT execute yet. Reply to the user in plain English describing the action being removed (use behavior_for_user). " +
-          "DO NOT mention the internal_name, file paths, or any plumbing in the user-facing reply. " +
-          "On their explicit go-ahead, call delete_generated_tool again with replay_args.",
-      };
-    }
-    // Remove from the live tools array. (No ESM equivalent of require.cache —
-    // the next propose for this name uses a fresh import URL via timestamp
-    // query string, so cached modules don't resurface.)
-    const idx = tools.findIndex((t) => t.name === name);
-    if (idx !== -1) tools.splice(idx, 1);
-    delete toolImpls[name];
-    fs.unlinkSync(filePath);
-    return {
-      ok: true,
-      removed: name,
-      file: filePath,
-      note: "Tool unregistered and file deleted. It will not reappear on restart.",
-    };
-  },
+  // ---------- Self-extension (RETIRED) ----------
+  // propose_new_tool / delete_generated_tool / loadGeneratedTools used to live
+  // here. They were retired May 2026 after the CSV-import chaos. Reasons:
+  //   1. Generated tools lived on Render's ephemeral disk and died on every
+  //      deploy, so each "Compass built itself a tool!" moment was a leaky
+  //      bucket — the next deploy started over.
+  //   2. The agent reached for it as a first resort instead of asking, accreting
+  //      bespoke JS that nobody reviewed.
+  //   3. The legitimate "I need to handle a new file format / one-off data
+  //      shape" cases are now covered by the code_execution tool (Python
+  //      sandbox), which is reviewed by Anthropic and doesn't litter our disk.
+  // If a *durable* new capability is genuinely needed, add a normal tool to
+  // this file via PR — same as every other tool here.
 };
 
 // ---------- Tool definitions for Claude ----------
@@ -2105,33 +2111,14 @@ const tools = [
     type: "tool_search_tool_bm25_20251119",
     name: "tool_search_tool_bm25",
   },
+  // Server-side Python sandbox. When a user uploads a CSV / Excel / PDF / JSON,
+  // or any time the agent needs to slice/aggregate data ad-hoc, run Python here
+  // instead of asking for a new bespoke JS tool. Files referenced via
+  // container_upload blocks (Files API) land in /mnt/user-data/uploads/.
+  // See https://docs.claude.com/en/docs/agents-and-tools/tool-use/code-execution-tool
   {
-    name: "propose_new_tool",
-    description:
-      "Propose and register a NEW agent tool that doesn't exist yet. When to use: the user asks for something no existing tool supports AND you've already searched via tool_search_tool_bm25 to confirm the gap. CONFIRMATION GATED: first call shows the FULL proposed code to the user — they review and explicitly approve before anything is written or executed. Once approved the tool is persisted to tools/generated/<name>.js (git-visible, revokable by deleting the file) and hot-loaded into the live process so you can call it immediately to fulfil the original request. Only propose tools that are SMALL, SCOPED, and SAFE — single-purpose impls, no shelling out, no filesystem writes outside the tool's narrow purpose, no secrets exfiltration.",
-    input_schema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Tool name. Lowercase letters/digits/underscores, starts with a letter (e.g. 'create_invoice', 'log_workout')." },
-        description: { type: "string", description: "When-to-use guidance for future agent runs. Same shape as descriptions on existing tools." },
-        input_schema: { type: "object", description: "JSON Schema for the tool's input args. Must be a valid JSON Schema object with type and properties." },
-        implementation_code: { type: "string", description: "A JavaScript function expression — e.g. 'async function ({ x, y }) { ... return { ok: true }; }'. The host project is ESM ('type': 'module' in package.json), so the file is loaded as an ES module. Inside the function, `this` is bound to the tool registry, so you can call other tools via `this.lookup_person(...)`. Available globals: process, fetch, console. `require` is NOT available — for dynamic module loading use `await import('module-name')`. Most impls won't need any imports beyond what global fetch/process provide. Keep it small and scoped." },
-        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed tool definition." },
-      },
-      required: ["name", "description", "input_schema", "implementation_code"],
-    },
-  },
-  {
-    name: "delete_generated_tool",
-    description: "Revoke a previously generated tool. Only works on tools that were minted via propose_new_tool (the file must exist under tools/generated/). Built-in tools cannot be deleted with this action. CONFIRMATION GATED: first call returns a plain-English preview of the action being removed; second call with confirmed: true unregisters and deletes the file.",
-    input_schema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "The name of the generated tool to remove. If the user describes the tool by behavior rather than name, look up matches via tool_search_tool_bm25 first." },
-        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly confirmed the removal." },
-      },
-      required: ["name"],
-    },
+    type: "code_execution_20250825",
+    name: "code_execution",
   },
   {
     name: "lookup_person",
@@ -2535,16 +2522,39 @@ const tools = [
   },
   {
     name: "add_table_column",
-    description: "Add a column to an existing NocoDB table. When to use: ONLY after explicit user confirmation. Use list_tables to find the table_id. Common types as above.",
+    description: "Add a column to an existing NocoDB table. When to use: ONLY after explicit user confirmation. Use list_tables to find the table_id. For SingleSelect / MultiSelect you MUST pass options[] — silent degradation to free text is refused.",
     defer_loading: true,
     input_schema: {
       type: "object",
       properties: {
         table_id: { type: "string" },
         name: { type: "string", description: "Column name (will also be the title)." },
-        type: { type: "string", description: "NocoDB UI data type — defaults to SingleLineText" },
+        type: {
+          type: "string",
+          description: "NocoDB UI data type. Common: SingleLineText, LongText, Number, Decimal, Checkbox, Date, DateTime, Email, PhoneNumber, URL, JSON, SingleSelect, MultiSelect.",
+        },
+        options: {
+          type: "array",
+          description: "REQUIRED when type is SingleSelect or MultiSelect. Array of value strings, e.g. [\"Foundations\", \"Mastery\"]. Omit for other types.",
+          items: { type: "string" },
+        },
       },
-      required: ["table_id", "name"],
+      required: ["table_id", "name", "type"],
+    },
+  },
+  {
+    name: "add_select_options",
+    description: "Append new values to an existing SingleSelect or MultiSelect column. When to use: a CSV import surfaces a value that isn't in the current option list (e.g. Source=\"Podcast\" when the column only allows Direct/Referral/etc.). CONFIRMATION GATED — first call returns a preview, second call with confirmed:true commits. Use get_table_meta or query the column metadata to find column_id.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        table_id: { type: "string" },
+        column_id: { type: "string", description: "NocoDB column id (not the title)." },
+        new_options: { type: "array", items: { type: "string" } },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the new values." },
+      },
+      required: ["table_id", "column_id", "new_options"],
     },
   },
   {
@@ -2874,17 +2884,14 @@ Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-langu
 ACT, DON'T NARRATE:
 When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities. If no available tool can answer the question, say so directly rather than promising to check.
 
-SELF-EXTENSION (propose_new_tool):
-If the user asks for something no existing tool covers, you can propose a brand-new tool with propose_new_tool. The flow:
-1. First confirm the gap — search the tool catalog via tool_search_tool_bm25 with terms describing the capability. Don't propose a new tool when an existing one covers the use case.
-2. If genuinely missing, tell the user what's missing in plain English and ASK before proposing — "I can't do that yet. Want me to add the ability?". Wait for their go-ahead.
-3. Call propose_new_tool with name, description, input_schema, and implementation_code. The first call returns a confirmation preview.
-4. CRITICAL — your user-facing reply at this step must be PLAIN ENGLISH and surface ZERO internals. Yohan and Valerie are non-technical. They don't need or want to see: the internal tool name, JavaScript code, JSON schemas, parameter lists, or any plumbing language. Describe ONLY what will happen in human terms ("This will look up someone by name and post a workout link to their Slack DM. Want me to add it?"). The technical details are auto-saved to git for separate developer review.
-5. On their explicit go-ahead, call propose_new_tool again with the replay_args from the preview (which already has confirmed: true). The tool is persisted to tools/generated/<name>.js (git-visible, deletable to revoke) and hot-loaded.
-6. Immediately use the new tool to fulfil the original request. After it runs, describe the outcome in plain English — again, no need to mention that a "new action" was added or what it's called.
-Implementation code runs inside the bot's process. The host project is ESM, so each generated tool file is loaded as an ES module. Inside the function, 'this' is the tool registry — you can call other tools via this.lookup_person(...), this.create_clickup_task(...), etc. Available globals: process, fetch, console. NOTE: require is NOT available in this ESM context — for dynamic module loading use 'await import("module-name")'. Most impls won't need any imports beyond what fetch/process provide. Keep impls SMALL and SCOPED — single capability, no metaprogramming, no shelling out, no writes outside the tool's narrow purpose. If the request is really an ad-hoc one-off, prefer using existing tools or asking the human to do it manually rather than minting a permanent new tool.
+ATTACHMENTS AND CODE EXECUTION:
+When the user uploads a file in Slack, n8n uploads it to Anthropic's Files API and you receive it as a content block on the first message of the run. You'll also see a "## Attached files" manifest in the transcript listing each file's name, mime type, and file_id. You can SEE these files — do not say "I can't see attachments" or invent tools to discover them.
 
-To revoke a previously minted tool, use delete_generated_tool. Same plain-English confirmation rules — describe the action being removed in human terms, not its internal name.
+For CSV / JSON / Excel and any tabular or programmatic work: use the code_execution tool. It's a Python sandbox; uploaded files land at /mnt/user-data/uploads/<filename>. Read them with pandas, open(), json.load(), etc. Do NOT ask anyone to build a bespoke parser tool — code_execution covers that case.
+
+For PDFs and images you can read directly via the model's native multimodal capability — the document/image content blocks are already in the prompt.
+
+If a workflow requires a genuinely new DURABLE capability (a permanent integration with a system Compass doesn't reach yet), say so plainly and ask Nathan to add it. There is no runtime tool-minting any more.
 
 DIRECT DATA MANIPULATION:
 For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
@@ -2973,10 +2980,12 @@ EDGE CASES TO HANDLE:
 - Toggle only the stages the user explicitly named — if they said "agreement_sent", set just that and leave agreement_signed as-is.
 - Use only emails, phone numbers, and PII that appear in the transcript. If a value is missing, ask for it or leave it blank.
 
-SCHEMA CHANGES (create_table / add_table_column):
-These are DESTRUCTIVE in the sense that they alter the database structure for everyone. Rules:
-- Confirm with the user before calling create_table or add_table_column. Use ask_for_clarification with a concrete proposal: "I'd create a table called 'Invoices' with columns: Number (text), Amount (decimal), Issued (date), Status (single select). OK to proceed?"
+SCHEMA CHANGES (create_table / add_table_column / add_select_options):
+These alter the database structure for everyone. Rules:
+- Always confirm with the user first. Use ask_for_clarification with a concrete proposal: "I'd add a column 'referral_type' (SingleSelect with options: Full Partnership, Warm Handoff, Non-referral, Direct, Other). OK to proceed?"
 - Prefer adding to an existing table over creating a new one. Use list_tables first to check.
+- For SingleSelect / MultiSelect columns the new add_table_column REQUIRES options[] — it will refuse to silently fall back to free text. Ask the user for the values up front; don't degrade.
+- When a CSV import surfaces a value that's not in an existing dropdown, use add_select_options (confirmation gated) — don't reject the row, propose adding the value.
 - bulk_create_records is safer (data only, no schema change) — still confirm if importing more than ~10 records at once.
 
 When you're done, return a concise summary suitable for posting to Slack.
@@ -2999,8 +3008,34 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
-async function runAgent(transcript, slack_context = null) {
-  const messages = [{ role: "user", content: transcript }];
+async function runAgent(transcript, slack_context = null, attachments = []) {
+  // If files were uploaded to the Files API at the n8n boundary, attach them
+  // as content blocks on the first user message so Claude sees them natively.
+  // Block-type routing:
+  //   - text/csv, application/json, text/* → container_upload (lands in code-
+  //     exec sandbox at /mnt/user-data/uploads/<filename>)
+  //   - application/pdf → document block (model reads directly)
+  //   - image/* → image block
+  //   - everything else → container_upload (best fallback; agent can decide)
+  let initialContent;
+  if (attachments && attachments.length > 0) {
+    const blocks = [{ type: "text", text: transcript }];
+    for (const a of attachments) {
+      const mime = (a.mimetype || "").toLowerCase();
+      if (mime.startsWith("image/")) {
+        blocks.push({ type: "image", source: { type: "file", file_id: a.file_id } });
+      } else if (mime === "application/pdf" || mime === "text/plain" || mime === "text/markdown") {
+        blocks.push({ type: "document", source: { type: "file", file_id: a.file_id } });
+      } else {
+        // CSV / JSON / Excel / unknown → push to code-exec sandbox
+        blocks.push({ type: "container_upload", file_id: a.file_id });
+      }
+    }
+    initialContent = blocks;
+  } else {
+    initialContent = transcript;
+  }
+  const messages = [{ role: "user", content: initialContent }];
   const trace = [];
   let iteration = 0;
   const maxIterations = 12;
@@ -3030,15 +3065,39 @@ async function runAgent(transcript, slack_context = null) {
       );
     }
     const t0 = Date.now();
-    const response = await anthropic.messages.create({
-      model: AGENT_MODEL,
-      max_tokens: 2048,
-      system: [
-        { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
-      ],
-      tools: cachedTools,
-      messages,
-    });
+    let response;
+    try {
+      response = await anthropic.messages.create({
+        model: AGENT_MODEL,
+        max_tokens: 2048,
+        system: [
+          { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
+        ],
+        tools: cachedTools,
+        messages,
+      });
+    } catch (e) {
+      // credit_balance_too_low arrives as HTTP 400, not 429 — generic retry libs
+      // miss it. Catch explicitly so we surface a useful Slack message instead
+      // of a JSON-blob error and so the loop stops cleanly mid-batch (the May
+      // 2026 incident: 12 of 25 rows written, then the loop crashed silently).
+      const msg = String(e?.message || "");
+      const status = e?.status || e?.response?.status;
+      if (status === 400 && /credit balance/i.test(msg)) {
+        console.error(`[agent] credit exhausted on iter=${iteration} after tools=[${trace.map((t) => t.tool).join(",")}]`);
+        return {
+          ok: false,
+          credit_exhausted: true,
+          summary:
+            "Anthropic credits are exhausted, so I had to stop. Top up at console.anthropic.com and reply in this thread — I'll pick up where I left off (any rows I already wrote will be detected as duplicates and skipped).",
+          stop_reason: "credit_exhausted",
+          iterations: iteration,
+          trace,
+        };
+      }
+      // Anything else: rethrow so /run's catch surfaces it normally.
+      throw e;
+    }
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -3131,10 +3190,9 @@ async function runAgent(transcript, slack_context = null) {
               // Pass slack_context separately so the workflow can use it.
               result = await callN8nWebhook(block.name, block.input, slack_context);
             } else {
-              // Spread so tool impls keep working via `this.<other_tool>`, but
-              // expose the running trace so tools that need to enforce
-              // call-order invariants (e.g. propose_new_tool requires a prior
-              // tool_search_tool_bm25 call) can introspect it.
+              // Spread so tool impls keep working via `this.<other_tool>`. The
+              // running trace is exposed too in case a tool wants to enforce a
+              // call-order invariant (no current users; kept for future-proofing).
               result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
             }
           } catch (e) {
@@ -3257,6 +3315,11 @@ async function getUserName(userId) {
 // Resolves Slack's <@USER_ID> mention syntax to readable @Name so the agent can
 // tell when a message is addressed to someone else (key for the stay_silent
 // false-positive check on side-conversations within threads).
+//
+// Historical attachments (m.files[]) are rendered as inline `[file: ...]` lines
+// so the agent knows past messages had files even when those files aren't
+// re-attached to the current request. Without this rendering the agent is
+// blind to "look at the CSV I sent earlier" references.
 async function formatSlackMessages(messages, botId) {
   const lines = [];
   for (const m of messages) {
@@ -3271,8 +3334,25 @@ async function formatSlackMessages(messages, botId) {
       text = text.replace(match, `@${name}`);
     }
     text = text.trim();
-    if (!text) continue;
-    lines.push(`${speaker}: ${text}`);
+    // Render attachments. Slack file shape: { id, name, mimetype, size, ... }.
+    // We use Slack's native file id here, NOT an Anthropic file_id — the
+    // historical message wasn't routed through n8n's upload step. The agent
+    // sees the metadata and can ask the user to re-share if it needs the
+    // contents.
+    const fileLines = [];
+    for (const f of m.files || []) {
+      const parts = [
+        `name=${f.name || "(unnamed)"}`,
+        `mime=${f.mimetype || "?"}`,
+        f.size ? `size=${f.size}` : null,
+        `slack_file_id=${f.id || "?"}`,
+      ].filter(Boolean);
+      fileLines.push(`  [file: ${parts.join(" ")}]`);
+    }
+    if (!text && fileLines.length === 0) continue;
+    if (text) lines.push(`${speaker}: ${text}`);
+    else lines.push(`${speaker}: (file upload)`);
+    if (fileLines.length > 0) lines.push(...fileLines);
   }
   return lines.join("\n");
 }
@@ -3506,40 +3586,44 @@ function loadSkills() {
 }
 loadSkills();
 
-// Generated tools — agent-authored tools created via propose_new_tool. Files
-// live in tools/generated/<name>.js as ES modules with `export default
-// { name, description, input_schema, impl }`. They're visible in git so changes
-// are reviewable and revokable (delete the file + redeploy to remove).
-async function loadGeneratedTools() {
-  const dir = path.join(__dirname, "tools", "generated");
-  if (!fs.existsSync(dir)) return;
-  for (const file of fs.readdirSync(dir)) {
-    if (!file.endsWith(".js")) continue;
-    const fullPath = path.join(dir, file);
-    try {
-      const mod = (await import(`file://${fullPath}?t=${Date.now()}`)).default;
-      if (!mod?.name || !mod?.impl || !mod?.input_schema) {
-        console.error(`[tools/generated] ${file} missing name/impl/input_schema — skipping`);
-        continue;
-      }
-      if (toolImpls[mod.name]) {
-        console.error(`[tools/generated] ${file} name '${mod.name}' collides with existing tool — skipping`);
-        continue;
-      }
-      tools.push({
-        name: mod.name,
-        description: mod.description || "",
-        defer_loading: mod.defer_loading ?? true,
-        input_schema: mod.input_schema,
-      });
-      toolImpls[mod.name] = mod.impl;
-      console.log(`[tools/generated] loaded ${mod.name} from ${file}`);
-    } catch (e) {
-      console.error(`[tools/generated] failed to load ${file}: ${e.message}`);
+// Generated-tools loader removed alongside propose_new_tool (May 2026). New
+// durable capabilities go in via normal PR; ad-hoc data work goes through the
+// code_execution sandbox.
+
+// Idempotent schema migration for the Agent actions audit table. Adds the
+// `Trace detail` column (LongText) on boot if it doesn't already exist. Self-
+// healing — runs against whichever NocoDB the env points at, no manual click
+// in the UI required. If the column already exists, the meta GET sees it and
+// the function returns without writing. If the audit table doesn't exist at
+// all (AGENT_ACTIONS_TABLE_ID unset, or wrong id), we log and skip — audit
+// logging is fire-and-forget elsewhere, so a broken table just means a
+// missing audit row, not a failed boot.
+async function ensureAuditSchema() {
+  if (!AGENT_ACTIONS_TABLE_ID) {
+    console.log("[migrate] AGENT_ACTIONS_TABLE_ID not set — skipping audit schema check");
+    return;
+  }
+  try {
+    const meta = await ncGet(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}`);
+    const columnTitles = (meta?.columns || []).map((c) => c.title);
+    if (columnTitles.includes("Trace detail")) {
+      console.log("[migrate] audit table already has Trace detail column");
+      return;
     }
+    console.log("[migrate] adding Trace detail column to audit table…");
+    await ncPost(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}/columns`, {
+      column_name: "Trace detail",
+      title: "Trace detail",
+      uidt: "LongText",
+    });
+    console.log("[migrate] Trace detail column added");
+  } catch (e) {
+    // Don't block boot — audit logging tolerates missing fields (NocoDB drops
+    // unknown keys silently). Surface loudly so we notice in Render logs.
+    console.error(`[migrate] ensureAuditSchema failed (continuing): ${e.message}`);
   }
 }
-await loadGeneratedTools();
+await ensureAuditSchema();
 
 function renderTemplate(name, vars) {
   let html = EMAIL_TEMPLATES[name];
@@ -3676,19 +3760,67 @@ async function getGmailFromAddress(accessToken) {
   return data.emailAddress;
 }
 
+// Light PII redaction for tool inputs going into the audit trail. Keeps the
+// shape of the data so it's debuggable, hides the value. Audit trail lives in
+// our own NocoDB so this is belt-and-braces, not a privacy boundary.
+function redactValue(v) {
+  if (v == null) return v;
+  if (typeof v === "string") {
+    // Email
+    if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) {
+      const [local, domain] = v.split("@");
+      return `${local[0]}***@${domain}`;
+    }
+    // Phone (any string of mostly digits, ≥7)
+    const digits = v.replace(/\D/g, "");
+    if (digits.length >= 7 && digits.length / v.length > 0.5) {
+      return `***${digits.slice(-3)}`;
+    }
+    return v.length > 200 ? v.slice(0, 200) + `…(${v.length})` : v;
+  }
+  return v;
+}
+function redactToolInput(input) {
+  if (!input || typeof input !== "object") return input;
+  const out = {};
+  for (const [k, v] of Object.entries(input)) {
+    const lk = k.toLowerCase();
+    if (lk.includes("email") || lk.includes("phone") || lk === "to_email" || lk === "to") {
+      out[k] = redactValue(v);
+    } else if (Array.isArray(v)) {
+      out[k] = v.length > 10 ? `[array len=${v.length}]` : v.map(redactValue);
+    } else if (typeof v === "object") {
+      out[k] = "[object]";
+    } else {
+      out[k] = redactValue(v);
+    }
+  }
+  return out;
+}
+
 // Log every agent run to the Agent actions audit table.
 // Fire-and-forget — failures here shouldn't fail the response.
+//
+// Trace summary now includes tool *inputs* (PII-redacted, truncated) so
+// "what did Compass actually do at 4:15 PM" is answerable from NocoDB without
+// re-reading Render logs. Outputs are not logged (too verbose, varies wildly);
+// the tool name + redacted input is enough to reconstruct intent.
 async function logAgentAction({ transcript, slack_context, result, elapsedMs }) {
   if (!AGENT_ACTIONS_TABLE_ID) return;
   try {
     const source = slack_context?.file_id ? "Slack voice" : (slack_context?.channel ? "Slack text" : "API call");
-    const toolsUsed = (result.trace || []).map((t) => t.tool).filter(Boolean);
+    const trace = result.trace || [];
+    const toolsUsed = trace.map((t) => t.tool).filter(Boolean);
+    const traceWithInputs = trace
+      .map((t) => ({ tool: t.tool, input: redactToolInput(t.input) }))
+      .slice(0, 50); // cap to avoid massive audit rows
     const summaryShort = (result.summary || "").slice(0, 200).replace(/\n+/g, " ");
     const payload = {
       Summary: summaryShort || (result.error ? `Error: ${result.error.slice(0, 180)}` : "agent run"),
       Transcript: transcript,
       "Agent response": result.summary || "",
       "Tools used": JSON.stringify(toolsUsed),
+      "Trace detail": JSON.stringify(traceWithInputs).slice(0, 8000),
       Iterations: result.iterations || 0,
       "Elapsed ms": elapsedMs,
       Success: !!result.ok,
@@ -3724,9 +3856,28 @@ app.post("/run", async (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
 
-  const { transcript, slack_context } = req.body || {};
+  const { transcript, slack_context, attachments } = req.body || {};
   if (!transcript || typeof transcript !== "string") {
     return res.status(400).json({ error: "transcript required" });
+  }
+  // attachments[] is optional. Each entry: { file_id, name, mimetype, size,
+  // role? } — file_id is the Anthropic Files API id (n8n uploads on receipt).
+  // Validate shape loosely — we don't pin a prefix because Anthropic may
+  // change their id format (and have done so silently in the past). Just
+  // require a non-empty string. Anything that fails this is logged and
+  // dropped; the API will reject genuinely-bad ids when we send the request,
+  // which surfaces as a normal error rather than silent attachment-blindness.
+  const validAttachments = Array.isArray(attachments)
+    ? attachments.filter(
+        (a) => a && typeof a === "object" && typeof a.file_id === "string" && a.file_id.length > 0
+      )
+    : [];
+  if (Array.isArray(attachments) && attachments.length !== validAttachments.length) {
+    console.warn(
+      `[agent] dropped ${attachments.length - validAttachments.length} malformed attachment(s) — bad shape: ${JSON.stringify(
+        attachments.filter((a) => !validAttachments.includes(a))
+      ).slice(0, 200)}`
+    );
   }
 
   console.log(`[agent] transcript: ${redactPII(transcript).slice(0, 200)}`);
@@ -3766,9 +3917,19 @@ app.post("/run", async (req, res) => {
     const ref = `## Slack message reference\nchannel: ${slack_context.channel}\nmessage_ts: ${slack_context.thread_ts || slack_context.ts || "(unknown)"}\n${fromLine}\n`;
     enrichedTranscript = ref + enrichedTranscript;
   }
+  // If files arrived, append a manifest so the model sees them in the prompt
+  // text too (description = name + mime + role hint). The actual file_ids are
+  // attached to the first user message as content blocks inside runAgent.
+  if (validAttachments.length > 0) {
+    const manifest = validAttachments
+      .map((a) => `  - ${a.name || "unnamed"} · ${a.mimetype || "unknown"} · ${a.size ? a.size + " bytes" : "size unknown"} · file_id=${a.file_id}`)
+      .join("\n");
+    enrichedTranscript += `\n\n## Attached files (already uploaded to Files API and visible to you)\n${manifest}\n\nFor CSV / JSON / text content, you can reference these directly in code_execution by file_id (they land in /mnt/user-data/uploads/). For PDFs and images, the model can read them natively from the attached content blocks.`;
+  }
+
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context);
+    result = await runAgent(enrichedTranscript, slack_context, validAttachments);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
@@ -3781,7 +3942,13 @@ app.post("/run", async (req, res) => {
 
   // Reply to Slack if context provided AND the agent didn't explicitly choose silence.
   if (slack_context?.channel && !result.silent) {
-    const prefix = result.ok ? ":white_check_mark:" : (result.clarification_needed ? ":thinking_face:" : ":warning:");
+    const prefix = result.ok
+      ? ":white_check_mark:"
+      : result.clarification_needed
+        ? ":thinking_face:"
+        : result.credit_exhausted
+          ? ":credit_card:"
+          : ":warning:";
     const summary = result.summary || "Done.";
     const trailer = result.trace?.length
       ? `\n_${result.trace.length} action${result.trace.length === 1 ? "" : "s"} · ${elapsedMs}ms_`
@@ -3812,9 +3979,6 @@ app.post("/reload", async (req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`Compass agent listening on :${PORT}`);
-  if (ALLOW_TOOL_PROPOSALS === "1" || ALLOW_TOOL_PROPOSALS === "true") {
-    console.log(`[propose_new_tool] ENABLED — agent can mint new JS tools at runtime.`);
-  }
   // Fire-and-forget — the loop will see discovered tools on its next call.
   // If discovery fails, only n8n tools are missing; JS tools work regardless.
   await refreshN8nTools();

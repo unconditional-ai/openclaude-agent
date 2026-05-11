@@ -2,19 +2,39 @@
 
 The Claude tool-use agent service for Unconditional Self ops.
 
-Receives `{transcript, slack_context}` from n8n, runs a Claude tool-use loop against UST's NocoDB, posts the result back to Slack.
+Receives `{transcript, slack_context, attachments?}` from n8n, runs a Claude tool-use loop against UST's NocoDB, posts the result back to Slack.
+
+For the n8n attachment-upload contract see [`docs/n8n-attachment-handoff.md`](docs/n8n-attachment-handoff.md).
 
 ## Tools available to Claude
 
+UST domain:
 - `lookup_person` — search People by email or name
 - `lookup_cohort` — find cohort by name
-- `create_person` — new participant record + cohort link
+- `create_person` — new participant record + cohort link. **Idempotent by code**: looks up by email first; if a match exists, returns the existing record instead of duplicating.
 - `update_person` — patch fields
-- `toggle_stage` — set onboarding stage checkbox
+- `toggle_stage` — set onboarding stage checkbox (with documented stage cascade)
 - `add_note` — append to Notes
 - `link_person_to_cohort` — add another cohort link
 - `log_touchpoint` — audit log entry
+
+Schema (confirmation gated):
+- `add_table_column` — adds a column. **Refuses SingleSelect/MultiSelect without `options[]`** (no silent fallback to free text).
+- `add_select_options` — appends new values to an existing dropdown column.
+- `create_table` — new table.
+
+Generic data:
+- `query_table`, `bulk_create_records`, `bulk_update_records`, `delete_records`
+
+Server-side Anthropic tools (no impl in this codebase):
+- `code_execution` — Python sandbox. Use for CSV/JSON/Excel/PDF/image work. Files attached via the `attachments[]` payload land at `/mnt/user-data/uploads/`.
+- `tool_search_tool_bm25` — discovers deferred tools by natural-language query.
+
+Loop control:
 - `ask_for_clarification` — terminates loop, asks user
+- `stay_silent` — terminates loop without posting
+
+**Removed May 2026:** `propose_new_tool`, `delete_generated_tool`. Generated-tools-on-disk pattern was retired (Render's ephemeral disk killed them on every deploy, and the agent reached for it as a first resort instead of asking). For ad-hoc data work use `code_execution`; for genuinely new durable capabilities, add a normal tool to `index.js` via PR.
 
 ## Endpoints
 
@@ -72,8 +92,7 @@ RUN_SHARED_SECRET            # shared secret n8n sends as X-Run-Secret on POST /
 Optional:
 
 ```
-AGENT_MODEL=claude-sonnet-4-5
-ALLOW_TOOL_PROPOSALS         # set to "1" to enable propose_new_tool (off by default — RCE surface)
+AGENT_MODEL=claude-sonnet-4-6
 N8N_BASE_URL                 # e.g. https://your-n8n.example.com/webhook
 N8N_API_KEY                  # from n8n → Settings → n8n API → Create API Key. Used to discover tools.
 N8N_AUTH_TOKEN               # the value sent as X-Webhook-Token on every n8n call (matches the compass-webhook-auth credential in n8n)
