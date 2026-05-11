@@ -1181,12 +1181,17 @@ const toolImpls = {
     const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
     if (!baseId) return { error: "Could not determine base ID from People table metadata" };
     const data = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
-    const tables = (data.list || data.tables || data || []).map((t) => ({
-      id: t.id,
-      title: t.title,
-      table_name: t.table_name,
-      description: t.description || null,
-    }));
+    // Filter out Compass-internal infrastructure tables. The thread-state
+    // table is the agent's own scratch memory; surfacing it to the model
+    // invites confused reads/writes ("let me update the row count column…").
+    const tables = (data.list || data.tables || data || [])
+      .filter((t) => t.title !== THREAD_STATE_TABLE_TITLE)
+      .map((t) => ({
+        id: t.id,
+        title: t.title,
+        table_name: t.table_name,
+        description: t.description || null,
+      }));
     return { base_id: baseId, tables };
   },
 
@@ -3008,7 +3013,7 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
-async function runAgent(transcript, slack_context = null, attachments = []) {
+async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null) {
   // If files were uploaded to the Files API at the n8n boundary, attach them
   // as content blocks on the first user message so Claude sees them natively.
   // Block-type routing:
@@ -3038,7 +3043,14 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
   const messages = [{ role: "user", content: initialContent }];
   const trace = [];
   let iteration = 0;
-  const maxIterations = 12;
+  // Was 12; bumped to 25 to support batch CSV imports (May 9 import used 11 in
+  // its final batch — already too close to the old ceiling). Safe to bump
+  // because the cost guard below caps spend per conversation.
+  const maxIterations = 25;
+  // Cost ledger for this conversation. Starts at the value already accrued on
+  // this thread (so a "continue" after pause counts toward the same budget
+  // until /run resets it), or 0 if fresh. Updated after every messages.create.
+  let conversationCostUsd = 0;
 
   while (iteration < maxIterations) {
     iteration++;
@@ -3088,6 +3100,7 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
         return {
           ok: false,
           credit_exhausted: true,
+          cost_usd: conversationCostUsd,
           summary:
             "Anthropic credits are exhausted, so I had to stop. Top up at console.anthropic.com and reply in this thread — I'll pick up where I left off (any rows I already wrote will be detected as duplicates and skipped).",
           stop_reason: "credit_exhausted",
@@ -3097,6 +3110,28 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
       }
       // Anything else: rethrow so /run's catch surfaces it normally.
       throw e;
+    }
+
+    // Cost guard. After the response arrives, add this turn's cost to the
+    // running ledger. If the per-conversation cap is exceeded, stop the loop
+    // cleanly with a useful Slack message — the user can reply with anything
+    // (most natural: "continue") and the next /run will reset the ledger.
+    const turnCost = costOf(response.usage, AGENT_MODEL);
+    conversationCostUsd += turnCost;
+    if (conversationCostUsd > MAX_USD_PER_CONVERSATION) {
+      console.warn(`[agent] budget exhausted on iter=${iteration}: $${conversationCostUsd.toFixed(4)} > $${MAX_USD_PER_CONVERSATION}`);
+      // Push the assistant turn before bailing so the audit trail captures it.
+      messages.push({ role: "assistant", content: response.content });
+      return {
+        ok: false,
+        budget_exhausted: true,
+        cost_usd: conversationCostUsd,
+        summary:
+          `This task hit the $${MAX_USD_PER_CONVERSATION.toFixed(2)} per-conversation budget cap (spent $${conversationCostUsd.toFixed(2)}). Reply 'continue' to extend with another budget.`,
+        stop_reason: "budget_exhausted",
+        iterations: iteration,
+        trace,
+      };
     }
 
     messages.push({ role: "assistant", content: response.content });
@@ -3113,7 +3148,7 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
     const textBlocks = response.content.filter((b) => b.type === "text");
     const textChars = textBlocks.reduce((n, b) => n + (b.text?.length || 0), 0);
     const usage = response.usage || {};
-    console.log(`[agent] iter=${iteration} stop=${response.stop_reason} ms=${ms} blocks=[${blockTypes.join(",")}] tools=[${tools_called.join(",")}] text_chars=${textChars} input_tokens=${usage.input_tokens || "?"} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0} output_tokens=${usage.output_tokens || "?"}`);
+    console.log(`[agent] iter=${iteration} stop=${response.stop_reason} ms=${ms} blocks=[${blockTypes.join(",")}] tools=[${tools_called.join(",")}] text_chars=${textChars} cost=$${turnCost.toFixed(4)} run_cost=$${conversationCostUsd.toFixed(4)} input_tokens=${usage.input_tokens || "?"} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0} output_tokens=${usage.output_tokens || "?"}`);
 
     // Anomaly: stop_reason=end_turn with NO text content and NO tool calls is a
     // clear bug — model produced nothing actionable. Log loudly.
@@ -3143,6 +3178,7 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
         clarification_needed: true,
         question: clarification.input.question,
         summary: clarification.input.question,
+        cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
       };
@@ -3159,6 +3195,7 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
         ok: true,
         silent: true,
         summary: `(silent: ${silent.input.reason || "no reason given"})`,
+        cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
       };
@@ -3179,24 +3216,60 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
         let result;
         const impl = toolImpls[block.name];
         const via = n8nTools.has(block.name) ? "n8n" : "js";
-        if (!impl) {
-          result = { error: `Tool not implemented: ${block.name}` };
-        } else {
+        // === Action ledger ===
+        // For destructive external actions (ClickUp tasks, Gmail drafts,
+        // Slack DMs, calendar invites), check the per-thread seen-actions
+        // ledger first. If we've already done this exact call in this thread
+        // recently, skip the side effect and return the cached result. Stops
+        // a resumed run from double-creating tasks/drafts/invites — same
+        // pattern as create_person's lookup-by-email dedup, generalised.
+        let ledgerSig = null;
+        const isLedgered = threadTs && THREAD_STATE.tableId && DESTRUCTIVE_EXTERNAL_TOOLS.has(block.name);
+        if (isLedgered) {
           try {
-            // n8n-backed tools are registered as `impl(input)` rather than
-            // method-on-this; the dispatch handles both: this binding for JS
-            // tools that need cross-tool calls; plain input arg for n8n proxies.
-            if (via === "n8n") {
-              // Pass slack_context separately so the workflow can use it.
-              result = await callN8nWebhook(block.name, block.input, slack_context);
-            } else {
-              // Spread so tool impls keep working via `this.<other_tool>`. The
-              // running trace is exposed too in case a tool wants to enforce a
-              // call-order invariant (no current users; kept for future-proofing).
-              result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
+            ledgerSig = await actionSignature(block.name, block.input);
+            const seen = await findSeenAction(threadTs, ledgerSig);
+            if (seen) {
+              result = {
+                ...seen.result,
+                already_done: true,
+                note: `This exact action was already completed in this thread on ${seen.ts}; returning the previous result rather than re-running it.`,
+              };
             }
           } catch (e) {
-            result = { error: e.message };
+            console.warn(`[action-ledger] lookup failed for ${block.name}: ${e.message} — proceeding without dedup`);
+          }
+        }
+        if (!result) {
+          if (!impl) {
+            result = { error: `Tool not implemented: ${block.name}` };
+          } else {
+            try {
+              // n8n-backed tools are registered as `impl(input)` rather than
+              // method-on-this; the dispatch handles both: this binding for JS
+              // tools that need cross-tool calls; plain input arg for n8n proxies.
+              if (via === "n8n") {
+                // Pass slack_context separately so the workflow can use it.
+                result = await callN8nWebhook(block.name, block.input, slack_context);
+              } else {
+                // Spread so tool impls keep working via `this.<other_tool>`. The
+                // running trace is exposed too in case a tool wants to enforce a
+                // call-order invariant (no current users; kept for future-proofing).
+                result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
+              }
+            } catch (e) {
+              result = { error: e.message };
+            }
+          }
+          // Record successful destructive actions in the ledger. Ignore errors
+          // and confirmation-required intermediate states — only commit a
+          // signature once the action actually happened.
+          if (isLedgered && ledgerSig && !result?.error && result?.status !== "confirmation_required") {
+            try {
+              await recordSeenAction(threadTs, ledgerSig, block.name, result);
+            } catch (e) {
+              console.warn(`[action-ledger] record failed for ${block.name}: ${e.message}`);
+            }
           }
         }
         trace.push({ tool: block.name, input: block.input, result, via });
@@ -3215,6 +3288,7 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
       return {
         ok: true,
         summary: textBlock?.text || "Done.",
+        cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
       };
@@ -3227,12 +3301,19 @@ async function runAgent(transcript, slack_context = null, attachments = []) {
       ok: false,
       summary: textBlock?.text || `Stopped: ${response.stop_reason}`,
       stop_reason: response.stop_reason,
+      cost_usd: conversationCostUsd,
       iterations: iteration,
       trace,
     };
   }
 
-  return { ok: false, summary: "Max iterations reached.", iterations: iteration, trace };
+  return {
+    ok: false,
+    summary: "Max iterations reached.",
+    cost_usd: conversationCostUsd,
+    iterations: iteration,
+    trace,
+  };
 }
 
 // ---------- Slack helpers ----------
@@ -3625,6 +3706,208 @@ async function ensureAuditSchema() {
 }
 await ensureAuditSchema();
 
+// ---------- Thread state table (in-flight tracking + cost ledger + idempotency) ----------
+//
+// One small NocoDB table that gives /run three things it didn't have before:
+//   - awareness of in-flight work on the same Slack thread (stops "you doing
+//     it?" nags from racing the original run)
+//   - per-conversation cost tracking (soft cap at MAX_USD_PER_CONVERSATION,
+//     resets when the user explicitly continues)
+//   - per-thread idempotency keys for destructive external actions (so a
+//     resumed run after credit-exhaust doesn't double-create ClickUp tasks /
+//     Gmail drafts / calendar invites)
+//
+// The table is auto-created on boot in the same base as the People table, so
+// no manual NocoDB clicking is required. The discovered table_id is cached on
+// THREAD_STATE.tableId for the rest of the process lifetime. If creation
+// fails (read-only token, base permission missing) the helpers below fall
+// back to no-ops, so the agent still works — just without thread-state
+// awareness.
+
+const THREAD_STATE = { tableId: process.env.THREAD_STATE_TABLE_ID || null };
+const THREAD_STATE_TABLE_TITLE = "Compass thread state";
+
+// Tunable budget cap. 50¢ per conversation is comfortable for normal voice
+// notes and a default-shaped CSV import; runaway loops trip the guard before
+// they cost anything material. Bumped per "continue" by the user (the next
+// run on a `budget_exhausted` thread resets cost_usd to 0 before proceeding).
+const MAX_USD_PER_CONVERSATION = parseFloat(process.env.MAX_USD_PER_CONVERSATION || "0.50");
+
+// Pricing table for cost guard. Keep in sync with
+// https://docs.claude.com/en/docs/about-claude/pricing — out of date prices
+// just mean the cap fires at a slightly wrong dollar value, not that anything
+// breaks. Add new models as we adopt them.
+const PRICES_PER_MTOK = {
+  "claude-sonnet-4-7": { in: 3.0, cache_write_5m: 3.75, cache_read: 0.30, out: 15.0 },
+  "claude-sonnet-4-6": { in: 3.0, cache_write_5m: 3.75, cache_read: 0.30, out: 15.0 },
+  "claude-sonnet-4-5": { in: 3.0, cache_write_5m: 3.75, cache_read: 0.30, out: 15.0 },
+  "claude-haiku-4-5":  { in: 1.0, cache_write_5m: 1.25, cache_read: 0.10, out: 5.0 },
+  "claude-opus-4-7":   { in: 5.0, cache_write_5m: 6.25, cache_read: 0.50, out: 25.0 },
+};
+
+function costOf(usage, model) {
+  const p = PRICES_PER_MTOK[model] || PRICES_PER_MTOK["claude-sonnet-4-6"];
+  return (
+    (usage?.input_tokens || 0)                * p.in              / 1e6 +
+    (usage?.cache_creation_input_tokens || 0) * p.cache_write_5m  / 1e6 +
+    (usage?.cache_read_input_tokens || 0)     * p.cache_read      / 1e6 +
+    (usage?.output_tokens || 0)               * p.out              / 1e6
+  );
+}
+
+async function ensureThreadStateTable() {
+  // If pinned via env, skip discovery — operator has set it explicitly.
+  if (THREAD_STATE.tableId) {
+    console.log(`[migrate] thread state table pinned via env: ${THREAD_STATE.tableId}`);
+    return;
+  }
+  if (!PEOPLE_TABLE_ID) {
+    console.warn("[migrate] PEOPLE_TABLE_ID not set — cannot discover base for thread state table");
+    return;
+  }
+  try {
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+    if (!baseId) {
+      console.warn("[migrate] could not resolve base_id from People table — skipping thread state setup");
+      return;
+    }
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+    const existing = tables.find((t) => t.title === THREAD_STATE_TABLE_TITLE);
+    if (existing) {
+      THREAD_STATE.tableId = existing.id;
+      console.log(`[migrate] thread state table found: ${existing.id}`);
+      return;
+    }
+    console.log(`[migrate] creating ${THREAD_STATE_TABLE_TITLE} table…`);
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: THREAD_STATE_TABLE_TITLE,
+      title: THREAD_STATE_TABLE_TITLE,
+      columns: [
+        { column_name: "thread_ts", title: "thread_ts", uidt: "SingleLineText" },
+        { column_name: "status", title: "status", uidt: "SingleLineText" },
+        { column_name: "last_started", title: "last_started", uidt: "DateTime" },
+        { column_name: "last_completed", title: "last_completed", uidt: "DateTime" },
+        { column_name: "seen_actions", title: "seen_actions", uidt: "LongText" },
+        { column_name: "cost_usd", title: "cost_usd", uidt: "Decimal" },
+        { column_name: "last_summary", title: "last_summary", uidt: "LongText" },
+      ],
+    });
+    THREAD_STATE.tableId = created?.id;
+    console.log(`[migrate] thread state table created: ${THREAD_STATE.tableId}`);
+  } catch (e) {
+    console.error(`[migrate] ensureThreadStateTable failed (continuing without thread state): ${e.message}`);
+  }
+}
+await ensureThreadStateTable();
+
+// === Thread state CRUD helpers ===
+// All silently no-op if THREAD_STATE.tableId is null (auto-create failed or
+// not yet pinned). The agent runs as it did before, just without the
+// in-flight awareness / cost guard / action ledger features.
+
+async function getThreadState(threadTs) {
+  if (!THREAD_STATE.tableId || !threadTs) return null;
+  try {
+    const where = `(thread_ts,eq,${threadTs})`;
+    const data = await ncGet(
+      `/api/v2/tables/${THREAD_STATE.tableId}/records?where=${encodeURIComponent(where)}&limit=1`
+    );
+    return data?.list?.[0] || null;
+  } catch (e) {
+    console.error(`[thread-state] getThreadState(${threadTs}) failed:`, e.message);
+    return null;
+  }
+}
+
+async function upsertThreadState(threadTs, fields) {
+  if (!THREAD_STATE.tableId || !threadTs) return null;
+  try {
+    const existing = await getThreadState(threadTs);
+    if (existing) {
+      await ncPatch(`/api/v2/tables/${THREAD_STATE.tableId}/records`, [
+        { Id: existing.Id, ...fields },
+      ]);
+      return { ...existing, ...fields };
+    }
+    const created = await ncPost(`/api/v2/tables/${THREAD_STATE.tableId}/records`, [
+      { thread_ts: threadTs, ...fields },
+    ]);
+    return Array.isArray(created) ? created[0] : created;
+  } catch (e) {
+    console.error(`[thread-state] upsertThreadState(${threadTs}) failed:`, e.message);
+    return null;
+  }
+}
+
+// Stable canonical-JSON for hashing — sort keys, drop undefineds. Two calls
+// with the same logical args hash the same regardless of property order.
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return "[" + obj.map(canonicalJson).join(",") + "]";
+  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJson(obj[k])).join(",") + "}";
+}
+
+async function sha256(s) {
+  // Use Web Crypto via the Node global (Node 20+).
+  const buf = new TextEncoder().encode(s);
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function actionSignature(toolName, args) {
+  return sha256(toolName + ":" + canonicalJson(args));
+}
+
+async function findSeenAction(threadTs, sig) {
+  const state = await getThreadState(threadTs);
+  if (!state) return null;
+  let arr;
+  try {
+    arr = JSON.parse(state.seen_actions || "[]");
+  } catch {
+    arr = [];
+  }
+  return arr.find((a) => a.sig === sig) || null;
+}
+
+async function recordSeenAction(threadTs, sig, toolName, result) {
+  const state = await getThreadState(threadTs);
+  let arr;
+  try {
+    arr = JSON.parse(state?.seen_actions || "[]");
+  } catch {
+    arr = [];
+  }
+  // Cap at 100 entries — older falls off. A thread doing more than 100
+  // distinct destructive actions is something we want to notice anyway.
+  arr.push({ sig, tool: toolName, result, ts: new Date().toISOString() });
+  if (arr.length > 100) arr = arr.slice(-100);
+  await upsertThreadState(threadTs, { seen_actions: JSON.stringify(arr) });
+}
+
+// Tools whose calls have external side effects with no built-in idempotency.
+// create_person already has its own lookup-by-email dedup; toggle_stage and
+// add_note are reversible and rapid-fire is fine. These four are the ones
+// that genuinely need replay protection if a run resumes after partial work.
+const DESTRUCTIVE_EXTERNAL_TOOLS = new Set([
+  "create_clickup_task",
+  "draft_email",
+  "draft_welcome_email",
+  "send_slack_dm",
+  "create_calendar_event",
+]);
+
+class BudgetExhausted extends Error {
+  constructor(spent) {
+    super(`per-conversation budget cap of $${MAX_USD_PER_CONVERSATION} exceeded ($${spent.toFixed(4)} spent)`);
+    this.spent = spent;
+    this.name = "BudgetExhausted";
+  }
+}
+
 function renderTemplate(name, vars) {
   let html = EMAIL_TEMPLATES[name];
   if (!html) throw new Error(`Unknown template: ${name}`);
@@ -3820,7 +4103,10 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs }) 
       Transcript: transcript,
       "Agent response": result.summary || "",
       "Tools used": JSON.stringify(toolsUsed),
-      "Trace detail": JSON.stringify(traceWithInputs).slice(0, 8000),
+      // 32KB cap — bumped from 8KB to comfortably hold a 25-row CSV import
+      // trace (each tool call is ~250-400 bytes after PII redaction). NocoDB
+      // LongText handles this without issue.
+      "Trace detail": JSON.stringify(traceWithInputs).slice(0, 32000),
       Iterations: result.iterations || 0,
       "Elapsed ms": elapsedMs,
       Success: !!result.ok,
@@ -3882,6 +4168,70 @@ app.post("/run", async (req, res) => {
 
   console.log(`[agent] transcript: ${redactPII(transcript).slice(0, 200)}`);
   const t0 = Date.now();
+
+  // === Thread guard ===
+  // Looks at the existing state of this Slack thread (if any) and decides
+  // whether to proceed normally, react-and-stay-silent (the "you doing it?"
+  // race), or take over a stale in-flight run. Resets cost/state on resume
+  // from a budget_exhausted or credit_paused thread so the user's "continue"
+  // gets a fresh per-conversation budget.
+  //
+  // Returns one of:
+  //   { proceed: true, resetCost: bool }
+  //   { proceed: false, react: ":eyes:" }   ← skip this run, react instead
+  //
+  // Silently passes through (proceed: true) if THREAD_STATE.tableId is null
+  // — graceful degradation if the table didn't auto-create.
+  const threadTs = slack_context?.thread_ts || slack_context?.ts || null;
+  let resumeFromPause = false;
+  if (threadTs && THREAD_STATE.tableId) {
+    const state = await getThreadState(threadTs);
+    const now = Date.now();
+    if (state) {
+      const status = state.status;
+      const lastStartedMs = state.last_started ? new Date(state.last_started).getTime() : 0;
+      const ageSec = (now - lastStartedMs) / 1000;
+      if (status === "in_flight" && ageSec < 60) {
+        // Active run is still working. Don't race it — react and bail.
+        console.log(`[thread-guard] thread ${threadTs} in-flight ${ageSec.toFixed(0)}s ago — skipping nag`);
+        if (slack_context?.channel) {
+          try {
+            await fetch("https://slack.com/api/reactions.add", {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+              },
+              body: JSON.stringify({
+                channel: slack_context.channel,
+                timestamp: slack_context.ts || threadTs,
+                name: "eyes",
+              }),
+            });
+          } catch (e) {
+            console.warn(`[thread-guard] reaction failed: ${e.message}`);
+          }
+        }
+        return res.json({ ok: true, silent: true, reason: "in_flight_nag", elapsedMs: Date.now() - t0 });
+      }
+      if (status === "in_flight" && ageSec >= 60) {
+        // Previous run died (Render restart, crash, timeout). Take over.
+        console.warn(`[thread-guard] thread ${threadTs} stale in_flight (${ageSec.toFixed(0)}s) — taking over`);
+      }
+      if (status === "budget_exhausted" || status === "credit_paused") {
+        // User has replied after a paused run — treat this as a "continue".
+        // Reset cost; the new run gets a fresh per-conversation budget.
+        console.log(`[thread-guard] thread ${threadTs} resuming from ${status}`);
+        resumeFromPause = true;
+      }
+    }
+    await upsertThreadState(threadTs, {
+      status: "in_flight",
+      last_started: new Date().toISOString(),
+      ...(resumeFromPause ? { cost_usd: 0 } : {}),
+    });
+  }
+
   let enrichedTranscript = transcript;
   if (slack_context?.channel) {
     try {
@@ -3929,13 +4279,29 @@ app.post("/run", async (req, res) => {
 
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context, validAttachments);
+    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
   }
   const elapsedMs = Date.now() - t0;
   console.log(`[agent] done in ${elapsedMs}ms, ok=${result.ok}, iterations=${result.iterations}`);
+
+  // Update thread state with the run outcome. Idempotent / fire-and-forget —
+  // if the table doesn't exist or the write fails, the agent still works.
+  if (threadTs && THREAD_STATE.tableId) {
+    const finalStatus = result.budget_exhausted
+      ? "budget_exhausted"
+      : result.credit_exhausted
+        ? "credit_paused"
+        : "done";
+    upsertThreadState(threadTs, {
+      status: finalStatus,
+      last_completed: new Date().toISOString(),
+      cost_usd: result.cost_usd ?? null,
+      last_summary: (result.summary || "").slice(0, 500),
+    }).catch((e) => console.error(`[thread-state] post-run update failed: ${e.message}`));
+  }
 
   // Audit log — fire-and-forget, don't block the response on it
   logAgentAction({ transcript, slack_context, result, elapsedMs });
@@ -3948,7 +4314,9 @@ app.post("/run", async (req, res) => {
         ? ":thinking_face:"
         : result.credit_exhausted
           ? ":credit_card:"
-          : ":warning:";
+          : result.budget_exhausted
+            ? ":coin:"
+            : ":warning:";
     const summary = result.summary || "Done.";
     const trailer = result.trace?.length
       ? `\n_${result.trace.length} action${result.trace.length === 1 ? "" : "s"} · ${elapsedMs}ms_`
