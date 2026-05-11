@@ -1,9 +1,27 @@
 # n8n attachment handoff to Compass
 
-The agent now expects Slack file uploads to be uploaded to Anthropic's Files API on
+The agent expects Slack file uploads to be uploaded to Anthropic's Files API on
 the n8n side, with the resulting `file_id`s included in the `/run` payload. This
 removes the "I can't see the attached file" failure mode entirely (see the May 2026
 post-mortem) and makes CSV / image / PDF handling a first-class capability.
+
+## Status (May 11 2026)
+
+**Live for the `app_mention` path** — when @Compass is tagged in a message that
+has a file attached, the file is uploaded and Compass sees it natively. Same
+applies to the `name_match` path (any channel message containing "compass" by
+name). Implemented as 6 new nodes inside the `Slack Events Receiver` workflow
+(id `hD7s6CbL00sJ17s6`):
+
+  Has files? (mention) → Split files → Download from Slack →
+    Upload to Anthropic → Format attachment → Aggregate attachments → Mention → agent
+
+DM and thread-reply paths still don't handle attachments. Add when needed by
+copying the same six-node pattern into those branches.
+
+A backup of the pre-change workflow exists at id
+`W0GqqCARYfvUUMHk` (name: `Slack Events Receiver (backup pre-files-api 2026-05-11)`,
+inactive). Delete once everything is confirmed working.
 
 ## Payload contract
 
