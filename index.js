@@ -417,6 +417,16 @@ async function refreshN8nTools() {
   }
   n8nTools.clear();
   for (const t of discovered) {
+    // n8n version wins over any same-named built-in or stale entry. Matches
+    // the dispatch path (via === "n8n" overrides JS impl). Without this,
+    // collisions in `tools` cause Anthropic to reject with "Tool names must
+    // be unique." Note: removing a shadowed workflow at /reload doesn't
+    // restore the JS built-in — restart the service for that.
+    const existingIdx = tools.findIndex((x) => x.name === t.name);
+    if (existingIdx !== -1) {
+      tools.splice(existingIdx, 1);
+      console.log(`[n8n] '${t.name}' shadows existing tool of the same name.`);
+    }
     n8nTools.set(t.name, { description: t.description, workflow_id: t.workflow_id, workflow_name: t.workflow_name });
     // Tell Claude about the tool. Schema is intentionally permissive —
     // descriptions guide Claude on shape, not JSON Schema validation.
