@@ -25,6 +25,11 @@ const {
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
   PORT = 10000,
+  RUN_SHARED_SECRET,
+  ALLOW_TOOL_PROPOSALS,
+  N8N_BASE_URL,
+  N8N_API_KEY,
+  N8N_AUTH_TOKEN,
 } = process.env;
 
 const requiredEnv = {
@@ -37,6 +42,7 @@ const requiredEnv = {
   COHORTS_LINK_COLUMN_ID,
   TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   SLACK_BOT_TOKEN,
+  RUN_SHARED_SECRET,
 };
 for (const [k, v] of Object.entries(requiredEnv)) {
   if (!v) {
@@ -140,6 +146,18 @@ const VALID_SOURCES = ["Direct", "Referral", "Workshop", "Website", "Social", "O
 
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Redact PII before writing transcripts to logs. Render's logs are searchable
+// and may be retained for weeks; we don't want emails, phone numbers, or full
+// auth tokens floating around in there. The redaction is deliberately coarse —
+// the goal is "scrubbed enough for ops debugging," not forensic privacy.
+function redactPII(s) {
+  if (typeof s !== "string") return s;
+  return s
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, "[email]")
+    .replace(/(?:\+?\d[\d\s().-]{7,}\d)/g, "[phone]")
+    .replace(/\b(?:[A-Za-z0-9_-]{20,})\b/g, (m) => (m.length >= 32 ? "[token]" : m));
 }
 
 // ---------- ClickUp list discovery (lazy, cached) ----------
@@ -268,6 +286,159 @@ function pendingConfirmation(action_summary, replay_args) {
       "On their explicit go-ahead (e.g. 'yes', 'go ahead', thumbsup react), call this same tool again " +
       "with the args from replay_args (which already includes confirmed: true).",
   };
+}
+
+// ---------- n8n tool discovery ----------
+//
+// Compass's writable tools live in n8n as workflows tagged `compass`. At boot
+// (and on POST /reload), the agent asks n8n's API for that list, then registers
+// each workflow as a Claude tool whose impl is "POST to the webhook." Adding a
+// tool is a workflow create+activate+tag in n8n; no agent code change needed.
+//
+// Convention per workflow:
+//   • Workflow name: `compass:<tool_name>` (e.g. `compass:log_touchpoint`).
+//   • Tagged `compass`.
+//   • Active.
+//   • First node is a Webhook with path = <tool_name> and Header Auth using
+//     the `compass-webhook-auth` credential.
+//   • Workflow.description (Settings → Description in the n8n GUI) doubles as
+//     the tool description shown to Claude. Write it like a tool description:
+//     when to use, when not to use, expected input shape.
+//   • Final node is "Respond to Webhook" returning JSON.
+//
+// Input schema: workflows accept any JSON object. Claude reads the description
+// to figure out the right shape; we don't enforce JSON Schema. Less safety,
+// more flexibility — matches the "agent intelligence over rigid framework" goal.
+
+async function discoverN8nTools() {
+  if (!N8N_BASE_URL || !N8N_API_KEY) {
+    console.log("[n8n] N8N_BASE_URL or N8N_API_KEY not set — skipping discovery.");
+    return [];
+  }
+  const apiBase = N8N_BASE_URL.replace(/\/webhook\/?$/, "").replace(/\/$/, "");
+  const listUrl = `${apiBase}/api/v1/workflows?tags=compass&active=true`;
+  const headers = { "X-N8N-API-KEY": N8N_API_KEY };
+  try {
+    const listRes = await fetch(listUrl, { headers });
+    if (!listRes.ok) {
+      console.error(`[n8n] discovery list failed: HTTP ${listRes.status}`);
+      return [];
+    }
+    const listJson = await listRes.json();
+    const summaries = listJson.data || [];
+    // n8n's list endpoint strips the description field, so fetch each
+    // workflow individually to pick it up. Parallel — cheap for ~10 tools.
+    const fulls = await Promise.all(
+      summaries.map((s) =>
+        fetch(`${apiBase}/api/v1/workflows/${s.id}`, { headers })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null)
+      )
+    );
+    const tools = [];
+    for (const wf of fulls) {
+      if (!wf) continue;
+      const webhookNode = (wf.nodes || []).find((n) => n.type === "n8n-nodes-base.webhook");
+      const respondNode = (wf.nodes || []).find((n) => n.type === "n8n-nodes-base.respondToWebhook");
+      const path = webhookNode?.parameters?.path;
+      if (!path) {
+        console.error(`[n8n] workflow ${wf.name} has no webhook path — skipping`);
+        continue;
+      }
+      if (!respondNode) {
+        console.error(`[n8n] workflow ${wf.name} has no Respond to Webhook node — skipping`);
+        continue;
+      }
+      if (!wf.description) {
+        console.error(`[n8n] workflow ${wf.name} has no description — Claude won't know when to use it. Set one in n8n → Settings → Description.`);
+      }
+      tools.push({
+        name: path,
+        description: wf.description || wf.name,
+        workflow_id: wf.id,
+        workflow_name: wf.name,
+      });
+    }
+    return tools;
+  } catch (e) {
+    console.error(`[n8n] discovery error: ${e.message}`);
+    return [];
+  }
+}
+
+async function callN8nWebhook(toolName, input, slack_context) {
+  const base = N8N_BASE_URL.replace(/\/$/, "");
+  const url = base.endsWith("/webhook") ? `${base}/${toolName}` : `${base}/webhook/${toolName}`;
+  const headers = { "content-type": "application/json" };
+  if (N8N_AUTH_TOKEN) headers["X-Webhook-Token"] = N8N_AUTH_TOKEN;
+  const body = JSON.stringify({
+    tool: toolName,
+    input,
+    slack_context: slack_context || null,
+    request_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  });
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 30_000);
+  try {
+    const res = await fetch(url, { method: "POST", headers, body, signal: ctrl.signal });
+    const text = await res.text();
+    if (!res.ok) {
+      return { error: `n8n ${toolName} → HTTP ${res.status}: ${text.slice(0, 500)}` };
+    }
+    if (!text) return { ok: true };
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { ok: true, text };
+    }
+  } catch (e) {
+    return { error: `n8n ${toolName} call failed: ${e.message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Discovered n8n tools — keyed by tool name. Populated at startup and refreshed
+// on POST /reload. Each entry is { description, workflow_id, workflow_name }.
+const n8nTools = new Map();
+
+// Mutable so /reload can rebuild it. Holds the final tool definitions sent to
+// Claude (built-in JS tools + discovered n8n tools).
+let claudeToolDefs = null;
+
+async function refreshN8nTools() {
+  const discovered = await discoverN8nTools();
+  // Sweep previously-registered n8n tools out of `tools` and `toolImpls` so
+  // /reload reflects deletions/renames in n8n, not just additions.
+  for (const name of n8nTools.keys()) {
+    const idx = tools.findIndex((t) => t.name === name);
+    if (idx !== -1) tools.splice(idx, 1);
+    delete toolImpls[name];
+  }
+  n8nTools.clear();
+  for (const t of discovered) {
+    n8nTools.set(t.name, { description: t.description, workflow_id: t.workflow_id, workflow_name: t.workflow_name });
+    // Tell Claude about the tool. Schema is intentionally permissive —
+    // descriptions guide Claude on shape, not JSON Schema validation.
+    tools.push({
+      name: t.name,
+      description: t.description,
+      defer_loading: true,
+      input_schema: { type: "object", additionalProperties: true },
+    });
+    // Dispatch is handled specially in the agent loop (see `via === "n8n"`)
+    // so this registration is just to make the dispatcher's "is impl present"
+    // check pass. The actual webhook call happens in the loop.
+    toolImpls[t.name] = async function () {
+      return { error: "n8n tool dispatched through loop's webhook path; this stub should never run." };
+    };
+  }
+  if (discovered.length > 0) {
+    console.log(`[n8n] discovered ${discovered.length} tool${discovered.length === 1 ? "" : "s"}: ${discovered.map((t) => t.name).join(", ")}`);
+  } else {
+    console.log("[n8n] no compass-tagged active workflows found.");
+  }
+  return discovered;
 }
 
 // ---------- Tool implementations ----------
@@ -1763,6 +1934,13 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   // first call returns a preview showing the FULL code; the human must explicitly
   // approve before the file is written and registered.
   async propose_new_tool({ name, description, input_schema, implementation_code, confirmed = false }) {
+    // RCE surface: this tool hot-loads agent-authored JS into the running
+    // process. Even with confirmation gating, a prompt-injected transcript
+    // could socially engineer a malicious approval flow. Default to disabled
+    // and require an explicit env opt-in.
+    if (ALLOW_TOOL_PROPOSALS !== "1" && ALLOW_TOOL_PROPOSALS !== "true") {
+      return { error: "Tool proposals are disabled on this deployment. An operator must set ALLOW_TOOL_PROPOSALS=1 in env to enable self-extension." };
+    }
     if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
       return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
     }
@@ -1858,6 +2036,9 @@ ${location ? `<p>Location: ${location}</p>` : ""}
   // from the live registry AND the file is deleted, so it doesn't reappear on
   // restart.
   async delete_generated_tool({ name, confirmed = false }) {
+    if (ALLOW_TOOL_PROPOSALS !== "1" && ALLOW_TOOL_PROPOSALS !== "true") {
+      return { error: "Tool revocation is disabled on this deployment (ALLOW_TOOL_PROPOSALS not enabled)." };
+    }
     if (!name || !/^[a-z][a-z0-9_]*$/.test(name)) {
       return { error: "name must be lowercase letters/digits/underscores starting with a letter" };
     }
@@ -2192,12 +2373,15 @@ const tools = [
   {
     name: "toggle_stage",
     description:
-      "Set an onboarding stage checkbox for a person. The 8 stages don't all happen linearly — most are independent, so changing one stage usually doesn't affect others. " +
+      "Set an onboarding stage checkbox for a person. The 10 stages don't all happen linearly — most are independent, so changing one stage usually doesn't affect others. " +
       "NARROW CASCADE: only TRUE logical dependencies are cascaded automatically: " +
-      "  • agreement_signed=true → also marks agreement_sent=true (can't sign what wasn't sent) " +
-      "  • payment_plan=true → also marks xero_invoice=true (payment plan needs invoice first) " +
-      "  • inverses (agreement_sent=false → unmarks agreement_signed; xero_invoice=false → unmarks payment_plan) " +
-      "All other stages are independent — marking xero_invoice does NOT mark onboarding_call_done. The tool returns 'cascaded_stages' showing what (if anything) was also affected.",
+      "  • welcome_email_sent=true → also marks deposit_paid=true (welcome email is sent right after deposit on the call) " +
+      "  • form_submitted=true → also marks welcome_email_sent=true (form link lives inside the welcome email) " +
+      "  • contract_signed=true → also marks contract_sent=true (can't sign what wasn't sent) " +
+      "  • calendar_invites_accepted=true → also marks calendar_invites_sent=true " +
+      "  • paid_in_full=true → also marks deposit_paid=true " +
+      "  • inverses (e.g. deposit_paid=false → unmarks welcome_email_sent and everything that depends on it) " +
+      "All other stages are independent — marking calendar_invites_sent does NOT mark onboarding_call_done. The tool returns 'cascaded_stages' showing what (if anything) was also affected.",
     input_schema: {
       type: "object",
       properties: {
@@ -2805,7 +2989,7 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
-async function runAgent(transcript) {
+async function runAgent(transcript, slack_context = null) {
   const messages = [{ role: "user", content: transcript }];
   const trace = [];
   let iteration = 0;
@@ -2869,10 +3053,16 @@ async function runAgent(transcript) {
     }
     // Anomaly: stop_reason=end_turn but tool_use blocks were present — model
     // intended to call tools but the API set end_turn instead of tool_use. We
-    // currently ignore tool_use on end_turn; surface this so we can decide
-    // whether to handle it (e.g. process the calls anyway).
+    // process the calls anyway (the dispatch block below ignores stop_reason
+    // and runs whatever tool_use blocks are in the response). Logged so we can
+    // see how often this happens.
     if (response.stop_reason === "end_turn" && tools_called.length > 0) {
-      console.error(`[agent] WARN iter=${iteration} end_turn with tool_use blocks ignored: [${tools_called.join(",")}]`);
+      console.error(`[agent] WARN iter=${iteration} end_turn with tool_use blocks — processing anyway: [${tools_called.join(",")}]`);
+    }
+    // Same for max_tokens — if the cutoff happened to land mid-response, we
+    // still execute any tool_use blocks the model produced before truncation.
+    if (response.stop_reason === "max_tokens" && tools_called.length > 0) {
+      console.error(`[agent] WARN iter=${iteration} max_tokens with tool_use blocks — processing anyway: [${tools_called.join(",")}]`);
     }
 
     // Check for ask_for_clarification — terminate loop early
@@ -2905,36 +3095,43 @@ async function runAgent(transcript) {
       };
     }
 
-    if (response.stop_reason === "end_turn") {
-      const textBlock = response.content.find((b) => b.type === "text");
-      return {
-        ok: true,
-        summary: textBlock?.text || "Done.",
-        iterations: iteration,
-        trace,
-      };
-    }
-
-    if (response.stop_reason === "tool_use") {
+    // Process any tool_use blocks the model produced, regardless of stop_reason.
+    // Anthropic's API normally pairs tool_use content with stop_reason=tool_use,
+    // but we've seen end_turn-with-tools and max_tokens-with-tools in the wild.
+    // Dispatching whenever tool_use blocks are present means we never silently
+    // drop work the model intended to do.
+    const dispatchableToolUses = toolUseBlocks.filter((b) => b.name !== "ask_for_clarification" && b.name !== "stay_silent");
+    if (dispatchableToolUses.length > 0) {
+      // The assistant turn (response.content, including these tool_use blocks)
+      // was already pushed onto `messages` above. We just need to feed back the
+      // matching tool_results.
       const toolResults = [];
-      for (const block of toolUseBlocks) {
-        if (block.name === "ask_for_clarification") continue;
-        const impl = toolImpls[block.name];
+      for (const block of dispatchableToolUses) {
         let result;
+        const impl = toolImpls[block.name];
+        const via = n8nTools.has(block.name) ? "n8n" : "js";
         if (!impl) {
           result = { error: `Tool not implemented: ${block.name}` };
         } else {
           try {
-            // Spread so tool impls keep working via `this.<other_tool>`, but
-            // expose the running trace so tools that need to enforce
-            // call-order invariants (e.g. propose_new_tool requires a prior
-            // tool_search_tool_bm25 call) can introspect it.
-            result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
+            // n8n-backed tools are registered as `impl(input)` rather than
+            // method-on-this; the dispatch handles both: this binding for JS
+            // tools that need cross-tool calls; plain input arg for n8n proxies.
+            if (via === "n8n") {
+              // Pass slack_context separately so the workflow can use it.
+              result = await callN8nWebhook(block.name, block.input, slack_context);
+            } else {
+              // Spread so tool impls keep working via `this.<other_tool>`, but
+              // expose the running trace so tools that need to enforce
+              // call-order invariants (e.g. propose_new_tool requires a prior
+              // tool_search_tool_bm25 call) can introspect it.
+              result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
+            }
           } catch (e) {
             result = { error: e.message };
           }
         }
-        trace.push({ tool: block.name, input: block.input, result });
+        trace.push({ tool: block.name, input: block.input, result, via });
         toolResults.push({
           type: "tool_result",
           tool_use_id: block.id,
@@ -2945,7 +3142,18 @@ async function runAgent(transcript) {
       continue;
     }
 
-    // Other stop reasons (max_tokens, stop_sequence, etc.)
+    if (response.stop_reason === "end_turn") {
+      const textBlock = response.content.find((b) => b.type === "text");
+      return {
+        ok: true,
+        summary: textBlock?.text || "Done.",
+        iterations: iteration,
+        trace,
+      };
+    }
+
+    // Other stop reasons (max_tokens, stop_sequence, etc.) with no tool calls
+    // to dispatch — surface what we have.
     const textBlock = response.content.find((b) => b.type === "text");
     return {
       ok: false,
@@ -3485,13 +3693,33 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs }) 
   }
 }
 
+// Constant-time string compare to avoid timing leaks on the shared secret.
+function timingSafeEq(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
 app.post("/run", async (req, res) => {
+  // Auth gate. RUN_SHARED_SECRET is required in production — n8n sends it as
+  // X-Run-Secret. We also accept Authorization: Bearer <secret> for callers
+  // that prefer the standard header. Boot already aborts if the var is unset
+  // (see requiredEnv), so anything reaching here must present it.
+  const provided =
+    req.get("x-run-secret") ||
+    (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!timingSafeEq(provided, RUN_SHARED_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
   const { transcript, slack_context } = req.body || {};
   if (!transcript || typeof transcript !== "string") {
     return res.status(400).json({ error: "transcript required" });
   }
 
-  console.log(`[agent] transcript: ${transcript.slice(0, 200)}`);
+  console.log(`[agent] transcript: ${redactPII(transcript).slice(0, 200)}`);
   const t0 = Date.now();
   let enrichedTranscript = transcript;
   if (slack_context?.channel) {
@@ -3530,7 +3758,7 @@ app.post("/run", async (req, res) => {
   }
   let result;
   try {
-    result = await runAgent(enrichedTranscript);
+    result = await runAgent(enrichedTranscript, slack_context);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
@@ -3560,6 +3788,24 @@ app.post("/run", async (req, res) => {
   res.json({ ...result, elapsedMs });
 });
 
-app.listen(PORT, () => {
+// Re-run n8n discovery without restarting. Auth-gated by the same shared
+// secret as /run. Useful after creating, editing, or deleting a compass
+// workflow in the n8n GUI — Claude picks up changes on the next /run call.
+app.post("/reload", async (req, res) => {
+  const provided = req.get("x-run-secret") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!timingSafeEq(provided, RUN_SHARED_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const discovered = await refreshN8nTools();
+  res.json({ ok: true, n8n_tools: discovered.map((t) => t.name) });
+});
+
+app.listen(PORT, async () => {
   console.log(`Compass agent listening on :${PORT}`);
+  if (ALLOW_TOOL_PROPOSALS === "1" || ALLOW_TOOL_PROPOSALS === "true") {
+    console.log(`[propose_new_tool] ENABLED — agent can mint new JS tools at runtime.`);
+  }
+  // Fire-and-forget — the loop will see discovered tools on its next call.
+  // If discovery fails, only n8n tools are missing; JS tools work regardless.
+  await refreshN8nTools();
 });

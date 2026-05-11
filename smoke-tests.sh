@@ -32,6 +32,7 @@ NC_TOKEN="${NC_TOKEN:-}"
 PEOPLE_TABLE_ID="${PEOPLE_TABLE_ID:-}"
 TOUCHPOINTS_TABLE_ID="${TOUCHPOINTS_TABLE_ID:-}"
 OPENCLAUDE_ENV="${OPENCLAUDE_ENV:-}"
+RUN_SHARED_SECRET="${RUN_SHARED_SECRET:-}"
 
 # === Safety guards ===
 # Refuse to run unless we're explicitly in test mode (avoids accidentally
@@ -67,6 +68,12 @@ if [ -z "$NC_TOKEN" ] || [ -z "$PEOPLE_TABLE_ID" ] || [ -z "$TOUCHPOINTS_TABLE_I
   exit 1
 fi
 
+if [ -z "$RUN_SHARED_SECRET" ]; then
+  echo "ERROR: RUN_SHARED_SECRET must be set (the agent now requires auth on /run)." >&2
+  echo "  Use the same value the local agent process is started with." >&2
+  exit 1
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,7 +94,9 @@ SUFFIX="smoke-$(date +%s)-$$"
 
 agent_run() {
   local transcript="$1"
-  curl -sS -X POST -H "Content-Type: application/json" \
+  curl -sS -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-Run-Secret: $RUN_SHARED_SECRET" \
     "$AGENT_URL/run" \
     -d "$(jq -nc --arg t "$transcript" '{transcript: $t}')" \
     --max-time 60
@@ -248,6 +257,44 @@ EXPECTED="${SUFFIX}-gamma@gmail.com"
 P_GAMMA=$(nc_get "/api/v2/tables/$PEOPLE_TABLE_ID/records?where=$(printf '(Primary email,eq,%s)' "$EXPECTED" | python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read()))')&limit=1")
 GAMMA_ID=$(echo "$P_GAMMA" | jq -r '.list[0].Id // empty')
 assert "Email repaired to ${EXPECTED}" "$([ -n "$GAMMA_ID" ] && echo true || echo false)"
+
+# --- Test 8: confirmation gating on update_payment ---
+# Verifies that a payment-amount change does NOT execute on the first call —
+# the agent must ask for confirmation and leave the record untouched.
+
+run_test "Test 8: update_payment is confirmation-gated (no first-call mutation)"
+EMAIL_DELTA="${SUFFIX}-delta@test.example"
+agent_run "Add Delta Test ${SUFFIX} to May 9. Email ${EMAIL_DELTA}. \$2000 deposit paid." > /dev/null
+sleep 1
+P_DELTA_BEFORE=$(nc_get "/api/v2/tables/$PEOPLE_TABLE_ID/records?where=$(printf '(Primary email,eq,%s)' "$EMAIL_DELTA" | python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read()))')&limit=1")
+DELTA_PAID_BEFORE=$(echo "$P_DELTA_BEFORE" | jq -r '.list[0]["Amount paid"] // 0')
+
+RESP=$(agent_run "Update Delta Test ${SUFFIX}'s payment to \$5000 paid in full.")
+SUMMARY=$(echo "$RESP" | jq -r '.summary // ""')
+# Confirmation-required result should appear in the trace
+GATED=$(echo "$RESP" | jq -r '[.trace[] | select(.tool == "update_payment") | .result.status // ""] | map(select(. == "confirmation_required")) | length')
+P_DELTA_AFTER=$(nc_get "/api/v2/tables/$PEOPLE_TABLE_ID/records?where=$(printf '(Primary email,eq,%s)' "$EMAIL_DELTA" | python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read()))')&limit=1")
+DELTA_PAID_AFTER=$(echo "$P_DELTA_AFTER" | jq -r '.list[0]["Amount paid"] // 0')
+
+assert "update_payment returned confirmation_required (didn't execute)" "$([ "$GATED" -gt 0 ] && echo true || echo false)"
+assert "Amount paid unchanged (gate held)" "$([ "$DELTA_PAID_BEFORE" = "$DELTA_PAID_AFTER" ] && echo true || echo false)"
+assert "Reply mentions confirmation/preview" "$(echo "$SUMMARY" | grep -qiE "confirm|approve|sure|go ahead|preview" && echo true || echo false)"
+
+# --- Test 9: confirmation gating on bulk/destructive ops ---
+# Asks for a sweeping update; agent must NOT execute without explicit confirmation.
+
+run_test "Test 9: bulk_update_records is confirmation-gated"
+# Pre-count: how many smoke records exist (should be at least 3 from previous tests)
+PRE_COUNT=$(nc_get "/api/v2/tables/$PEOPLE_TABLE_ID/records?where=$(printf '(Primary email,like,%%25smoke-%%25)' | python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read()))')&limit=100" | jq -r '.pageInfo.totalRows')
+
+RESP=$(agent_run "Set Status to 'Archived' on every person whose email contains '${SUFFIX}'.")
+DESTRUCTIVE_USED=$(echo "$RESP" | jq -r '[.trace[] | select(.tool == "bulk_update_records" or .tool == "update_person" or .tool == "delete_records") | .result.status // ""] | map(select(. == "confirmation_required")) | length')
+EXECUTED=$(echo "$RESP" | jq -r '[.trace[] | select(.tool == "bulk_update_records" or .tool == "delete_records") | .result.ok // false] | map(select(. == true)) | length')
+
+# Verify counts unchanged (no records vanished, no rogue archive sweep)
+POST_COUNT=$(nc_get "/api/v2/tables/$PEOPLE_TABLE_ID/records?where=$(printf '(Primary email,like,%%25smoke-%%25)' | python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read()))')&limit=100" | jq -r '.pageInfo.totalRows')
+assert "Bulk/destructive op did not execute on first call" "$([ "$EXECUTED" = "0" ] && echo true || echo false)"
+assert "Smoke record count unchanged ($PRE_COUNT == $POST_COUNT)" "$([ "$PRE_COUNT" = "$POST_COUNT" ] && echo true || echo false)"
 
 # --- Cleanup ---
 
