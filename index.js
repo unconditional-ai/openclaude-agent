@@ -3018,7 +3018,24 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
-async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null) {
+async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, placeholderRef = null) {
+  // Live progress: when /run posted a "On it…" placeholder up front, this
+  // function appends a status line for each tool the agent runs and edits the
+  // placeholder in place. /run replaces the placeholder with the final answer
+  // when this function returns. Falls back to no-op if placeholderRef is null
+  // (no placeholder posted, e.g. boot-time test or post failed).
+  const progressLines = [];
+  let lastFlushedCount = 0;
+  async function flushProgress() {
+    if (!placeholderRef || progressLines.length === lastFlushedCount) return;
+    lastFlushedCount = progressLines.length;
+    const text = `_Working on it…_\n\n${progressLines.join("\n")}`;
+    try {
+      await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, text);
+    } catch (e) {
+      console.error(`[progress] update failed: ${e.message}`);
+    }
+  }
   // If files were uploaded to the Files API at the n8n boundary, attach them
   // as content blocks on the first user message so Claude sees them natively.
   // Block-type routing:
@@ -3283,7 +3300,16 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
           tool_use_id: block.id,
           content: JSON.stringify(result),
         });
+        // Live progress: append a status line for this tool call. Marker:
+        //   ✓  succeeded
+        //   •  succeeded but de-duped via the action ledger ("already done")
+        //   ⚠  errored (don't kill the run; agent may recover next turn)
+        const marker = result?.error ? ":warning:" : (result?.already_done || result?.already_existed) ? ":small_blue_diamond:" : ":white_check_mark:";
+        progressLines.push(`${marker} ${humanizeToolName(block.name)}`);
       }
+      // Single chat.update per iteration (batches all of this turn's tool
+      // status lines into one Slack edit, avoids spamming the API).
+      await flushProgress();
       messages.push({ role: "user", content: toolResults });
       continue;
     }
@@ -3352,6 +3378,111 @@ async function postToSlack(channel, text, threadTs = null) {
   // Throw so the call-site try/catch can log it instead of pretending the post succeeded.
   if (!data.ok) throw new Error(`Slack chat.postMessage failed: ${data.error || JSON.stringify(data)}`);
   return data;
+}
+
+// Edit a previously-posted Slack message in place. Used for the live progress
+// pattern: /run posts an "On it…" placeholder, runAgent updates it as work
+// progresses, /run replaces it with the final answer at the end. Same mrkdwn
+// rules as postToSlack.
+async function updateSlackMessage(channel, ts, text) {
+  const res = await fetch("https://slack.com/api/chat.update", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+    body: JSON.stringify({ channel, ts, text: toSlackMrkdwn(text) }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Slack chat.update failed: ${data.error || JSON.stringify(data)}`);
+  return data;
+}
+
+// Delete a previously-posted Slack message. Used when the agent decides to
+// stay_silent after a placeholder was already posted — without this the user
+// sees "On it…" stuck forever. Best-effort; failures logged but not thrown.
+async function deleteSlackMessage(channel, ts) {
+  const res = await fetch("https://slack.com/api/chat.delete", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+    body: JSON.stringify({ channel, ts }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Slack chat.delete failed: ${data.error || JSON.stringify(data)}`);
+  return data;
+}
+
+// Human-readable label for a tool call, used in the live progress message.
+// Curated overrides for the most common tools; fallback to a verb-from-snake-
+// case heuristic. Goal: a non-technical reader (Yohan, Valerie) sees "Created
+// person record" rather than "create_person" in the live status.
+const TOOL_HUMAN_LABELS = {
+  lookup_person: "Looked up person",
+  lookup_cohort: "Looked up cohort",
+  create_person: "Created person record",
+  update_person: "Updated person",
+  toggle_stage: "Updated onboarding stage",
+  add_note: "Added note",
+  link_person_to_cohort: "Linked person to cohort",
+  log_touchpoint: "Logged touchpoint",
+  list_people: "Listed people",
+  list_clickup_tasks: "Listed ClickUp tasks",
+  find_clickup_list: "Found ClickUp list",
+  create_clickup_task: "Created ClickUp task",
+  update_clickup_task: "Updated ClickUp task",
+  delete_clickup_task: "Deleted ClickUp task",
+  update_payment: "Updated payment",
+  draft_email: "Drafted email",
+  draft_welcome_email: "Drafted welcome email",
+  draft_calendar_invite_email: "Drafted calendar invite",
+  create_calendar_event: "Created calendar event",
+  check_calendar_availability: "Checked calendar availability",
+  send_slack_dm: "Sent Slack DM",
+  create_slack_reminder: "Created Slack reminder",
+  list_slack_reminders: "Listed Slack reminders",
+  react_to_message: "Reacted to message",
+  list_recent_actions: "Looked at recent actions",
+  list_jotform_submissions: "Listed JotForm submissions",
+  get_jotform_submission: "Got JotForm submission",
+  find_person_by_phone: "Looked up person by phone",
+  get_person_full: "Got full person record",
+  list_tables: "Listed tables",
+  create_table: "Created table",
+  add_table_column: "Added table column",
+  add_select_options: "Added dropdown options",
+  bulk_create_records: "Bulk-created records",
+  bulk_update_records: "Bulk-updated records",
+  delete_records: "Deleted records",
+  query_table: "Queried table",
+  pin_knowledge: "Pinned knowledge",
+  recall_knowledge: "Recalled knowledge",
+  inspect_self: "Looked at self",
+  inspect_slack_config: "Looked at Slack config",
+  read_google_sheet: "Read Google Sheet",
+  list_skills: "Listed skills",
+  load_skill: "Loaded skill",
+  code_execution: "Ran code",
+  tool_search_tool_bm25: "Searched tools",
+};
+const VERB_MAP = {
+  create: "Created", update: "Updated", delete: "Deleted",
+  lookup: "Looked up", list: "Listed", get: "Got",
+  find: "Found", add: "Added", send: "Sent",
+  draft: "Drafted", check: "Checked", read: "Read",
+  log: "Logged", pin: "Pinned", recall: "Recalled",
+  load: "Loaded", search: "Searched", react: "Reacted",
+  toggle: "Toggled", inspect: "Inspected", bulk: "Bulk",
+  query: "Queried", link: "Linked", run: "Ran",
+};
+function humanizeToolName(name) {
+  if (TOOL_HUMAN_LABELS[name]) return TOOL_HUMAN_LABELS[name];
+  const parts = name.split("_");
+  const verb = VERB_MAP[parts[0]] || (parts[0][0]?.toUpperCase() + parts[0].slice(1));
+  const subject = parts.slice(1).join(" ");
+  return subject ? `${verb} ${subject}` : verb;
 }
 
 // Generic Slack Web API call (GET-style with query string).
@@ -4282,9 +4413,32 @@ app.post("/run", async (req, res) => {
     enrichedTranscript += `\n\n## Attached files (already uploaded to Files API and visible to you)\n${manifest}\n\nFor CSV / JSON / text content, you can reference these directly in code_execution by file_id (they land in /mnt/user-data/uploads/). For PDFs and images, the model can read them natively from the attached content blocks.`;
   }
 
+  // === Live progress placeholder ===
+  // Post an "On it…" message immediately so the user sees something in the
+  // 1-30 seconds before the first tool call lands. runAgent updates this
+  // message in place after each iteration with one line per tool. This block
+  // replaces it with the final answer (or deletes it if the agent decides to
+  // stay_silent). If posting fails (Slack down, channel-not-in, etc.) the
+  // run still proceeds and falls back to a regular postMessage at the end.
+  let placeholderRef = null;
+  if (slack_context?.channel) {
+    try {
+      const placeholder = await postToSlack(
+        slack_context.channel,
+        "_On it…_",
+        slack_context.thread_ts
+      );
+      if (placeholder?.ts) {
+        placeholderRef = { channel: slack_context.channel, ts: placeholder.ts };
+      }
+    } catch (e) {
+      console.warn(`[progress] placeholder post failed (will fall back to final post): ${e.message}`);
+    }
+  }
+
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs);
+    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs, placeholderRef);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
@@ -4311,28 +4465,57 @@ app.post("/run", async (req, res) => {
   // Audit log — fire-and-forget, don't block the response on it
   logAgentAction({ transcript, slack_context, result, elapsedMs });
 
-  // Reply to Slack if context provided AND the agent didn't explicitly choose silence.
-  if (slack_context?.channel && !result.silent) {
-    const prefix = result.ok
-      ? ":white_check_mark:"
-      : result.clarification_needed
-        ? ":thinking_face:"
-        : result.credit_exhausted
-          ? ":credit_card:"
-          : result.budget_exhausted
-            ? ":coin:"
-            : ":warning:";
-    const summary = result.summary || "Done.";
-    const trailer = result.trace?.length
-      ? `\n_${result.trace.length} action${result.trace.length === 1 ? "" : "s"} · ${elapsedMs}ms_`
-      : "";
-    try {
-      await postToSlack(slack_context.channel, `${prefix} ${summary}${trailer}`, slack_context.thread_ts);
-    } catch (e) {
-      console.error(`[slack] post failed:`, e);
+  // Reply to Slack — either by editing the live-progress placeholder in place
+  // (the common path) or by posting fresh (placeholder post failed earlier).
+  // If the agent chose stay_silent, delete the placeholder so the user doesn't
+  // see "On it…" stuck forever.
+  if (slack_context?.channel) {
+    if (result.silent) {
+      console.log(`[agent] stayed silent: ${result.summary}`);
+      if (placeholderRef) {
+        try {
+          await deleteSlackMessage(placeholderRef.channel, placeholderRef.ts);
+        } catch (e) {
+          console.error(`[slack] placeholder delete failed:`, e.message);
+        }
+      }
+    } else {
+      const prefix = result.ok
+        ? ":white_check_mark:"
+        : result.clarification_needed
+          ? ":thinking_face:"
+          : result.credit_exhausted
+            ? ":credit_card:"
+            : result.budget_exhausted
+              ? ":coin:"
+              : ":warning:";
+      const summary = result.summary || "Done.";
+      const trailer = result.trace?.length
+        ? `\n_${result.trace.length} action${result.trace.length === 1 ? "" : "s"} · ${elapsedMs}ms_`
+        : "";
+      const finalText = `${prefix} ${summary}${trailer}`;
+      if (placeholderRef) {
+        try {
+          await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, finalText);
+        } catch (e) {
+          // Edit failed (maybe the message was deleted by a moderator or
+          // Slack returned an error). Fall back to posting fresh so the user
+          // still gets an answer.
+          console.error(`[slack] placeholder update failed (falling back to new post):`, e.message);
+          try {
+            await postToSlack(slack_context.channel, finalText, slack_context.thread_ts);
+          } catch (e2) {
+            console.error(`[slack] fallback post also failed:`, e2.message);
+          }
+        }
+      } else {
+        try {
+          await postToSlack(slack_context.channel, finalText, slack_context.thread_ts);
+        } catch (e) {
+          console.error(`[slack] post failed:`, e.message);
+        }
+      }
     }
-  } else if (result.silent) {
-    console.log(`[agent] stayed silent: ${result.summary}`);
   }
 
   res.json({ ...result, elapsedMs });
