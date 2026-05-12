@@ -4636,9 +4636,36 @@ function toSlackMrkdwn(text) {
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
 }
 
-async function postToSlack(channel, text, threadTs = null) {
+// Build a Block Kit array from a text body + optional confirmation ref_id.
+// When a ref_id is supplied, render Approve / Cancel buttons whose `value`
+// embeds the ref_id — the /slack-interaction handler reads it back to find
+// the matching pending-action row in NocoDB. Without ref_id, returns null
+// (caller falls back to the plain text-only path). The text always survives
+// as the section above the buttons so non-interactive clients still see it.
+function buildConfirmationBlocks(text, refId) {
+  if (!refId) return null;
+  return [
+    { type: "section", text: { type: "mrkdwn", text: toSlackMrkdwn(text) } },
+    {
+      type: "actions",
+      block_id: "compass_confirm",
+      elements: [
+        { type: "button", action_id: "compass_approve",
+          text: { type: "plain_text", text: "Approve", emoji: true },
+          style: "primary", value: refId },
+        { type: "button", action_id: "compass_reject",
+          text: { type: "plain_text", text: "Cancel", emoji: true },
+          style: "danger", value: refId },
+      ],
+    },
+  ];
+}
+
+async function postToSlack(channel, text, threadTs = null, confirmRefId = null) {
   const body = { channel, text: toSlackMrkdwn(text) };
   if (threadTs) body.thread_ts = threadTs;
+  const blocks = buildConfirmationBlocks(text, confirmRefId);
+  if (blocks) body.blocks = blocks;
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
@@ -4657,15 +4684,22 @@ async function postToSlack(channel, text, threadTs = null) {
 // Edit a previously-posted Slack message in place. Used for the live progress
 // pattern: /run posts an "On it…" placeholder, runAgent updates it as work
 // progresses, /run replaces it with the final answer at the end. Same mrkdwn
-// rules as postToSlack.
-async function updateSlackMessage(channel, ts, text) {
+// rules as postToSlack. confirmRefId optionally appends Approve/Cancel buttons.
+async function updateSlackMessage(channel, ts, text, confirmRefId = null) {
+  const body = { channel, ts, text: toSlackMrkdwn(text) };
+  const blocks = buildConfirmationBlocks(text, confirmRefId);
+  if (blocks) body.blocks = blocks;
+  // Explicitly null out blocks if we want to strip them from a previously-blocked
+  // message. Slack's chat.update keeps prior blocks if you don't send them — to
+  // remove buttons we send `blocks: []`. Passing the empty array unsets them.
+  if (!blocks && confirmRefId === false) body.blocks = [];
   const res = await fetch("https://slack.com/api/chat.update", {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${SLACK_BOT_TOKEN}`,
     },
-    body: JSON.stringify({ channel, ts, text: toSlackMrkdwn(text) }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   if (!data.ok) throw new Error(`Slack chat.update failed: ${data.error || JSON.stringify(data)}`);
@@ -5602,6 +5636,138 @@ async function ensureThreadStateTable() {
 }
 await ensureThreadStateTable();
 
+// ---------- Pending button-action table (auto-discovery + bootstrap) ----------
+// Backs the Slack interactivity flow. When a tool returns confirmation_required,
+// we register a row here and embed its ref_id in the Approve/Cancel buttons we
+// attach to the Slack message. Click → /slack-interaction looks up the row,
+// runs the tool with confirmed:true, and updates the message with the outcome.
+// Persisted (not in-memory) so a Render redeploy doesn't strand pending clicks.
+
+const PENDING_ACTIONS = { tableId: null };
+const PENDING_ACTIONS_TABLE_TITLE = "compass_pending_actions";
+
+async function ensurePendingActionsTable() {
+  if (!PEOPLE_TABLE_ID) {
+    console.warn("[migrate] PEOPLE_TABLE_ID not set — cannot discover base for pending-actions table");
+    return;
+  }
+  try {
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+    if (!baseId) {
+      console.warn("[migrate] could not resolve base_id from People table — skipping pending-actions setup");
+      return;
+    }
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+    const existing = tables.find((t) => t.title === PENDING_ACTIONS_TABLE_TITLE);
+    if (existing) {
+      PENDING_ACTIONS.tableId = existing.id;
+      console.log(`[migrate] pending-actions table found: ${existing.id}`);
+      return;
+    }
+    console.log(`[migrate] creating ${PENDING_ACTIONS_TABLE_TITLE} table…`);
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: PENDING_ACTIONS_TABLE_TITLE,
+      title: PENDING_ACTIONS_TABLE_TITLE,
+      columns: [
+        { column_name: "ref_id",        title: "ref_id",        uidt: "SingleLineText" },
+        { column_name: "thread_ts",     title: "thread_ts",     uidt: "SingleLineText" },
+        { column_name: "channel",       title: "channel",       uidt: "SingleLineText" },
+        { column_name: "message_ts",    title: "message_ts",    uidt: "SingleLineText" },
+        { column_name: "tool_name",     title: "tool_name",     uidt: "SingleLineText" },
+        { column_name: "args_json",     title: "args_json",     uidt: "LongText" },
+        { column_name: "action_summary",title: "action_summary",uidt: "LongText" },
+        { column_name: "requested_by",  title: "requested_by",  uidt: "SingleLineText" },
+        { column_name: "status",        title: "status",        uidt: "SingleLineText" },
+        { column_name: "result_json",   title: "result_json",   uidt: "LongText" },
+      ],
+    });
+    PENDING_ACTIONS.tableId = created?.id;
+    console.log(`[migrate] pending-actions table created: ${PENDING_ACTIONS.tableId}`);
+  } catch (e) {
+    console.error(`[migrate] ensurePendingActionsTable failed (continuing — buttons will degrade to text-only confirmation): ${e.message}`);
+  }
+}
+await ensurePendingActionsTable();
+
+// CRUD helpers. All silently no-op (return null) if the table isn't available,
+// so the agent loop keeps working with text-only confirmation as before.
+
+async function recordPendingAction({ thread_ts, channel, tool_name, args, action_summary, requested_by }) {
+  if (!PENDING_ACTIONS.tableId) return null;
+  const ref_id = (await import("node:crypto")).randomUUID();
+  try {
+    await ncPost(`/api/v2/tables/${PENDING_ACTIONS.tableId}/records`, [{
+      ref_id,
+      thread_ts: thread_ts || "",
+      channel: channel || "",
+      message_ts: "",
+      tool_name,
+      args_json: JSON.stringify(args || {}),
+      action_summary: (action_summary || "").slice(0, 4000),
+      requested_by: requested_by || "",
+      status: "pending",
+      result_json: "",
+    }]);
+    return ref_id;
+  } catch (e) {
+    console.warn(`[pending-actions] record failed for ${tool_name}: ${e.message}`);
+    return null;
+  }
+}
+
+async function setPendingActionMessageTs(ref_id, message_ts) {
+  if (!PENDING_ACTIONS.tableId || !ref_id) return;
+  try {
+    const data = await ncGet(`/api/v2/tables/${PENDING_ACTIONS.tableId}/records?where=${encodeURIComponent(`(ref_id,eq,${ref_id})`)}&limit=1`);
+    const row = data.list?.[0];
+    if (!row) return;
+    await ncPatch(`/api/v2/tables/${PENDING_ACTIONS.tableId}/records`, [{ Id: row.Id, message_ts }]);
+  } catch (e) {
+    console.warn(`[pending-actions] set message_ts failed: ${e.message}`);
+  }
+}
+
+async function lookupPendingAction(ref_id) {
+  if (!PENDING_ACTIONS.tableId || !ref_id) return null;
+  try {
+    const data = await ncGet(`/api/v2/tables/${PENDING_ACTIONS.tableId}/records?where=${encodeURIComponent(`(ref_id,eq,${ref_id})`)}&limit=1`);
+    const row = data.list?.[0];
+    if (!row) return null;
+    let args = {};
+    try { args = JSON.parse(row.args_json || "{}"); } catch {}
+    return {
+      Id: row.Id,
+      ref_id: row.ref_id,
+      thread_ts: row.thread_ts,
+      channel: row.channel,
+      message_ts: row.message_ts,
+      tool_name: row.tool_name,
+      args,
+      action_summary: row.action_summary,
+      requested_by: row.requested_by,
+      status: row.status,
+    };
+  } catch (e) {
+    console.warn(`[pending-actions] lookup failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function markPendingActionDone(Id, status, result) {
+  if (!PENDING_ACTIONS.tableId || !Id) return;
+  try {
+    await ncPatch(`/api/v2/tables/${PENDING_ACTIONS.tableId}/records`, [{
+      Id,
+      status,
+      result_json: JSON.stringify(result || {}).slice(0, 8000),
+    }]);
+  } catch (e) {
+    console.warn(`[pending-actions] mark done failed: ${e.message}`);
+  }
+}
+
 // ---------- Editable prompt body table (auto-discovery + bootstrap) ----------
 // Mirrors ensureThreadStateTable: pin via env if set, otherwise look up by title
 // in the same NocoDB base, otherwise create. After this resolves, loadPromptBody
@@ -6230,31 +6396,210 @@ app.post("/run", async (req, res) => {
         ? `\n_${result.trace.length} action${result.trace.length === 1 ? "" : "s"} · ${elapsedMs}ms_`
         : "";
       const finalText = `${prefix} ${summary}${trailer}`;
+
+      // If this turn produced one or more confirmation_required tool results,
+      // register the LAST one as a pending action and attach Approve / Cancel
+      // buttons to the final reply. Buttons embed the ref_id; click flows
+      // through /slack-interaction which re-runs the tool with confirmed:true.
+      // The text-confirmation path ("yes" / "go ahead") still works in
+      // parallel — buttons are a UX shortcut, not a replacement.
+      let confirmRefId = null;
+      const pendings = (result.trace || []).filter(
+        (t) => t?.result?.status === "confirmation_required"
+      );
+      const lastPending = pendings[pendings.length - 1];
+      if (lastPending && slack_context?.channel) {
+        confirmRefId = await recordPendingAction({
+          thread_ts: slack_context.thread_ts || slack_context.ts || null,
+          channel: slack_context.channel,
+          tool_name: lastPending.tool,
+          args: lastPending.result.replay_args,
+          action_summary: lastPending.result.action_summary,
+          requested_by: slack_context.user_id || slack_context.user || null,
+        });
+      }
+
+      let postedTs = null;
       if (placeholderRef) {
         try {
-          await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, finalText);
+          await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, finalText, confirmRefId);
+          postedTs = placeholderRef.ts;
         } catch (e) {
           // Edit failed (maybe the message was deleted by a moderator or
           // Slack returned an error). Fall back to posting fresh so the user
           // still gets an answer.
           console.error(`[slack] placeholder update failed (falling back to new post):`, e.message);
           try {
-            await postToSlack(slack_context.channel, finalText, slack_context.thread_ts);
+            const posted = await postToSlack(slack_context.channel, finalText, slack_context.thread_ts, confirmRefId);
+            postedTs = posted?.ts || null;
           } catch (e2) {
             console.error(`[slack] fallback post also failed:`, e2.message);
           }
         }
       } else {
         try {
-          await postToSlack(slack_context.channel, finalText, slack_context.thread_ts);
+          const posted = await postToSlack(slack_context.channel, finalText, slack_context.thread_ts, confirmRefId);
+          postedTs = posted?.ts || null;
         } catch (e) {
           console.error(`[slack] post failed:`, e.message);
         }
+      }
+
+      // Backfill the message_ts on the pending row so /slack-interaction can
+      // chat.update the right message later. Best-effort; failures only mean
+      // the post-click outcome won't replace the buttons in place (the action
+      // still runs).
+      if (confirmRefId && postedTs) {
+        await setPendingActionMessageTs(confirmRefId, postedTs);
       }
     }
   }
 
   res.json({ ...result, elapsedMs });
+});
+
+// Slack interactivity handler. Receives Block Kit button clicks (Approve /
+// Cancel under a confirmation message) forwarded from n8n's
+// /webhook/slack-interactions endpoint, looks up the pending action by its
+// ref_id, and runs (or cancels) the original tool. Auth via RUN_SHARED_SECRET
+// — same gate as /run.
+//
+// Slack requires a 200 within 3 seconds. We ack first, then process async so
+// the user's UI updates feel snappy and slow tools don't blow the deadline.
+//
+// Expected request body shape (from n8n):
+//   { payload: <Slack interaction payload, parsed from the form-encoded
+//              `payload` field> }
+// We extract payload.actions[0].action_id ("compass_approve" or
+// "compass_reject") and payload.actions[0].value (the ref_id we embedded).
+app.post("/slack-interaction", async (req, res) => {
+  const provided =
+    req.get("x-run-secret") ||
+    (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!timingSafeEq(provided, RUN_SHARED_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const payload = req.body?.payload || req.body;
+  if (!payload || !Array.isArray(payload.actions) || payload.actions.length === 0) {
+    return res.status(400).json({ error: "missing actions[]" });
+  }
+
+  // Ack immediately. Slack only cares about the 200; further work happens async.
+  res.json({ ok: true });
+
+  // Background processing — never let an exception escape this block, the
+  // response is already sent and crashing the worker takes the whole pod down.
+  (async () => {
+    try {
+      const action = payload.actions[0];
+      const refId = action.value;
+      const decision = action.action_id; // "compass_approve" or "compass_reject"
+      const clickerId = payload.user?.id || null;
+      const clickerName = payload.user?.username || payload.user?.name || clickerId || "someone";
+
+      const pending = await lookupPendingAction(refId);
+      if (!pending) {
+        console.warn(`[slack-interaction] no pending action for ref_id=${refId}`);
+        return;
+      }
+      if (pending.status !== "pending") {
+        console.warn(`[slack-interaction] action ${refId} already ${pending.status} — ignoring duplicate click`);
+        // Best-effort message refresh so the user sees the outcome rather than
+        // a frozen button. We don't have the prior outcome rendered nicely
+        // here, but a short note clears confusion.
+        if (pending.channel && pending.message_ts) {
+          try {
+            await updateSlackMessage(
+              pending.channel,
+              pending.message_ts,
+              `_(This confirmation was already ${pending.status}. No action taken on the second click.)_`,
+              false
+            );
+          } catch {}
+        }
+        return;
+      }
+
+      const impl = toolImpls[pending.tool_name];
+      if (!impl) {
+        console.error(`[slack-interaction] unknown tool ${pending.tool_name} for ref_id=${refId}`);
+        await markPendingActionDone(pending.Id, "failed", { error: `unknown tool ${pending.tool_name}` });
+        if (pending.channel && pending.message_ts) {
+          try {
+            await updateSlackMessage(
+              pending.channel,
+              pending.message_ts,
+              `:warning: Couldn't run \`${pending.tool_name}\` — tool not found. (This shouldn't happen; ping Nathan.)`,
+              false
+            );
+          } catch {}
+        }
+        return;
+      }
+
+      if (decision === "compass_reject") {
+        await markPendingActionDone(pending.Id, "rejected", { rejected_by: clickerId });
+        if (pending.channel && pending.message_ts) {
+          try {
+            await updateSlackMessage(
+              pending.channel,
+              pending.message_ts,
+              `:no_entry_sign: Cancelled by <@${clickerId || clickerName}>.\n_${pending.action_summary || ""}_`,
+              false
+            );
+          } catch (e) {
+            console.warn(`[slack-interaction] reject message update failed: ${e.message}`);
+          }
+        }
+        return;
+      }
+
+      // Approved — run the tool with confirmed:true (the replay_args we stored
+      // already include it, set by pendingConfirmation()).
+      console.log(`[slack-interaction] approved ref_id=${refId} tool=${pending.tool_name} by=${clickerId}`);
+      let result;
+      try {
+        result = await impl.call({ ...toolImpls, _trace: [] }, pending.args || {});
+      } catch (e) {
+        result = { error: e.message };
+      }
+      const status = result?.error ? "failed" : "done";
+      await markPendingActionDone(pending.Id, status, result);
+
+      // Build a tight outcome line for the message update.
+      let outcomeText;
+      if (result?.error) {
+        outcomeText = `:warning: Approved by <@${clickerId || clickerName}> but the tool failed: ${result.error}`;
+      } else {
+        const summary = pending.action_summary || pending.tool_name;
+        outcomeText = `:white_check_mark: Approved by <@${clickerId || clickerName}>. Done.\n_${summary}_`;
+      }
+      if (pending.channel && pending.message_ts) {
+        try {
+          await updateSlackMessage(pending.channel, pending.message_ts, outcomeText, false);
+        } catch (e) {
+          console.warn(`[slack-interaction] approve message update failed: ${e.message}`);
+        }
+      }
+
+      // Best-effort audit log entry so the action shows up under list_recent_actions.
+      try {
+        if (AGENT_ACTIONS_TABLE_ID) {
+          await ncPost(`/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records`, [{
+            "Tool name": pending.tool_name,
+            "Tool input": JSON.stringify(pending.args || {}).slice(0, 4000),
+            "Result": JSON.stringify(result || {}).slice(0, 4000),
+            "Trace detail": `Approved via Slack button by ${clickerName} (${clickerId || "?"}). Original confirmation issued at ref_id=${refId}.`,
+          }]);
+        }
+      } catch (e) {
+        console.warn(`[slack-interaction] audit log failed (non-fatal): ${e.message}`);
+      }
+    } catch (e) {
+      console.error(`[slack-interaction] async handler crashed: ${e.message}\n${e.stack}`);
+    }
+  })().catch((e) => console.error(`[slack-interaction] unhandled: ${e.message}`));
 });
 
 // Re-run n8n discovery without restarting. Auth-gated by the same shared
