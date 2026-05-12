@@ -3116,9 +3116,47 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // when this function returns. The lazy-on-first-tool design means stay_silent
   // and pure-text-reply cases never post a placeholder at all — fixing the
   // "Compass don't reply to this" → flash of 'On it…' then disappears bug.
+  // progressLines holds objects { marker, label, count } so consecutive
+  // identical actions collapse to "✓ Looked up person ×3" rather than
+  // repeating three lines. Slack chat.update has a 40000-char limit; if
+  // we exceed, we tail-truncate with a "[N earlier actions truncated]"
+  // header so the user always sees the most recent activity.
   const progressLines = [];
-  let lastFlushedCount = 0;
+  let progressVersion = 0;
+  let lastFlushedVersion = 0;
   let placeholderRef = null;
+  function pushProgress(marker, label) {
+    const last = progressLines[progressLines.length - 1];
+    if (last && last.marker === marker && last.label === label) {
+      last.count += 1;
+    } else {
+      progressLines.push({ marker, label, count: 1 });
+    }
+    progressVersion++;
+  }
+  function renderProgress() {
+    const SLACK_MSG_CAP = 35_000; // Slack's hard limit is 40k; leave headroom
+    const HEADER = "_Working on it…_\n\n";
+    const lines = progressLines.map((p) =>
+      p.count > 1 ? `${p.marker} _${p.label}_  ×${p.count}` : `${p.marker} _${p.label}_`
+    );
+    const fullText = HEADER + lines.join("\n");
+    if (fullText.length <= SLACK_MSG_CAP) return fullText;
+    // Tail-truncate. Walk lines from the end, keeping until we'd exceed.
+    const TRUNC_HEADER_RESERVE = 80;
+    const targetSize = SLACK_MSG_CAP - HEADER.length - TRUNC_HEADER_RESERVE;
+    let acc = 0;
+    let keepFromIdx = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const lineLen = lines[i].length + 1;
+      if (acc + lineLen > targetSize) break;
+      acc += lineLen;
+      keepFromIdx = i;
+    }
+    const droppedCount = keepFromIdx;
+    const kept = lines.slice(keepFromIdx);
+    return `${HEADER}_[…${droppedCount} earlier action${droppedCount === 1 ? "" : "s"} truncated…]_\n${kept.join("\n")}`;
+  }
   async function ensurePlaceholder() {
     if (placeholderRef || !slack_context?.channel) return;
     try {
@@ -3130,11 +3168,10 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   }
   async function flushProgress() {
     await ensurePlaceholder();
-    if (!placeholderRef || progressLines.length === lastFlushedCount) return;
-    lastFlushedCount = progressLines.length;
-    const text = `_Working on it…_\n\n${progressLines.join("\n")}`;
+    if (!placeholderRef || progressVersion === lastFlushedVersion) return;
+    lastFlushedVersion = progressVersion;
     try {
-      await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, text);
+      await updateSlackMessage(placeholderRef.channel, placeholderRef.ts, renderProgress());
     } catch (e) {
       console.error(`[progress] update failed: ${e.message}`);
     }
@@ -3444,8 +3481,9 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         //   ✓  succeeded
         //   •  succeeded but de-duped via the action ledger ("already done")
         //   ⚠  errored (don't kill the run; agent may recover next turn)
+        // pushProgress() collapses consecutive duplicates ("Looked up person ×3").
         const marker = result?.error ? ":warning:" : (result?.already_done || result?.already_existed) ? ":small_blue_diamond:" : ":white_check_mark:";
-        progressLines.push(`${marker} _${humanizeToolName(block.name)}_`);
+        pushProgress(marker, humanizeToolName(block.name));
       }
       // Single chat.update per iteration (batches all of this turn's tool
       // status lines into one Slack edit, avoids spamming the API).
