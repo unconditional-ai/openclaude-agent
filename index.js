@@ -4232,7 +4232,61 @@ function truncateLargeCodeExecOutputs(contentBlocks) {
   return out;
 }
 
-async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null) {
+// Cap on persisted messages payload. NocoDB LongText is theoretically large,
+// but a giant blob slows every getThreadState read for the rest of the
+// thread's life. 500KB is generous for ~25 turns of mixed tool calls and
+// holds a 50-row CSV import without issue. If serialization exceeds this,
+// we skip THIS iteration's checkpoint (next one might be smaller after
+// truncateLargeCodeExecOutputs trims a heavy turn).
+const CHECKPOINT_PAYLOAD_CAP_CHARS = 500_000;
+
+async function loadCheckpoint(threadTs) {
+  if (!THREAD_STATE.tableId || !threadTs) return null;
+  const state = await getThreadState(threadTs);
+  if (!state?.messages_json) return null;
+  try {
+    const messages = JSON.parse(state.messages_json);
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+    const usage = state.usage_totals_json ? JSON.parse(state.usage_totals_json) : null;
+    return {
+      messages,
+      usage: usage || { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+      cost_usd: typeof state.cost_usd === "number" ? state.cost_usd : 0,
+      iteration: typeof state.iteration === "number" ? state.iteration : 0,
+    };
+  } catch (e) {
+    console.warn(`[checkpoint] parse failed for thread ${threadTs}: ${e.message} — fresh start`);
+    return null;
+  }
+}
+
+async function saveCheckpoint(threadTs, { messages, usage, cost_usd, iteration }) {
+  if (!THREAD_STATE.tableId || !threadTs) return;
+  let payload;
+  try {
+    payload = JSON.stringify(messages);
+  } catch (e) {
+    console.warn(`[checkpoint] serialise failed: ${e.message}`);
+    return;
+  }
+  if (payload.length > CHECKPOINT_PAYLOAD_CAP_CHARS) {
+    console.warn(`[checkpoint] payload ${payload.length} > cap ${CHECKPOINT_PAYLOAD_CAP_CHARS} — skipping checkpoint this iter`);
+    return;
+  }
+  await upsertThreadState(threadTs, {
+    messages_json: payload,
+    usage_totals_json: JSON.stringify(usage || {}),
+    cost_usd: typeof cost_usd === "number" ? Number(cost_usd.toFixed(6)) : null,
+    iteration: typeof iteration === "number" ? iteration : null,
+  });
+}
+
+async function clearCheckpoint(threadTs) {
+  if (!THREAD_STATE.tableId || !threadTs) return;
+  await upsertThreadState(threadTs, { messages_json: "", usage_totals_json: "" });
+}
+
+async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, resumeFromPause = false) {
   // Live progress: posts an "On it…" placeholder right before the FIRST tool
   // dispatch, then edits it in place after each subsequent iteration to add a
   // status line per tool. /run replaces the placeholder with the final answer
@@ -4338,9 +4392,32 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   } else {
     initialContent = transcript;
   }
-  const messages = [{ role: "user", content: initialContent }];
+  // Resume-from-checkpoint: if the user said "continue" after a budget /
+  // credit pause, load the saved messages and pick up the conversation where
+  // it left off. The new transcript becomes a fresh user turn appended to
+  // the saved history, so the agent sees the full prior context plus the
+  // resume signal. Falls back to a fresh start if the checkpoint is missing
+  // or unparseable.
+  let messages;
   const trace = [];
   let iteration = 0;
+  let resumedFromCheckpoint = false;
+  if (resumeFromPause && threadTs) {
+    const ckpt = await loadCheckpoint(threadTs);
+    if (ckpt && ckpt.messages.length > 0) {
+      messages = [...ckpt.messages, { role: "user", content: initialContent }];
+      // NOTE: iteration counter resets to 0 on resume. The maxIterations
+      // cap is a runaway-loop safety net (per /run call), not a budget gate
+      // (that's MAX_USD_PER_CONVERSATION). A user who said "continue" is
+      // explicitly buying another round of work, so giving them a fresh
+      // 25-iteration ceiling is the right thing.
+      resumedFromCheckpoint = true;
+      console.log(`[checkpoint] resumed thread ${threadTs} from saved iter=${ckpt.iteration || 0} with ${ckpt.messages.length} prior messages (counter reset to 0 for new run cap)`);
+    }
+  }
+  if (!messages) {
+    messages = [{ role: "user", content: initialContent }];
+  }
   // Was 12; bumped to 25 to support batch CSV imports (May 9 import used 11 in
   // its final batch — already too close to the old ceiling). Safe to bump
   // because the cost guard below caps spend per conversation.
@@ -4650,11 +4727,28 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       // status lines into one Slack edit, avoids spamming the API).
       await flushProgress();
       messages.push({ role: "user", content: toolResults });
+
+      // Persist a checkpoint so a budget/credit pause can resume from here
+      // instead of restarting from the original transcript. Best-effort —
+      // failure (oversize payload, NocoDB hiccup) just means this iteration
+      // isn't a recovery point, the next one might be.
+      if (threadTs) {
+        await saveCheckpoint(threadTs, {
+          messages,
+          usage: usageTotals,
+          cost_usd: conversationCostUsd,
+          iteration,
+        });
+      }
+
       continue;
     }
 
     if (response.stop_reason === "end_turn") {
       const textBlock = response.content.find((b) => b.type === "text");
+      // Successfully completed — drop the checkpoint so the next /run on this
+      // thread starts fresh rather than re-loading a stale conversation.
+      if (threadTs) await clearCheckpoint(threadTs).catch(() => {});
       return {
         ok: true,
         summary: textBlock?.text || "Done.",
@@ -4663,6 +4757,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         trace,
         placeholderRef,
         usage: usageTotals,
+        resumed_from_checkpoint: resumedFromCheckpoint,
       };
     }
 
@@ -5697,6 +5792,9 @@ async function ensureThreadStateTable() {
         { column_name: "seen_actions", title: "seen_actions", uidt: "LongText" },
         { column_name: "cost_usd", title: "cost_usd", uidt: "Decimal" },
         { column_name: "last_summary", title: "last_summary", uidt: "LongText" },
+        { column_name: "messages_json", title: "messages_json", uidt: "LongText" },
+        { column_name: "usage_totals_json", title: "usage_totals_json", uidt: "LongText" },
+        { column_name: "iteration", title: "iteration", uidt: "Number" },
       ],
     });
     THREAD_STATE.tableId = created?.id;
@@ -5706,6 +5804,35 @@ async function ensureThreadStateTable() {
   }
 }
 await ensureThreadStateTable();
+
+// Idempotently add the checkpoint columns to existing thread_state tables that
+// pre-date this commit. Same pattern as ensureAuditSchema. Failure is non-fatal —
+// checkpointing degrades to no-op if the columns are missing.
+async function ensureThreadStateCheckpointColumns() {
+  if (!THREAD_STATE.tableId) return;
+  try {
+    const meta = await ncGet(`/api/v2/meta/tables/${THREAD_STATE.tableId}`);
+    const have = new Set((meta?.columns || []).map((c) => c.title));
+    const desired = [
+      { title: "messages_json", uidt: "LongText" },
+      { title: "usage_totals_json", uidt: "LongText" },
+      { title: "iteration", uidt: "Number" },
+    ];
+    const missing = desired.filter((c) => !have.has(c.title));
+    for (const col of missing) {
+      console.log(`[migrate] adding ${col.title} (${col.uidt}) to thread_state…`);
+      await ncPost(`/api/v2/meta/tables/${THREAD_STATE.tableId}/columns`, {
+        column_name: col.title,
+        title: col.title,
+        uidt: col.uidt,
+      });
+    }
+    if (missing.length > 0) console.log(`[migrate] added ${missing.length} checkpoint column(s)`);
+  } catch (e) {
+    console.error(`[migrate] ensureThreadStateCheckpointColumns failed (continuing without checkpoint): ${e.message}`);
+  }
+}
+await ensureThreadStateCheckpointColumns();
 
 // ---------- Pending button-action table (auto-discovery + bootstrap) ----------
 // Backs the Slack interactivity flow. When a tool returns confirmation_required,
@@ -6525,7 +6652,7 @@ app.post("/run", async (req, res) => {
   // the existing placeholder or post fresh.
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context, runAttachments, threadTs);
+    result = await runAgent(enrichedTranscript, slack_context, runAttachments, threadTs, resumeFromPause);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
