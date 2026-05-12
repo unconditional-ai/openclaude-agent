@@ -3652,6 +3652,29 @@ async function fetchThreadContext(channel, threadTs, limit = 30) {
 // on any Slack error rather than throwing, so /run still proceeds.
 const MAX_FALLBACK_FILES = 5;
 const MAX_FALLBACK_FILE_BYTES = 25 * 1024 * 1024; // Anthropic Files API limit
+// Walk a list of Slack messages newest-first, collecting unique files.
+// Dedupe by id first, then by (name, size) so re-uploads of the same CSV
+// collapse to one (different slack ids, identical content — bloats input
+// tokens and breaks prompt caching).
+function collectUniqueFiles(messages, maxFiles, seenIds, seenContent) {
+  const out = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    for (const f of messages[i].files || []) {
+      if (!f?.id || seenIds.has(f.id)) continue;
+      const contentKey = `${f.name || ""}|${f.size || 0}`;
+      if (seenContent.has(contentKey)) {
+        console.log(`[slack-files] dedup: skipping ${f.id} — same name+size (${contentKey})`);
+        continue;
+      }
+      seenIds.add(f.id);
+      seenContent.add(contentKey);
+      out.push(f);
+      if (out.length >= maxFiles) return out;
+    }
+  }
+  return out;
+}
+
 async function fetchSlackTriggeringFiles(slackContext) {
   const channel = slackContext?.channel;
   // Bug fix May 12: n8n's text-path nodes (Mention/DM/Thread → agent) only
@@ -3667,93 +3690,76 @@ async function fetchSlackTriggeringFiles(slackContext) {
     console.log(`[slack-files] skipping (missing channel/ts): channel=${channel} triggerTs=${triggerTs}`);
     return [];
   }
-  try {
-    let messages = [];
-    let scanMode;
-    if (slackContext.thread_ts) {
-      scanMode = "thread";
-      const params = {
-        channel,
-        ts: slackContext.thread_ts,
-        limit: 30,
-      };
-      // Only constrain to messages up to the trigger when we have a real
-      // trigger ts (not just thread_ts in disguise). Otherwise grab the
-      // whole thread.
+  const seenIds = new Set();
+  const seenContent = new Set();
+  const collected = [];
+
+  // === Pass 1: thread (if applicable) ===
+  if (slackContext.thread_ts) {
+    try {
+      const params = { channel, ts: slackContext.thread_ts, limit: 30 };
       if (haveExplicitTs) {
         params.latest = triggerTs;
         params.inclusive = true;
       }
       const data = await slackApi("conversations.replies", params);
-      messages = data.messages || [];
-    } else {
-      scanMode = "channel";
-      // Fetch a small window of recent messages so we can find files uploaded
-      // a few messages back, not just the triggering one. Common pattern:
-      // user uploads CSV, then sends a follow-up "@Compass please import" —
-      // the trigger has no files, but the prior message does.
-      const params = { channel, limit: 10 };
-      if (haveExplicitTs) {
-        params.latest = triggerTs;
-        params.inclusive = true;
+      const messages = data.messages || [];
+
+      // Triggering message takes priority if it has files.
+      const target = messages.find((m) => m.ts === triggerTs);
+      const triggerFiles = target?.files || [];
+      const messagesWithFiles = messages.filter((m) => (m.files || []).length > 0);
+      const allIds = messagesWithFiles.flatMap((m) => (m.files || []).map((f) => f?.id || "?"));
+      console.log(
+        `[slack-files] thread: ${messages.length} messages, ${messagesWithFiles.length} have files, ids=[${allIds.join(",")}]`
+      );
+      if (triggerFiles.length > 0) {
+        console.log(`[slack-files] using ${triggerFiles.length} file(s) from triggering message`);
+        return triggerFiles.slice(0, MAX_FALLBACK_FILES);
       }
-      const data = await slackApi("conversations.history", params);
-      messages = (data.messages || []).slice().reverse(); // chronological
-    }
-
-    // Diagnostic: how many messages did Slack return, and how many have
-    // files? Helps debug "the file isn't reaching me" reports — if Slack is
-    // returning the messages but `files` is missing, we have a permissions
-    // problem (bot needs files:read scope) rather than a logic problem.
-    const messagesWithFiles = messages.filter((m) => (m.files || []).length > 0);
-    const allFileIds = messagesWithFiles.flatMap((m) => (m.files || []).map((f) => f?.id || "?"));
-    console.log(
-      `[slack-files] ${scanMode}: ${messages.length} messages, ${messagesWithFiles.length} have files, ids=[${allFileIds.join(",")}], triggerTs=${triggerTs}`
-    );
-
-    // Prefer files on the triggering message (the user's intent is most
-    // direct then). If none, fall back to the most recent files in the
-    // thread/channel window — newest first, capped at MAX_FALLBACK_FILES.
-    const target = messages.find((m) => m.ts === triggerTs);
-    const triggerFiles = target?.files || [];
-    if (triggerFiles.length > 0) {
-      console.log(`[slack-files] using ${triggerFiles.length} file(s) from triggering message`);
-      return triggerFiles.slice(0, MAX_FALLBACK_FILES);
-    }
-
-    // Walk recent messages in reverse-chronological order, collecting files
-    // until we hit the cap. De-dupe by file id first (a Slack file can
-    // appear in both file_shared and the message subtype event), then by
-    // (name, size) since users often re-upload the same CSV multiple times
-    // when testing — we only need one copy and uploading three of the same
-    // file inflates input tokens AND breaks prompt caching turn-over-turn
-    // (different anthropic file_ids = different prompt prefix).
-    const seenIds = new Set();
-    const seenContent = new Set(); // key = `${name}|${size}`
-    const collected = [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-      for (const f of messages[i].files || []) {
-        if (!f?.id || seenIds.has(f.id)) continue;
-        const contentKey = `${f.name || ""}|${f.size || 0}`;
-        if (seenContent.has(contentKey)) {
-          console.log(`[slack-files] dedup: skipping ${f.id} — same name+size as already-collected (${contentKey})`);
-          continue;
-        }
-        seenIds.add(f.id);
-        seenContent.add(contentKey);
-        collected.push(f);
-        if (collected.length >= MAX_FALLBACK_FILES) break;
+      const fromThread = collectUniqueFiles(messages, MAX_FALLBACK_FILES, seenIds, seenContent);
+      collected.push(...fromThread);
+      if (collected.length > 0) {
+        console.log(`[slack-files] thread walk-back: collected ${collected.length} (ids=[${collected.map((f) => f.id).join(",")}])`);
+        return collected.slice(0, MAX_FALLBACK_FILES);
       }
-      if (collected.length >= MAX_FALLBACK_FILES) break;
+    } catch (e) {
+      console.warn(`[slack-files] thread scan failed: ${e.message}`);
     }
-    console.log(
-      `[slack-files] trigger has no files; collected ${collected.length} from prior messages (ids=[${collected.map((f) => f.id).join(",")}])`
-    );
-    return collected;
-  } catch (e) {
-    console.warn(`[slack-files] scan failed: ${e.message}`);
-    return [];
   }
+
+  // === Pass 2: channel scan (always, but especially valuable when in a
+  // thread that doesn't contain the file). Common pattern: user posts a
+  // CSV at the channel level, then later starts a thread on something
+  // else. The CSV is a sibling channel message — invisible to
+  // conversations.replies on the unrelated thread. Catch it via
+  // conversations.history near the trigger ts. ===
+  try {
+    const histParams = { channel, limit: 20 };
+    if (haveExplicitTs) {
+      histParams.latest = triggerTs;
+      histParams.inclusive = true;
+    }
+    const data = await slackApi("conversations.history", histParams);
+    const messages = (data.messages || []).slice().reverse(); // chronological
+    const messagesWithFiles = messages.filter((m) => (m.files || []).length > 0);
+    const allIds = messagesWithFiles.flatMap((m) => (m.files || []).map((f) => f?.id || "?"));
+    console.log(
+      `[slack-files] channel: ${messages.length} messages, ${messagesWithFiles.length} have files, ids=[${allIds.join(",")}]`
+    );
+    const fromChannel = collectUniqueFiles(messages, MAX_FALLBACK_FILES - collected.length, seenIds, seenContent);
+    collected.push(...fromChannel);
+    if (fromChannel.length > 0) {
+      console.log(`[slack-files] channel walk-back: collected ${fromChannel.length} new (ids=[${fromChannel.map((f) => f.id).join(",")}])`);
+    }
+  } catch (e) {
+    console.warn(`[slack-files] channel scan failed: ${e.message}`);
+  }
+
+  if (collected.length === 0) {
+    console.log(`[slack-files] no files found in thread or channel scan`);
+  }
+  return collected.slice(0, MAX_FALLBACK_FILES);
 }
 
 // Per-process cache of slack_file_id -> anthropic_file_id. Files API uploads
