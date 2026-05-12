@@ -914,7 +914,7 @@ const toolImpls = {
       }
     }
     if (!scopedListIds) {
-      const dailyId = process.env.CLICKUP_DAILY_TASK_LIST_ID;
+      const dailyId = APP_CONFIG.CLICKUP_DAILY_TASK_LIST_ID;
       if (!dailyId) return { error: "No list_id/list_ids/cohort given and CLICKUP_DAILY_TASK_LIST_ID not set" };
       scopedListIds = [dailyId];
     }
@@ -1033,7 +1033,7 @@ const toolImpls = {
 
   async create_clickup_task({ name, description = "", priority = null, due_date = null, list_id = null, assignees = null }) {
     const token = process.env.CLICKUP_TOKEN;
-    const targetList = list_id || process.env.CLICKUP_DEFAULT_LIST_ID;
+    const targetList = list_id || APP_CONFIG.CLICKUP_DEFAULT_LIST_ID;
     if (!token) return { error: "CLICKUP_TOKEN not configured on server" };
     if (!targetList) return { error: "No list_id provided and CLICKUP_DEFAULT_LIST_ID not set" };
 
@@ -1275,8 +1275,15 @@ const toolImpls = {
     // ("let me update the row count column…"). compass_prompt holds the
     // editable system-prompt body — Compass should edit it via the gated
     // edit_prompt_body tool, not via raw CRUD that bypasses the diff preview.
+    // compass_config and compass_pending_actions are similarly internal.
+    const internal = new Set([
+      THREAD_STATE_TABLE_TITLE,
+      PROMPT_TABLE_TITLE,
+      APP_CONFIG_TABLE_TITLE,
+      PENDING_ACTIONS_TABLE_TITLE,
+    ]);
     const tables = (data.list || data.tables || data || [])
-      .filter((t) => t.title !== THREAD_STATE_TABLE_TITLE && t.title !== PROMPT_TABLE_TITLE)
+      .filter((t) => !internal.has(t.title))
       .map((t) => ({
         id: t.id,
         title: t.title,
@@ -2030,9 +2037,9 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       userId = to;
     } else {
       const map = {
-        yohan: process.env.YOHAN_SLACK_ID,
-        valerie: process.env.VALERIE_SLACK_ID,
-        nathan: process.env.NATHAN_SLACK_ID,
+        yohan: APP_CONFIG.YOHAN_SLACK_ID,
+        valerie: APP_CONFIG.VALERIE_SLACK_ID,
+        nathan: APP_CONFIG.NATHAN_SLACK_ID,
       };
       userId = map[String(to).toLowerCase().trim()];
       if (!userId) {
@@ -2069,16 +2076,16 @@ ${location ? `<p>Location: ${location}</p>` : ""}
       if (typeof user === "string" && /^U[A-Z0-9]+$/.test(user)) {
         userId = user;
         const reverse = {
-          [process.env.YOHAN_SLACK_ID]: "yohan",
-          [process.env.VALERIE_SLACK_ID]: "valerie",
-          [process.env.NATHAN_SLACK_ID]: "nathan",
+          [APP_CONFIG.YOHAN_SLACK_ID]: "yohan",
+          [APP_CONFIG.VALERIE_SLACK_ID]: "valerie",
+          [APP_CONFIG.NATHAN_SLACK_ID]: "nathan",
         };
         friendlyName = reverse[userId] || null;
       } else {
         const map = {
-          yohan: process.env.YOHAN_SLACK_ID,
-          valerie: process.env.VALERIE_SLACK_ID,
-          nathan: process.env.NATHAN_SLACK_ID,
+          yohan: APP_CONFIG.YOHAN_SLACK_ID,
+          valerie: APP_CONFIG.VALERIE_SLACK_ID,
+          nathan: APP_CONFIG.NATHAN_SLACK_ID,
         };
         const key = String(user).toLowerCase().trim();
         userId = map[key];
@@ -2248,9 +2255,9 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     let resolvedId = user_id;
     if (!resolvedId && name) {
       const map = {
-        yohan: process.env.YOHAN_SLACK_ID,
-        valerie: process.env.VALERIE_SLACK_ID,
-        nathan: process.env.NATHAN_SLACK_ID,
+        yohan: APP_CONFIG.YOHAN_SLACK_ID,
+        valerie: APP_CONFIG.VALERIE_SLACK_ID,
+        nathan: APP_CONFIG.NATHAN_SLACK_ID,
       };
       resolvedId = map[String(name).toLowerCase().trim()] || null;
       if (!resolvedId) return { error: `No mapping for name '${name}'. Try email instead.` };
@@ -2458,7 +2465,7 @@ ${location ? `<p>Location: ${location}</p>` : ""}
         },
         clickup: {
           CLICKUP_TOKEN: !!process.env.CLICKUP_TOKEN,
-          CLICKUP_DEFAULT_LIST_ID: !!process.env.CLICKUP_DEFAULT_LIST_ID,
+          CLICKUP_DEFAULT_LIST_ID: !!APP_CONFIG.CLICKUP_DEFAULT_LIST_ID,
         },
         jotform: {
           JOTFORM_API_KEY: !!process.env.JOTFORM_API_KEY,
@@ -3772,10 +3779,10 @@ let cachedPromptUpdatedAt = null;
 
 const promptVars = () => ({
   TODAY: todayISO(),
-  YOHAN_SLACK_ID: process.env.YOHAN_SLACK_ID || "",
-  VALERIE_SLACK_ID: process.env.VALERIE_SLACK_ID || "",
-  NATHAN_SLACK_ID: process.env.NATHAN_SLACK_ID || "",
-  CLICKUP_DAILY_TASK_LIST_ID: process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var",
+  YOHAN_SLACK_ID: APP_CONFIG.YOHAN_SLACK_ID || "",
+  VALERIE_SLACK_ID: APP_CONFIG.VALERIE_SLACK_ID || "",
+  NATHAN_SLACK_ID: APP_CONFIG.NATHAN_SLACK_ID || "",
+  CLICKUP_DAILY_TASK_LIST_ID: APP_CONFIG.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID in compass_config",
 });
 
 function substitutePromptVars(text) {
@@ -5773,6 +5780,119 @@ async function markPendingActionDone(Id, status, result) {
 // in the same NocoDB base, otherwise create. After this resolves, loadPromptBody
 // either reads the existing latest Version row or seeds Version=1 from SEED_PROMPT_BODY.
 
+// ---------- App config (NocoDB-backed key/value store) ----------
+//
+// Replaces five env vars (YOHAN_SLACK_ID, VALERIE_SLACK_ID, NATHAN_SLACK_ID,
+// CLICKUP_DAILY_TASK_LIST_ID, CLICKUP_DEFAULT_LIST_ID) with rows in a
+// `compass_config` table. The env vars still seed the in-memory APP_CONFIG
+// at module-load, and on first boot the seed is also written to NocoDB so
+// existing deployments don't lose anything when the env vars are removed.
+// After that, Yohan/Valerie can edit the values in the NocoDB UI without a
+// redeploy.
+//
+// Read pattern: APP_CONFIG.YOHAN_SLACK_ID (live binding into this object).
+// Write pattern: edit the NocoDB row, then call POST /reload to refresh.
+
+const APP_CONFIG_KEYS = [
+  "YOHAN_SLACK_ID",
+  "VALERIE_SLACK_ID",
+  "NATHAN_SLACK_ID",
+  "CLICKUP_DAILY_TASK_LIST_ID",
+  "CLICKUP_DEFAULT_LIST_ID",
+];
+
+// Seed from env at module-load. Anything still set in Render shows up here
+// before the NocoDB lookup runs — useful as a fallback if NocoDB is briefly
+// unreachable at boot, and as the source for the first-boot bootstrap row.
+const APP_CONFIG = Object.fromEntries(
+  APP_CONFIG_KEYS.map((k) => [k, process.env[k] || null])
+);
+
+const APP_CONFIG_TABLE = { tableId: null };
+const APP_CONFIG_TABLE_TITLE = "compass_config";
+
+async function ensureAppConfigTable() {
+  if (!PEOPLE_TABLE_ID) {
+    console.warn("[migrate] PEOPLE_TABLE_ID not set — cannot discover base for compass_config table");
+    return;
+  }
+  try {
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+    if (!baseId) {
+      console.warn("[migrate] could not resolve base_id from People table — skipping compass_config setup");
+      return;
+    }
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+    const existing = tables.find((t) => t.title === APP_CONFIG_TABLE_TITLE);
+    if (existing) {
+      APP_CONFIG_TABLE.tableId = existing.id;
+      console.log(`[migrate] compass_config table found: ${existing.id}`);
+      return;
+    }
+    console.log(`[migrate] creating ${APP_CONFIG_TABLE_TITLE} table…`);
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: APP_CONFIG_TABLE_TITLE,
+      title: APP_CONFIG_TABLE_TITLE,
+      columns: [
+        { column_name: "key",         title: "key",         uidt: "SingleLineText" },
+        { column_name: "value",       title: "value",       uidt: "LongText" },
+        { column_name: "description", title: "description", uidt: "LongText" },
+      ],
+    });
+    APP_CONFIG_TABLE.tableId = created?.id;
+    console.log(`[migrate] compass_config table created: ${APP_CONFIG_TABLE.tableId}`);
+  } catch (e) {
+    console.error(`[migrate] ensureAppConfigTable failed (continuing with env-only config): ${e.message}`);
+  }
+}
+
+async function loadAppConfig() {
+  if (!APP_CONFIG_TABLE.tableId) {
+    console.log("[app-config] table not available — using env-derived APP_CONFIG only");
+    return;
+  }
+  try {
+    const data = await ncGet(`/api/v2/tables/${APP_CONFIG_TABLE.tableId}/records?limit=200&fields=Id,key,value`);
+    const rows = data.list || [];
+    const known = new Set(APP_CONFIG_KEYS);
+    const haveInTable = new Set();
+    for (const row of rows) {
+      const key = row.key?.trim();
+      if (!key) continue;
+      haveInTable.add(key);
+      if (known.has(key)) {
+        APP_CONFIG[key] = row.value || null;
+      }
+    }
+    // First-boot bootstrap: any APP_CONFIG_KEY missing from the table gets
+    // inserted from the in-memory env-seeded value (if any). Lets the operator
+    // delete the env vars from Render after this deploys without losing data.
+    const toBootstrap = APP_CONFIG_KEYS.filter((k) => !haveInTable.has(k));
+    if (toBootstrap.length > 0) {
+      const seedRows = toBootstrap.map((k) => ({
+        key: k,
+        value: APP_CONFIG[k] || "",
+        description: APP_CONFIG_DESCRIPTIONS[k] || "",
+      }));
+      await ncPost(`/api/v2/tables/${APP_CONFIG_TABLE.tableId}/records`, seedRows);
+      console.log(`[app-config] bootstrapped ${toBootstrap.length} key(s) from env: ${toBootstrap.join(", ")}`);
+    }
+    console.log(`[app-config] loaded — ${APP_CONFIG_KEYS.filter((k) => APP_CONFIG[k]).length}/${APP_CONFIG_KEYS.length} keys populated`);
+  } catch (e) {
+    console.error(`[app-config] load failed (continuing with env-only): ${e.message}`);
+  }
+}
+
+const APP_CONFIG_DESCRIPTIONS = {
+  YOHAN_SLACK_ID: "Yohan's Slack user id (Uxxxxx). Used for @-mentions in agent replies.",
+  VALERIE_SLACK_ID: "Valerie's Slack user id (Uxxxxx).",
+  NATHAN_SLACK_ID: "Nathan's Slack user id (Uxxxxx).",
+  CLICKUP_DAILY_TASK_LIST_ID: "ClickUp list id for the Daily Task Board — destination for ❓ decision tasks.",
+  CLICKUP_DEFAULT_LIST_ID: "Fallback ClickUp list id for create_clickup_task when no list/cohort is given.",
+};
+
 async function ensurePromptTable() {
   if (PROMPT_TABLE.tableId) {
     console.log(`[migrate] compass_prompt table pinned via env: ${PROMPT_TABLE.tableId}`);
@@ -5816,6 +5936,8 @@ async function ensurePromptTable() {
 }
 await ensurePromptTable();
 await loadPromptBody();
+await ensureAppConfigTable();
+await loadAppConfig();
 
 // === Thread state CRUD helpers ===
 // All silently no-op if THREAD_STATE.tableId is null (auto-create failed or
@@ -6309,9 +6431,9 @@ app.post("/run", async (req, res) => {
   if (slack_context?.channel) {
     const fromId = slack_context.user_id || null;
     const teamMap = {
-      [process.env.YOHAN_SLACK_ID]: "yohan",
-      [process.env.VALERIE_SLACK_ID]: "valerie",
-      [process.env.NATHAN_SLACK_ID]: "nathan",
+      [APP_CONFIG.YOHAN_SLACK_ID]: "yohan",
+      [APP_CONFIG.VALERIE_SLACK_ID]: "valerie",
+      [APP_CONFIG.NATHAN_SLACK_ID]: "nathan",
     };
     const fromName = fromId ? (teamMap[fromId] || null) : null;
     const fromLine = fromId
