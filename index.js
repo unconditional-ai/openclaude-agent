@@ -3325,7 +3325,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         //   •  succeeded but de-duped via the action ledger ("already done")
         //   ⚠  errored (don't kill the run; agent may recover next turn)
         const marker = result?.error ? ":warning:" : (result?.already_done || result?.already_existed) ? ":small_blue_diamond:" : ":white_check_mark:";
-        progressLines.push(`${marker} ${humanizeToolName(block.name)}`);
+        progressLines.push(`${marker} _${humanizeToolName(block.name)}_`);
       }
       // Single chat.update per iteration (batches all of this turn's tool
       // status lines into one Slack edit, avoids spamming the API).
