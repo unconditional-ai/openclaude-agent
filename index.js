@@ -2896,19 +2896,37 @@ Each /run starts fresh. Data parsed via code_execution in a previous turn is gon
 If you need a file and don't see an Anthropic file_id on the current message, ask the user to re-upload it. If you can't reach a system, name what's blocking. Plain.
 
 ATTACHMENTS AND CODE EXECUTION:
-There are TWO different kinds of file identifier you might see, and you must keep them straight:
+Two kinds of file identifier appear in your context. Keep them straight:
 
-  1. **Anthropic file_id** — starts with "file_" (e.g. file_011AB...). These are uploaded to Anthropic's Files API and arrive as actual content blocks on the FIRST user message of this run. If you have one of these, you can pass it to code_execution (it lands in the sandbox at /mnt/user-data/uploads/<filename>) or read PDFs/images natively. The "## Attached files" manifest in the transcript only ever lists Anthropic file_ids — these are the readable ones.
+  - Anthropic file_id (starts with "file_"): a real readable file. Arrives as a content block on the first user message — image, document, or container_upload depending on type. The "## Attached files" manifest lists these.
+  - Slack file_id (starts with "F"): metadata only, from thread history rendering like [file: name=foo.csv slack_file_id=F0B...]. You can't read these.
 
-  2. **Slack file_id** — starts with "F" (e.g. F0B2XRKRCH2). These appear in thread-context history lines like  [file: name=foo.csv slack_file_id=F0B2...]  when a file was uploaded earlier in the thread. Slack file_ids are NOT readable by you. You cannot pass them to code_execution. They're metadata for context only — so you know a file was once shared in this conversation.
+If you don't see an Anthropic file_id on the current message but the user is asking you to act on a file, the file isn't reaching you. Ask plainly for a re-upload. Don't write "let me read it" without a tool call.
 
-If the user references a file but you don't see an Anthropic file_id (no "## Attached files" manifest, no document/image/container_upload content block on the current message), the file is NOT accessible to you. Say so plainly: "the file isn't reaching me — please re-upload it in this thread and I'll handle it." Don't say "let me read it" or "let me check" — those are pretend-actions when there's nothing to read. Don't write prose describing what you would do; ask for the re-upload and stop.
+How files reach you:
+  - image/* → image content block: read directly, native multimodal.
+  - application/pdf → document content block: read directly.
+  - small inline text (< 4KB CSV/JSON): may also appear as an inline text block labelled "Inline content of …" — read directly.
+  - everything else (CSVs, Excel, JSON over 4KB, anything > 30KB) → container_upload block. The bytes are loaded into the code_execution sandbox at request time, NOT into your context. To use them, call code_execution. The file content does not consume input tokens — it lives in the sandbox filesystem.
 
-When you DO have an Anthropic file_id available:
-- CSV / JSON / Excel / any data wrangling → use code_execution (Python sandbox with pandas, openpyxl, json, etc. preinstalled). Files land at /mnt/user-data/uploads/<filename>.
-- PDFs and images → read directly via the document/image content block already in your context.
+Finding files in the sandbox:
+The expected path is /mnt/user-data/uploads/<filename> but this is convention, not guaranteed. Your first code_execution call should discover the file:
 
-If a workflow requires a genuinely new DURABLE capability (a permanent integration with a system Compass doesn't reach yet), say so plainly and ask Nathan to add it. There is no runtime tool-minting any more.
+  import os
+  for d in ("/mnt/user-data/uploads", "/mnt/user-data", "/tmp", "/home", "/workspace"):
+      if os.path.isdir(d):
+          for f in os.listdir(d):
+              print(d + "/" + f)
+
+Then read the discovered path with pandas / open() / etc. Do NOT assume the path without checking — if the file isn't where expected, say so and surface what IS in the sandbox so we can fix the delivery.
+
+Big files (10s of MB):
+container_upload is the ONLY sane option — they'd blow input tokens otherwise. Treat the sandbox as your workspace: read with chunked pandas, write transformed output back to the sandbox, return summaries (not raw data) to the user. Don't print 50,000 rows to stdout — that DOES cost tokens. Aggregate first, print the summary.
+
+Generated output files:
+If code_execution writes a file (e.g. a cleaned CSV, a chart), the response includes a file_id you can pass back to the user via Slack file upload (ask Nathan if you need that capability wired up — currently we don't have a "send file to Slack" tool).
+
+If a workflow needs a new durable capability we don't have, say so plainly and ask Nathan to add it.
 
 DIRECT DATA MANIPULATION:
 For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
@@ -3776,11 +3794,12 @@ async function fetchSlackTriggeringFiles(slackContext) {
 // Cache is wiped on Render restart; that's fine.
 const _slackToAnthropicFileCache = new Map();
 
-// Threshold below which text-based files get inlined into the user message
-// as a text block (in addition to container_upload). Belt-and-braces so
-// Compass can read content even if container_upload doesn't deliver to the
-// sandbox. CSVs in our workflow are typically 5-15 KB.
-const INLINE_TEXT_MAX_BYTES = 30 * 1024;
+// Files > 4KB rely entirely on container_upload (which does NOT cost input
+// tokens — file goes to sandbox, not model context, per Anthropic docs).
+// Below 4KB inlining as text costs ~1k tokens at most and can act as a
+// belt-and-braces fallback if container_upload fails (rare). Above that
+// we'd be paying real money to bypass a free mechanism — not worth it.
+const INLINE_TEXT_MAX_BYTES = 4 * 1024;
 function isInlinableMime(mime) {
   if (!mime) return false;
   return (
