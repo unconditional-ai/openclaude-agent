@@ -3638,10 +3638,15 @@ const MAX_FALLBACK_FILE_BYTES = 25 * 1024 * 1024; // Anthropic Files API limit
 async function fetchSlackTriggeringFiles(slackContext) {
   const channel = slackContext?.channel;
   const triggerTs = slackContext?.ts || slackContext?.thread_ts;
-  if (!channel || !triggerTs) return [];
+  if (!channel || !triggerTs) {
+    console.log(`[slack-files] skipping (missing channel/ts): channel=${channel} triggerTs=${triggerTs}`);
+    return [];
+  }
   try {
     let messages = [];
+    let scanMode;
     if (slackContext.thread_ts && slackContext.thread_ts !== slackContext.ts) {
+      scanMode = "thread";
       const data = await slackApi("conversations.replies", {
         channel,
         ts: slackContext.thread_ts,
@@ -3651,6 +3656,7 @@ async function fetchSlackTriggeringFiles(slackContext) {
       });
       messages = data.messages || [];
     } else {
+      scanMode = "channel";
       // Fetch a small window of recent messages so we can find files uploaded
       // a few messages back, not just the triggering one. Common pattern:
       // user uploads CSV, then sends a follow-up "@Compass please import" —
@@ -3664,12 +3670,23 @@ async function fetchSlackTriggeringFiles(slackContext) {
       messages = (data.messages || []).slice().reverse(); // chronological
     }
 
+    // Diagnostic: how many messages did Slack return, and how many have
+    // files? Helps debug "the file isn't reaching me" reports — if Slack is
+    // returning the messages but `files` is missing, we have a permissions
+    // problem (bot needs files:read scope) rather than a logic problem.
+    const messagesWithFiles = messages.filter((m) => (m.files || []).length > 0);
+    const allFileIds = messagesWithFiles.flatMap((m) => (m.files || []).map((f) => f?.id || "?"));
+    console.log(
+      `[slack-files] ${scanMode}: ${messages.length} messages, ${messagesWithFiles.length} have files, ids=[${allFileIds.join(",")}], triggerTs=${triggerTs}`
+    );
+
     // Prefer files on the triggering message (the user's intent is most
     // direct then). If none, fall back to the most recent files in the
     // thread/channel window — newest first, capped at MAX_FALLBACK_FILES.
     const target = messages.find((m) => m.ts === triggerTs);
     const triggerFiles = target?.files || [];
     if (triggerFiles.length > 0) {
+      console.log(`[slack-files] using ${triggerFiles.length} file(s) from triggering message`);
       return triggerFiles.slice(0, MAX_FALLBACK_FILES);
     }
 
@@ -3687,9 +3704,9 @@ async function fetchSlackTriggeringFiles(slackContext) {
       }
       if (collected.length >= MAX_FALLBACK_FILES) break;
     }
-    if (collected.length > 0) {
-      console.log(`[slack-files] no files on trigger; using ${collected.length} from recent thread/channel`);
-    }
+    console.log(
+      `[slack-files] trigger has no files; collected ${collected.length} from prior messages (ids=[${collected.map((f) => f.id).join(",")}])`
+    );
     return collected;
   } catch (e) {
     console.warn(`[slack-files] scan failed: ${e.message}`);
@@ -4511,10 +4528,14 @@ app.post("/run", async (req, res) => {
   // uniformly across mention / name-match / thread-reply / DM without needing
   // four copies of the same sub-flow in n8n.
   const runAttachments = [...validAttachments];
+  if (validAttachments.length > 0) {
+    console.log(`[agent] received ${validAttachments.length} attachment(s) from n8n: ${validAttachments.map((a) => a.file_id).join(",")}`);
+  }
   if (runAttachments.length === 0 && slack_context?.channel) {
+    console.log(`[agent] no n8n attachments — running slack-files fallback (channel=${slack_context.channel} ts=${slack_context.ts} thread_ts=${slack_context.thread_ts})`);
     const slackFiles = await fetchSlackTriggeringFiles(slack_context);
     if (slackFiles.length > 0) {
-      console.log(`[agent] slack-files fallback: ${slackFiles.length} file(s) on triggering message`);
+      console.log(`[agent] slack-files fallback: ${slackFiles.length} file(s) — uploading to Anthropic`);
       for (const f of slackFiles) {
         try {
           const entry = await uploadSlackFileToAnthropic(f);
