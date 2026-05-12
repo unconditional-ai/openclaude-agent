@@ -14,14 +14,9 @@ const {
   ANTHROPIC_API_KEY,
   NOCODB_URL,
   NOCODB_TOKEN,
-  PEOPLE_TABLE_ID,
-  COHORTS_TABLE_ID,
-  TOUCHPOINTS_TABLE_ID,
-  COHORTS_LINK_COLUMN_ID,
-  TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
-  KNOWLEDGE_TABLE_ID,
   COMPASS_PROMPT_TABLE_ID,
+  NOCODB_BASE_ID,
 
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
@@ -32,15 +27,26 @@ const {
   N8N_AUTH_TOKEN,
 } = process.env;
 
+// These six IDs USED to be required env vars. They're now auto-discovered at
+// boot from the NocoDB base (table titles `People`, `Cohorts`, `Touchpoints`,
+// `Knowledge`; link columns inferred from the People/Touchpoints metas). The
+// env vars still work as overrides for anyone who wants to pin a specific id,
+// but Render config no longer needs them. See ensureCoreNocoIds() below.
+//
+// `let` (not `const`) so ensureCoreNocoIds can populate empty bindings at
+// boot. Module-level `let` bindings are visible to closures via the live
+// binding, so call sites that reference these names see the resolved value.
+let PEOPLE_TABLE_ID                  = process.env.PEOPLE_TABLE_ID                  || null;
+let COHORTS_TABLE_ID                 = process.env.COHORTS_TABLE_ID                 || null;
+let TOUCHPOINTS_TABLE_ID             = process.env.TOUCHPOINTS_TABLE_ID             || null;
+let KNOWLEDGE_TABLE_ID               = process.env.KNOWLEDGE_TABLE_ID               || null;
+let COHORTS_LINK_COLUMN_ID           = process.env.COHORTS_LINK_COLUMN_ID           || null;
+let TOUCHPOINTS_PERSON_LINK_COLUMN_ID = process.env.TOUCHPOINTS_PERSON_LINK_COLUMN_ID || null;
+
 const requiredEnv = {
   ANTHROPIC_API_KEY,
   NOCODB_URL,
   NOCODB_TOKEN,
-  PEOPLE_TABLE_ID,
-  COHORTS_TABLE_ID,
-  TOUCHPOINTS_TABLE_ID,
-  COHORTS_LINK_COLUMN_ID,
-  TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   SLACK_BOT_TOKEN,
   RUN_SHARED_SECRET,
 };
@@ -1264,11 +1270,13 @@ const toolImpls = {
     const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
     if (!baseId) return { error: "Could not determine base ID from People table metadata" };
     const data = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
-    // Filter out Compass-internal infrastructure tables. The thread-state
-    // table is the agent's own scratch memory; surfacing it to the model
-    // invites confused reads/writes ("let me update the row count column…").
+    // Filter out Compass-internal infrastructure tables. Thread state is the
+    // agent's own scratch memory; surfacing it invites confused reads/writes
+    // ("let me update the row count column…"). compass_prompt holds the
+    // editable system-prompt body — Compass should edit it via the gated
+    // edit_prompt_body tool, not via raw CRUD that bypasses the diff preview.
     const tables = (data.list || data.tables || data || [])
-      .filter((t) => t.title !== THREAD_STATE_TABLE_TITLE)
+      .filter((t) => t.title !== THREAD_STATE_TABLE_TITLE && t.title !== PROMPT_TABLE_TITLE)
       .map((t) => ({
         id: t.id,
         title: t.title,
@@ -5296,6 +5304,156 @@ loadSkills();
 // Generated-tools loader removed alongside propose_new_tool (May 2026). New
 // durable capabilities go in via normal PR; ad-hoc data work goes through the
 // code_execution sandbox.
+
+// ---------- Auto-discover the core NocoDB IDs ----------
+//
+// Replaces six env vars (PEOPLE_TABLE_ID, COHORTS_TABLE_ID, TOUCHPOINTS_TABLE_ID,
+// KNOWLEDGE_TABLE_ID, COHORTS_LINK_COLUMN_ID, TOUCHPOINTS_PERSON_LINK_COLUMN_ID)
+// with a single boot-time lookup against the NocoDB base. The env vars still
+// work as overrides — if any is set, we use it as-is and don't try to discover.
+// Otherwise we look up tables by title in the base (case-insensitive), then
+// inspect the People and Touchpoints metas to find the link columns.
+//
+// Base ID resolution order:
+//   1. NOCODB_BASE_ID env if set.
+//   2. Inferred from PEOPLE_TABLE_ID env if set (current ensureThreadStateTable pattern).
+//   3. List bases via /api/v2/meta/bases — if exactly one, use it; else error out.
+//
+// Boots before everything else that needs these IDs (audit schema, thread state,
+// prompt body). Failure to resolve is fatal — there's nothing useful Compass can
+// do without the People table.
+
+const CORE_TABLE_TITLES = {
+  PEOPLE_TABLE_ID:       ["People", "people"],
+  COHORTS_TABLE_ID:      ["Cohorts", "cohorts"],
+  TOUCHPOINTS_TABLE_ID:  ["Touchpoints", "touchpoints"],
+  KNOWLEDGE_TABLE_ID:    ["Knowledge", "knowledge", "Compass knowledge"],
+};
+
+async function discoverBaseId() {
+  if (NOCODB_BASE_ID) return NOCODB_BASE_ID;
+  if (PEOPLE_TABLE_ID) {
+    try {
+      const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+      const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+      if (baseId) return baseId;
+    } catch (e) {
+      console.warn(`[migrate] PEOPLE_TABLE_ID->base lookup failed: ${e.message} — falling through to base list`);
+    }
+  }
+  const resp = await ncGet(`/api/v2/meta/bases`);
+  const bases = resp?.list || resp?.bases || resp || [];
+  if (bases.length === 1) return bases[0].id;
+  if (bases.length === 0) throw new Error("[migrate] no NocoDB bases found via /api/v2/meta/bases");
+  throw new Error(`[migrate] found ${bases.length} NocoDB bases — set NOCODB_BASE_ID env to disambiguate`);
+}
+
+async function ensureCoreNocoIds() {
+  // Skip the lookup if every ID is already pinned via env — no work to do.
+  const allPinned = PEOPLE_TABLE_ID && COHORTS_TABLE_ID && TOUCHPOINTS_TABLE_ID &&
+                    KNOWLEDGE_TABLE_ID && COHORTS_LINK_COLUMN_ID && TOUCHPOINTS_PERSON_LINK_COLUMN_ID;
+  if (allPinned) {
+    console.log("[migrate] all core NocoDB IDs pinned via env — skipping auto-discovery");
+    return;
+  }
+
+  let baseId;
+  try {
+    baseId = await discoverBaseId();
+  } catch (e) {
+    console.error(`[migrate] FATAL: could not resolve NocoDB base id: ${e.message}`);
+    process.exit(1);
+  }
+  console.log(`[migrate] resolved NocoDB base: ${baseId}`);
+
+  let tables;
+  try {
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+  } catch (e) {
+    console.error(`[migrate] FATAL: could not list tables in base ${baseId}: ${e.message}`);
+    process.exit(1);
+  }
+
+  function findTableId(candidates) {
+    for (const c of candidates) {
+      const t = tables.find((x) => (x.title || "").toLowerCase() === c.toLowerCase());
+      if (t) return t.id;
+    }
+    return null;
+  }
+
+  // Resolve each table id from its title if not already set
+  const resolved = {};
+  for (const [varName, candidates] of Object.entries(CORE_TABLE_TITLES)) {
+    const current = { PEOPLE_TABLE_ID, COHORTS_TABLE_ID, TOUCHPOINTS_TABLE_ID, KNOWLEDGE_TABLE_ID }[varName];
+    if (current) { resolved[varName] = current; continue; }
+    const id = findTableId(candidates);
+    if (!id) {
+      console.warn(`[migrate] could not auto-discover ${varName} (looked for titles: ${candidates.join(", ")})`);
+      continue;
+    }
+    resolved[varName] = id;
+    console.log(`[migrate] auto-discovered ${varName}: ${id}`);
+  }
+  if (resolved.PEOPLE_TABLE_ID)      PEOPLE_TABLE_ID      = resolved.PEOPLE_TABLE_ID;
+  if (resolved.COHORTS_TABLE_ID)     COHORTS_TABLE_ID     = resolved.COHORTS_TABLE_ID;
+  if (resolved.TOUCHPOINTS_TABLE_ID) TOUCHPOINTS_TABLE_ID = resolved.TOUCHPOINTS_TABLE_ID;
+  if (resolved.KNOWLEDGE_TABLE_ID)   KNOWLEDGE_TABLE_ID   = resolved.KNOWLEDGE_TABLE_ID;
+
+  if (!PEOPLE_TABLE_ID) {
+    console.error("[migrate] FATAL: People table not found by title and no PEOPLE_TABLE_ID env override — cannot continue");
+    process.exit(1);
+  }
+
+  // Resolve link column IDs by inspecting the People + Touchpoints metas.
+  // NocoDB column metas have uidt='Links' (or older 'LinkToAnotherRecord') and
+  // colOptions.fk_related_model_id pointing at the target table.
+  function isLinkColumn(col) {
+    return col?.uidt === "Links" || col?.uidt === "LinkToAnotherRecord";
+  }
+
+  if (!COHORTS_LINK_COLUMN_ID && PEOPLE_TABLE_ID && COHORTS_TABLE_ID) {
+    try {
+      const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+      const link = (peopleMeta?.columns || []).find(
+        (c) => isLinkColumn(c) && c.colOptions?.fk_related_model_id === COHORTS_TABLE_ID
+      );
+      if (link?.id) {
+        COHORTS_LINK_COLUMN_ID = link.id;
+        console.log(`[migrate] auto-discovered COHORTS_LINK_COLUMN_ID: ${link.id} (column "${link.title}")`);
+      } else {
+        console.warn(`[migrate] could not find a link column on People pointing at Cohorts (${COHORTS_TABLE_ID})`);
+      }
+    } catch (e) {
+      console.warn(`[migrate] COHORTS_LINK_COLUMN_ID discovery failed: ${e.message}`);
+    }
+  }
+
+  if (!TOUCHPOINTS_PERSON_LINK_COLUMN_ID && TOUCHPOINTS_TABLE_ID && PEOPLE_TABLE_ID) {
+    try {
+      const tpMeta = await ncGet(`/api/v2/meta/tables/${TOUCHPOINTS_TABLE_ID}`);
+      const link = (tpMeta?.columns || []).find(
+        (c) => isLinkColumn(c) && c.colOptions?.fk_related_model_id === PEOPLE_TABLE_ID
+      );
+      if (link?.id) {
+        TOUCHPOINTS_PERSON_LINK_COLUMN_ID = link.id;
+        console.log(`[migrate] auto-discovered TOUCHPOINTS_PERSON_LINK_COLUMN_ID: ${link.id} (column "${link.title}")`);
+      } else {
+        console.warn(`[migrate] could not find a link column on Touchpoints pointing at People (${PEOPLE_TABLE_ID})`);
+      }
+    } catch (e) {
+      console.warn(`[migrate] TOUCHPOINTS_PERSON_LINK_COLUMN_ID discovery failed: ${e.message}`);
+    }
+  }
+
+  // Sanity warnings — these are not fatal because the relevant tools will
+  // return clear errors if their IDs are missing, but worth flagging at boot.
+  for (const [name, val] of Object.entries({ COHORTS_TABLE_ID, TOUCHPOINTS_TABLE_ID, KNOWLEDGE_TABLE_ID, COHORTS_LINK_COLUMN_ID, TOUCHPOINTS_PERSON_LINK_COLUMN_ID })) {
+    if (!val) console.warn(`[migrate] ${name} unresolved — tools that depend on it will return errors`);
+  }
+}
+await ensureCoreNocoIds();
 
 // Idempotent schema migration for the Agent actions audit table. Adds the
 // `Trace detail` column (LongText) on boot if it doesn't already exist. Self-
