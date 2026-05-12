@@ -3053,6 +3053,62 @@ The from_user_id in the '## Slack message reference' block at the top of the tra
 
 // ---------- Agent loop ----------
 
+// Liberal cap on stdout/stderr from any single code_execution result before
+// it gets pushed onto the conversation history. We pay for the FULL output
+// once when Anthropic returns it (unavoidable), but if it stays in messages
+// every subsequent turn re-bills it as input. Truncation here bounds the
+// per-turn carry-over: a runaway os.walk(".") that dumps 300k chars stops
+// poisoning future turns.
+//
+// 60,000 chars ≈ 15,000 tokens — generous enough for a long CSV dump or a
+// detailed analysis (a 25-row import progress is ~3-5k tokens; even a
+// thorough multi-table summary rarely exceeds 10k). Hard runaway dumps
+// (filesystem walks, log spew) get cut here and don't compound.
+const CODE_EXEC_OUTPUT_CAP_CHARS = 60_000;
+
+function truncateLargeCodeExecOutputs(contentBlocks) {
+  if (!Array.isArray(contentBlocks)) return contentBlocks;
+  let truncatedAny = false;
+  const out = contentBlocks.map((b) => {
+    if (b?.type !== "bash_code_execution_tool_result") return b;
+    const content = b.content;
+    // content shape varies: may be { stdout, stderr, return_code } object,
+    // or array of { type, ... } items. Walk both.
+    function clip(s, label) {
+      if (typeof s !== "string" || s.length <= CODE_EXEC_OUTPUT_CAP_CHARS) return s;
+      truncatedAny = true;
+      const head = s.slice(0, CODE_EXEC_OUTPUT_CAP_CHARS);
+      return `${head}\n\n[…${label} truncated by Compass: original was ${s.length} chars, kept first ${CODE_EXEC_OUTPUT_CAP_CHARS}. Don't dump filesystems or log files; aggregate first.]`;
+    }
+    if (content && typeof content === "object" && !Array.isArray(content)) {
+      return {
+        ...b,
+        content: {
+          ...content,
+          ...(content.stdout ? { stdout: clip(content.stdout, "stdout") } : {}),
+          ...(content.stderr ? { stderr: clip(content.stderr, "stderr") } : {}),
+        },
+      };
+    }
+    if (Array.isArray(content)) {
+      return {
+        ...b,
+        content: content.map((c) => {
+          if (c && typeof c === "object" && typeof c.text === "string") {
+            return { ...c, text: clip(c.text, "text") };
+          }
+          return c;
+        }),
+      };
+    }
+    return b;
+  });
+  if (truncatedAny) {
+    console.warn(`[agent] truncated oversized code_execution output (cap=${CODE_EXEC_OUTPUT_CAP_CHARS} chars)`);
+  }
+  return out;
+}
+
 async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null) {
   // Live progress: posts an "On it…" placeholder right before the FIRST tool
   // dispatch, then edits it in place after each subsequent iteration to add a
@@ -3221,7 +3277,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     if (conversationCostUsd > MAX_USD_PER_CONVERSATION) {
       console.warn(`[agent] budget exhausted on iter=${iteration}: $${conversationCostUsd.toFixed(4)} > $${MAX_USD_PER_CONVERSATION}`);
       // Push the assistant turn before bailing so the audit trail captures it.
-      messages.push({ role: "assistant", content: response.content });
+      messages.push({ role: "assistant", content: truncateLargeCodeExecOutputs(response.content) });
       return {
         ok: false,
         budget_exhausted: true,
@@ -3236,7 +3292,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       };
     }
 
-    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "assistant", content: truncateLargeCodeExecOutputs(response.content) });
 
     const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
 
