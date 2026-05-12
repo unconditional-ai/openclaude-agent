@@ -3637,6 +3637,14 @@ const MAX_FALLBACK_FILES = 5;
 const MAX_FALLBACK_FILE_BYTES = 25 * 1024 * 1024; // Anthropic Files API limit
 async function fetchSlackTriggeringFiles(slackContext) {
   const channel = slackContext?.channel;
+  // Bug fix May 12: n8n's text-path nodes (Mention/DM/Thread → agent) only
+  // pass `thread_ts`, not the actual triggering message `ts`. So when ts is
+  // missing we use thread_ts as a fallback — but we must NOT then pass that
+  // as Slack's `latest` parameter (which means "messages with ts <= latest"),
+  // because thread_ts IS the earliest message in the thread (the parent),
+  // and `latest: parent_ts` filters out all the replies. Just walk the
+  // whole thread/window when we don't have a precise trigger ts.
+  const haveExplicitTs = !!slackContext?.ts && slackContext.ts !== slackContext.thread_ts;
   const triggerTs = slackContext?.ts || slackContext?.thread_ts;
   if (!channel || !triggerTs) {
     console.log(`[slack-files] skipping (missing channel/ts): channel=${channel} triggerTs=${triggerTs}`);
@@ -3645,15 +3653,21 @@ async function fetchSlackTriggeringFiles(slackContext) {
   try {
     let messages = [];
     let scanMode;
-    if (slackContext.thread_ts && slackContext.thread_ts !== slackContext.ts) {
+    if (slackContext.thread_ts) {
       scanMode = "thread";
-      const data = await slackApi("conversations.replies", {
+      const params = {
         channel,
         ts: slackContext.thread_ts,
-        latest: triggerTs,
-        inclusive: true,
         limit: 30,
-      });
+      };
+      // Only constrain to messages up to the trigger when we have a real
+      // trigger ts (not just thread_ts in disguise). Otherwise grab the
+      // whole thread.
+      if (haveExplicitTs) {
+        params.latest = triggerTs;
+        params.inclusive = true;
+      }
+      const data = await slackApi("conversations.replies", params);
       messages = data.messages || [];
     } else {
       scanMode = "channel";
@@ -3661,12 +3675,12 @@ async function fetchSlackTriggeringFiles(slackContext) {
       // a few messages back, not just the triggering one. Common pattern:
       // user uploads CSV, then sends a follow-up "@Compass please import" —
       // the trigger has no files, but the prior message does.
-      const data = await slackApi("conversations.history", {
-        channel,
-        latest: triggerTs,
-        inclusive: true,
-        limit: 10,
-      });
+      const params = { channel, limit: 10 };
+      if (haveExplicitTs) {
+        params.latest = triggerTs;
+        params.inclusive = true;
+      }
+      const data = await slackApi("conversations.history", params);
       messages = (data.messages || []).slice().reverse(); // chronological
     }
 
