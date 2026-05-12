@@ -62,7 +62,7 @@ for (const [k, v] of Object.entries(requiredEnv)) {
 const anthropic = new Anthropic({
   apiKey: ANTHROPIC_API_KEY,
   defaultHeaders: {
-    "anthropic-beta": "code-execution-2025-08-25,files-api-2025-04-14",
+    "anthropic-beta": "code-execution-2026-01-20,files-api-2025-04-14",
   },
 });
 
@@ -2791,7 +2791,7 @@ const tools = [
   // container_upload blocks (Files API) land in /mnt/user-data/uploads/.
   // See https://docs.claude.com/en/docs/agents-and-tools/tool-use/code-execution-tool
   {
-    type: "code_execution_20250825",
+    type: "code_execution_20260120",
     name: "code_execution",
   },
   {
@@ -3759,6 +3759,46 @@ const tools = [
   },
 ];
 
+// ---------- Programmatic tool calling (sandbox → tools) ----------
+//
+// code_execution_20260120 lets Python in the sandbox call our tools directly
+// via `await tool_name(args)` — bypassing the model for per-row work like
+// CSV import loops. The model writes ONE Python block; the sandbox runs it
+// and tool calls flow through the API as normal tool_use blocks tagged with
+// a `caller: { type: "code_execution_20260120" }` field.
+//
+// We opt tools in by adding `allowed_callers: ["code_execution_20260120"]`.
+// Restrict to safe reads + write tools that already have idempotency baked in
+// (create_person checks email, add_note appends, toggle_stage cascades). All
+// confirmation-gated tools and Slack-side post-effects stay model-only — the
+// sandbox can't bypass a user gate or post messages without the model's
+// explicit go.
+//
+// Done as a post-pass over the tools array so we don't have to remember to
+// add the field to every individual definition above.
+
+const SANDBOX_CALLABLE_TOOLS = new Set([
+  // Reads — always safe
+  "lookup_person", "lookup_cohort", "list_people", "find_person_by_phone",
+  "get_person_full", "query_table", "list_tables", "list_recent_actions",
+  "recall_knowledge", "list_clickup_tasks", "find_clickup_list",
+  "list_jotform_submissions", "get_jotform_submission",
+  "get_docuseal_submission", "list_skills", "load_skill",
+  "view_prompt_body", "view_prompt_history",
+  "check_calendar_availability", "lookup_slack_user", "read_channel_history",
+  "get_message_permalink", "list_slack_reminders",
+  // Writes — idempotent or already non-destructive
+  "create_person", "update_person", "toggle_stage", "add_note",
+  "log_touchpoint", "link_person_to_cohort", "pin_knowledge",
+  "bulk_create_records",
+]);
+
+for (const t of tools) {
+  if (t?.name && SANDBOX_CALLABLE_TOOLS.has(t.name)) {
+    t.allowed_callers = ["code_execution_20260120"];
+  }
+}
+
 // ---------- System prompt ----------
 //
 // Architecture: KERNEL_TOP (in code) + editable body (NocoDB) + KERNEL_BOTTOM (in code).
@@ -3882,6 +3922,25 @@ DO NOT use os.walk(".") or scan the whole filesystem — it dumps thousands of u
 
 Big files (10s of MB):
 container_upload is the only sane option — they'd blow input tokens otherwise. Treat the sandbox as your workspace: read with chunked pandas, write transformed output back to the sandbox, return summaries (not raw data) to the user. Don't print 50,000 rows to stdout — that DOES cost tokens. Aggregate first, print the summary.
+
+CALLING TOOLS FROM INSIDE PYTHON (sandbox → host tools):
+A subset of your tools is callable directly from the code_execution sandbox via "await tool_name(args)" — no round-trip through the model. Use this for per-row work in big imports (lookup_person × 50, create_person × 50) where the model layer adds nothing but cost and latency. The model writes ONE Python block; the tools run inside the sandbox and results land back in the same Python scope.
+
+Callable from sandbox: lookup_person, create_person, update_person, toggle_stage, add_note, log_touchpoint, link_person_to_cohort, lookup_cohort, list_people, query_table, list_tables, recall_knowledge, pin_knowledge, find_person_by_phone, get_person_full, list_clickup_tasks, list_recent_actions, view_prompt_body, view_prompt_history, list_skills, load_skill, read_channel_history, lookup_slack_user, list_slack_reminders, list_jotform_submissions, get_jotform_submission, check_calendar_availability, bulk_create_records.
+
+NOT callable from sandbox (must run through the model): everything confirmation-gated (update_payment, calendar writes, deletes, bulk_import_people, schema changes, prompt edits) and all Slack-message-posting tools. The model has to be in the loop for those — the gates exist for a reason and silent posts are jarring.
+
+Example: importing 80 rows from a CSV. Without sandbox tool calling, you'd loop the model 80 times. With it:
+
+  import pandas as pd
+  df = pd.read_csv("/files/input/sample.csv")
+  results = []
+  for _, row in df.iterrows():
+      r = await create_person({"email": row["email"], "name": row["name"], "cohort_name": "May 9 2026"})
+      results.append({"email": row["email"], "status": "created" if not r.get("already_existed") else "existed"})
+  print(f"{sum(1 for r in results if r['status'] == 'created')} created, {sum(1 for r in results if r['status'] == 'existed')} already existed")
+
+One model turn, 80 sandbox-side tool calls, ~5-10x cheaper. For unsafe tools (anything gated), do the gate dance in the model layer first, THEN drop into Python for the bulk per-row execution.
 
 Generated output files:
 If code_execution writes a file (e.g. a cleaned CSV, a chart), the response includes a file_id you can pass back to the user via Slack file upload (ask Nathan if you need that capability wired up — currently we don't have a "send file to Slack" tool).
@@ -4579,8 +4638,13 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         //   •  succeeded but de-duped via the action ledger ("already done")
         //   ⚠  errored (don't kill the run; agent may recover next turn)
         // pushProgress() collapses consecutive duplicates ("Looked up person ×3").
+        // Sandbox-originated calls (programmatic tool calling via
+        // code_execution_20260120) get a small "(sandbox)" tag so the user
+        // can tell when a Python loop is doing the work vs. the model.
         const marker = result?.error ? ":warning:" : (result?.already_done || result?.already_existed) ? ":small_blue_diamond:" : ":white_check_mark:";
-        pushProgress(marker, humanizeToolName(block.name));
+        const fromSandbox = block.caller?.type === "code_execution_20260120";
+        const label = humanizeToolName(block.name) + (fromSandbox ? " _(sandbox)_" : "");
+        pushProgress(marker, label);
       }
       // Single chat.update per iteration (batches all of this turn's tool
       // status lines into one Slack edit, avoids spamming the API).
