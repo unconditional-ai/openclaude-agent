@@ -3130,7 +3130,13 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     try {
       response = await anthropic.messages.create({
         model: AGENT_MODEL,
-        max_tokens: 2048,
+        // 8192 (was 2048): server-side tools like code_execution count their
+        // bash + tool_result blocks toward output_tokens, and a multi-tool
+        // turn (e.g. several Python snippets while parsing a CSV) easily
+        // crosses 2048. Hitting max_tokens with server-side tool blocks
+        // returns ok=false from the loop — work gets truncated mid-task.
+        // Opus 4.7 supports ≥32k output; 8192 is plenty of headroom.
+        max_tokens: 8192,
         system: [
           { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
         ],
@@ -3705,14 +3711,25 @@ async function fetchSlackTriggeringFiles(slackContext) {
     }
 
     // Walk recent messages in reverse-chronological order, collecting files
-    // until we hit the cap. De-dupe by file id (a Slack file can appear in
-    // both file_shared and the message subtype event).
-    const seen = new Set();
+    // until we hit the cap. De-dupe by file id first (a Slack file can
+    // appear in both file_shared and the message subtype event), then by
+    // (name, size) since users often re-upload the same CSV multiple times
+    // when testing — we only need one copy and uploading three of the same
+    // file inflates input tokens AND breaks prompt caching turn-over-turn
+    // (different anthropic file_ids = different prompt prefix).
+    const seenIds = new Set();
+    const seenContent = new Set(); // key = `${name}|${size}`
     const collected = [];
     for (let i = messages.length - 1; i >= 0; i--) {
       for (const f of messages[i].files || []) {
-        if (!f?.id || seen.has(f.id)) continue;
-        seen.add(f.id);
+        if (!f?.id || seenIds.has(f.id)) continue;
+        const contentKey = `${f.name || ""}|${f.size || 0}`;
+        if (seenContent.has(contentKey)) {
+          console.log(`[slack-files] dedup: skipping ${f.id} — same name+size as already-collected (${contentKey})`);
+          continue;
+        }
+        seenIds.add(f.id);
+        seenContent.add(contentKey);
         collected.push(f);
         if (collected.length >= MAX_FALLBACK_FILES) break;
       }
