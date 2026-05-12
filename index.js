@@ -3067,11 +3067,16 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // If files were uploaded to the Files API at the n8n boundary, attach them
   // as content blocks on the first user message so Claude sees them natively.
   // Block-type routing:
-  //   - text/csv, application/json, text/* → container_upload (lands in code-
-  //     exec sandbox at /mnt/user-data/uploads/<filename>)
-  //   - application/pdf → document block (model reads directly)
   //   - image/* → image block
-  //   - everything else → container_upload (best fallback; agent can decide)
+  //   - application/pdf / text/plain / text/markdown → document block
+  //   - text/csv / application/json / etc. → container_upload (sandbox)
+  //
+  // For small text-based files (CSV/JSON ≤ 30KB) the server-side fallback
+  // also captured the raw bytes as `inline_text`. We append a text block
+  // with the file's content right after — belt-and-braces so Compass can
+  // read the data directly even if container_upload doesn't deliver to the
+  // sandbox (which has been unreliable). For files coming directly from
+  // n8n we don't have the bytes, so they get container_upload only.
   let initialContent;
   if (attachments && attachments.length > 0) {
     const blocks = [{ type: "text", text: transcript }];
@@ -3082,8 +3087,16 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       } else if (mime === "application/pdf" || mime === "text/plain" || mime === "text/markdown") {
         blocks.push({ type: "document", source: { type: "file", file_id: a.file_id } });
       } else {
-        // CSV / JSON / Excel / unknown → push to code-exec sandbox
         blocks.push({ type: "container_upload", file_id: a.file_id });
+      }
+      // If we have inline text bytes (small text-based file via server-side
+      // fallback), inject as a text block so Compass can read it directly.
+      if (a.inline_text) {
+        const fence = "```";
+        blocks.push({
+          type: "text",
+          text: `Inline content of ${a.name || "attached file"} (${a.mimetype || "unknown"}, ${a.size || 0} bytes):\n\n${fence}\n${a.inline_text}\n${fence}`,
+        });
       }
     }
     initialContent = blocks;
@@ -3757,27 +3770,37 @@ async function fetchSlackTriggeringFiles(slackContext) {
   return collected.slice(0, MAX_FALLBACK_FILES);
 }
 
-// Per-process cache of slack_file_id -> anthropic_file_id. Files API uploads
-// are free, but re-uploading the same CSV produces a new file_id and breaks
-// prompt caching. Cache is wiped on Render restart; that's fine.
+// Per-process cache of slack_file_id -> anthropic upload result (file_id +
+// inline text content for small text files). Files API uploads are free, but
+// re-uploading the same CSV produces a new file_id and breaks prompt caching.
+// Cache is wiped on Render restart; that's fine.
 const _slackToAnthropicFileCache = new Map();
+
+// Threshold below which text-based files get inlined into the user message
+// as a text block (in addition to container_upload). Belt-and-braces so
+// Compass can read content even if container_upload doesn't deliver to the
+// sandbox. CSVs in our workflow are typically 5-15 KB.
+const INLINE_TEXT_MAX_BYTES = 30 * 1024;
+function isInlinableMime(mime) {
+  if (!mime) return false;
+  return (
+    mime.startsWith("text/") ||
+    mime === "application/json" ||
+    mime === "application/x-ndjson" ||
+    mime === "application/csv"
+  );
+}
 
 // Download a Slack file's bytes via url_private_download, then upload to the
 // Anthropic Files API. Returns an attachments[] entry shaped to match what
-// n8n's mention-path sub-flow produces. Throws on hard errors so the caller
-// can log and skip — we don't want one bad file to take down the whole run.
+// n8n's mention-path sub-flow produces. For small text files, also includes
+// the decoded content as `inline_text` so runAgent can inject it directly
+// into the user message. Throws on hard errors so the caller can log and
+// skip — we don't want one bad file to take down the whole run.
 async function uploadSlackFileToAnthropic(file) {
   if (!file?.id) throw new Error("missing slack file id");
   const cached = _slackToAnthropicFileCache.get(file.id);
-  if (cached) {
-    return {
-      file_id: cached,
-      name: file.name || "unnamed",
-      mimetype: file.mimetype || "application/octet-stream",
-      size: file.size || 0,
-      slack_file_id: file.id,
-    };
-  }
+  if (cached) return cached;
   if (file.size && file.size > MAX_FALLBACK_FILE_BYTES) {
     throw new Error(`file ${file.name || file.id} exceeds ${MAX_FALLBACK_FILE_BYTES} bytes`);
   }
@@ -3809,14 +3832,30 @@ async function uploadSlackFileToAnthropic(file) {
   }
   const data = await upRes.json();
   if (!data.id) throw new Error(`anthropic files response missing id: ${JSON.stringify(data).slice(0, 200)}`);
-  _slackToAnthropicFileCache.set(file.id, data.id);
-  return {
+
+  // For small text-based files, decode the bytes for inline injection. This
+  // makes Compass able to read the content directly without relying on
+  // container_upload + code_execution to deliver the file to the sandbox
+  // (which has been unreliable in production).
+  let inlineText = null;
+  if (isInlinableMime(mime) && buf.length <= INLINE_TEXT_MAX_BYTES) {
+    try {
+      inlineText = buf.toString("utf8");
+    } catch (e) {
+      console.warn(`[slack-files] couldn't decode ${file.name} as utf8: ${e.message}`);
+    }
+  }
+
+  const result = {
     file_id: data.id,
     name: file.name || "unnamed",
     mimetype: mime,
     size: file.size || buf.length,
     slack_file_id: file.id,
+    inline_text: inlineText,
   };
+  _slackToAnthropicFileCache.set(file.id, result);
+  return result;
 }
 
 // Fetch recent channel messages (top-level only) for context when the user posts at the channel level.
