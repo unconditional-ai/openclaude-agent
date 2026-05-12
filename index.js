@@ -21,6 +21,7 @@ const {
   TOUCHPOINTS_PERSON_LINK_COLUMN_ID,
   AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
   KNOWLEDGE_TABLE_ID,
+  COMPASS_PROMPT_TABLE_ID,
 
   SLACK_BOT_TOKEN,
   AGENT_MODEL = "claude-sonnet-4-6",
@@ -1652,6 +1653,114 @@ const toolImpls = {
     };
   },
 
+  // Patch an existing calendar event. Lets Compass reschedule or amend an
+  // event it (or a human) created earlier without recreating it. All fields
+  // optional except event_id — only the supplied fields are changed.
+  async update_calendar_event({ event_id, datetime = null, duration_minutes = null, title = null, description = null, location = null, send_updates = false, confirmed = false }) {
+    if (!event_id) return { error: "event_id required (from create_calendar_event response)" };
+    if (!confirmed) {
+      const changes = [];
+      if (datetime) changes.push(`start → ${datetime}`);
+      if (duration_minutes) changes.push(`duration → ${duration_minutes}min`);
+      if (title) changes.push(`title → "${title}"`);
+      if (description) changes.push(`description (replaced)`);
+      if (location) changes.push(`location → "${location}"`);
+      if (!changes.length) return { error: "Nothing to update — pass at least one of datetime, duration_minutes, title, description, location" };
+      return pendingConfirmation(
+        `Update calendar event ${event_id}: ${changes.join(", ")}${send_updates ? " (attendees WILL be emailed)" : " (no email to attendees)"}`,
+        { event_id, datetime, duration_minutes, title, description, location, send_updates, confirmed: true }
+      );
+    }
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    const patch = {};
+    if (title) patch.summary = title;
+    if (description) patch.description = description;
+    if (location) patch.location = location;
+    if (datetime) {
+      const startUTC = new Date(datetime);
+      if (isNaN(startUTC.getTime())) return { error: `Invalid datetime: ${datetime}` };
+      patch.start = { dateTime: startUTC.toISOString() };
+      // If duration provided alongside datetime, compute end from start+duration.
+      // Otherwise fetch the existing event to preserve original duration.
+      if (duration_minutes) {
+        const endUTC = new Date(startUTC.getTime() + duration_minutes * 60000);
+        patch.end = { dateTime: endUTC.toISOString() };
+      } else {
+        const getRes = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event_id}`,
+          { headers: { authorization: `Bearer ${accessToken}` } }
+        );
+        const existing = await getRes.json();
+        if (!getRes.ok) return { error: `Calendar API ${getRes.status}: ${existing.error?.message || JSON.stringify(existing)}` };
+        const origStart = new Date(existing.start?.dateTime || existing.start?.date);
+        const origEnd = new Date(existing.end?.dateTime || existing.end?.date);
+        const origDurationMs = origEnd.getTime() - origStart.getTime();
+        patch.end = { dateTime: new Date(startUTC.getTime() + origDurationMs).toISOString() };
+      }
+    } else if (duration_minutes) {
+      // Duration changed but start unchanged — fetch start to compute new end.
+      const getRes = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event_id}`,
+        { headers: { authorization: `Bearer ${accessToken}` } }
+      );
+      const existing = await getRes.json();
+      if (!getRes.ok) return { error: `Calendar API ${getRes.status}: ${existing.error?.message || JSON.stringify(existing)}` };
+      const startUTC = new Date(existing.start?.dateTime || existing.start?.date);
+      patch.end = { dateTime: new Date(startUTC.getTime() + duration_minutes * 60000).toISOString() };
+    }
+    const sendUpdates = send_updates ? "all" : "none";
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event_id}?sendUpdates=${sendUpdates}`,
+      {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      }
+    );
+    const evt = await res.json();
+    if (!res.ok) return { error: `Calendar API ${res.status}: ${evt.error?.message || JSON.stringify(evt)}` };
+    return {
+      event_id: evt.id,
+      html_link: evt.htmlLink,
+      start_utc: evt.start?.dateTime,
+      end_utc: evt.end?.dateTime,
+      updates_emailed: send_updates,
+    };
+  },
+
+  // Cancel a calendar event. send_cancellations controls whether attendees
+  // get a Google-generated cancellation email.
+  async delete_calendar_event({ event_id, send_cancellations = false, confirmed = false }) {
+    if (!event_id) return { error: "event_id required" };
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Delete calendar event ${event_id}${send_cancellations ? " (attendees WILL be emailed a cancellation)" : " (no email to attendees)"}`,
+        { event_id, send_cancellations, confirmed: true }
+      );
+    }
+    let accessToken;
+    try {
+      accessToken = await getGmailAccessToken();
+    } catch (e) {
+      return { error: e.message };
+    }
+    const sendUpdates = send_cancellations ? "all" : "none";
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${event_id}?sendUpdates=${sendUpdates}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${accessToken}` } }
+    );
+    if (res.status === 204 || res.status === 200) {
+      return { ok: true, event_id, cancellations_emailed: send_cancellations };
+    }
+    const data = await res.json().catch(() => ({}));
+    return { error: `Calendar API ${res.status}: ${data.error?.message || JSON.stringify(data)}` };
+  },
+
   // Read values from a Google Sheet. Read-only — uses the spreadsheets.readonly
   // scope. Accepts a bare spreadsheet ID or a full sheets.google.com URL (we
   // extract the ID from the /d/<ID>/ segment). `range` is A1 notation
@@ -1873,6 +1982,39 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     return { ok: true, channel, message_ts, name };
   },
 
+  async send_channel_message({ channel, message, thread_ts = null }) {
+    if (!channel || !message) return { error: "channel and message are both required" };
+    // Accept Slack IDs (C..., G...) or friendly names like 'project-get-proactive'
+    // or '#project-get-proactive'. chat.postMessage accepts both, but the # form
+    // is deprecated; we still pass it through and let Slack resolve.
+    const target = /^[CG][A-Z0-9]+$/.test(channel)
+      ? channel
+      : `#${String(channel).replace(/^#/, "")}`;
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        channel: target,
+        text: toSlackMrkdwn(message),
+        ...(thread_ts ? { thread_ts } : {}),
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      const err = data.error || JSON.stringify(data);
+      if (err === "not_in_channel" || err === "channel_not_found") {
+        return {
+          error: `Slack chat.postMessage failed: ${err}. The bot needs to be invited to the channel first — ask the user to '/invite @Compass' in that channel.`,
+        };
+      }
+      return { error: `Slack chat.postMessage failed: ${err}` };
+    }
+    return { ok: true, channel: data.channel, ts: data.ts };
+  },
+
   async send_slack_dm({ to, message, thread_link = null }) {
     if (!to || !message) return { error: "to and message are both required" };
     let userId = null;
@@ -2030,6 +2172,224 @@ ${location ? `<p>Location: ${location}</p>` : ""}
     };
   },
 
+  async delete_slack_reminder({ scheduled_message_id, channel }) {
+    if (!scheduled_message_id || !channel) {
+      return { error: "scheduled_message_id and channel are both required (read both from list_slack_reminders output)" };
+    }
+    const res = await fetch("https://slack.com/api/chat.deleteScheduledMessage", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ channel, scheduled_message_id }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      return { error: `Slack chat.deleteScheduledMessage failed: ${data.error || JSON.stringify(data)}` };
+    }
+    return { ok: true, scheduled_message_id, channel };
+  },
+
+  // Read recent messages from a Slack channel. Use when the user wants context
+  // from elsewhere — "what did Valerie say about deposits in #ops", "scan
+  // #intake for unanswered questions". Bot must be a member of the channel.
+  async read_channel_history({ channel, limit = 20, oldest = null, latest = null }) {
+    if (!channel) return { error: "channel required (ID like C0B2W2U5MQ9 or G... — channel names not accepted here, look up the ID first)" };
+    const params = { channel, limit: Math.min(Math.max(Number(limit) || 20, 1), 100) };
+    if (oldest) params.oldest = oldest;
+    if (latest) params.latest = latest;
+    let data;
+    try {
+      data = await slackApi("conversations.history", params);
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (msg.includes("not_in_channel") || msg.includes("channel_not_found")) {
+        return { error: `${msg}. Ask the user to /invite @Compass to the channel.` };
+      }
+      if (msg.includes("missing_scope")) {
+        return { error: `${msg}. The bot needs channels:history (public) / groups:history (private) scopes added.` };
+      }
+      return { error: msg };
+    }
+    const messages = await Promise.all(
+      (data.messages || []).map(async (m) => ({
+        ts: m.ts,
+        user_id: m.user || m.bot_id || null,
+        user_name: m.user ? await getUserName(m.user) : (m.username || "bot"),
+        text: m.text || "",
+        thread_ts: m.thread_ts || null,
+        reply_count: m.reply_count || 0,
+        subtype: m.subtype || null,
+      }))
+    );
+    return {
+      channel,
+      count: messages.length,
+      has_more: !!data.has_more,
+      messages,
+    };
+  },
+
+  // Look up a Slack user by email, user_id, or friendly name. Use when the
+  // user asks Compass to message someone whose ID isn't in the env-var map.
+  async lookup_slack_user({ email = null, user_id = null, name = null }) {
+    if (!email && !user_id && !name) {
+      return { error: "Pass one of: email, user_id, or name ('yohan'/'valerie'/'nathan')" };
+    }
+    let resolvedId = user_id;
+    if (!resolvedId && name) {
+      const map = {
+        yohan: process.env.YOHAN_SLACK_ID,
+        valerie: process.env.VALERIE_SLACK_ID,
+        nathan: process.env.NATHAN_SLACK_ID,
+      };
+      resolvedId = map[String(name).toLowerCase().trim()] || null;
+      if (!resolvedId) return { error: `No mapping for name '${name}'. Try email instead.` };
+    }
+    if (!resolvedId && email) {
+      try {
+        const data = await slackApi("users.lookupByEmail", { email });
+        resolvedId = data.user?.id;
+      } catch (e) {
+        const msg = String(e.message || e);
+        if (msg.includes("users_not_found")) return { error: `No Slack user found for email ${email}` };
+        if (msg.includes("missing_scope")) return { error: `${msg}. Bot needs users:read.email scope.` };
+        return { error: msg };
+      }
+    }
+    if (!resolvedId) return { error: "Could not resolve a user_id" };
+    let info;
+    try {
+      info = await slackApi("users.info", { user: resolvedId });
+    } catch (e) {
+      return { error: String(e.message || e) };
+    }
+    const u = info.user || {};
+    return {
+      user_id: u.id,
+      real_name: u.real_name || u.profile?.real_name || null,
+      display_name: u.profile?.display_name || null,
+      email: u.profile?.email || null,
+      is_bot: !!u.is_bot,
+      tz: u.tz || null,
+    };
+  },
+
+  // Edit a message Compass previously posted. Slack restricts chat.update to
+  // messages sent by the bot itself.
+  async update_message({ channel, ts, message }) {
+    if (!channel || !ts || !message) return { error: "channel, ts, and message are all required" };
+    const res = await fetch("https://slack.com/api/chat.update", {
+      method: "POST",
+      headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ channel, ts, text: toSlackMrkdwn(message) }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      const err = data.error || JSON.stringify(data);
+      if (err === "cant_update_message" || err === "message_not_found") {
+        return { error: `Slack chat.update failed: ${err}. Compass can only edit its own messages.` };
+      }
+      return { error: `Slack chat.update failed: ${err}` };
+    }
+    return { ok: true, channel: data.channel, ts: data.ts };
+  },
+
+  // Delete a message Compass previously posted. Same restriction as update.
+  async delete_message({ channel, ts }) {
+    if (!channel || !ts) return { error: "channel and ts are both required" };
+    const res = await fetch("https://slack.com/api/chat.delete", {
+      method: "POST",
+      headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ channel, ts }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      const err = data.error || JSON.stringify(data);
+      if (err === "cant_delete_message" || err === "message_not_found") {
+        return { error: `Slack chat.delete failed: ${err}. Compass can only delete its own messages.` };
+      }
+      return { error: `Slack chat.delete failed: ${err}` };
+    }
+    return { ok: true, channel, ts };
+  },
+
+  // Get a permanent link to a Slack message. Useful for cross-linking — DM
+  // someone with a permalink back to a channel thread.
+  async get_message_permalink({ channel, message_ts }) {
+    if (!channel || !message_ts) return { error: "channel and message_ts are both required" };
+    try {
+      const data = await slackApi("chat.getPermalink", { channel, message_ts });
+      return { ok: true, permalink: data.permalink };
+    } catch (e) {
+      return { error: String(e.message || e) };
+    }
+  },
+
+  // Upload a text/CSV file to Slack and share it into a channel or DM. Uses
+  // the modern external-upload flow (files.upload v1 was deprecated May 2025).
+  // Best for artifacts Compass generates inline: CSV exports, import diffs,
+  // text summaries. Not for binary files — `content` is a UTF-8 string.
+  async upload_file({ filename, content, channel = null, thread_ts = null, comment = null, title = null }) {
+    if (!filename || content == null) return { error: "filename and content are both required" };
+    const bytes = Buffer.from(String(content), "utf8");
+    // Step 1: get an upload URL.
+    const urlRes = await fetch("https://slack.com/api/files.getUploadURLExternal", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ filename, length: String(bytes.length) }).toString(),
+    });
+    const urlData = await urlRes.json();
+    if (!urlData.ok) {
+      const err = urlData.error || JSON.stringify(urlData);
+      if (err === "missing_scope") {
+        return { error: `${err}. Bot needs files:write scope.` };
+      }
+      return { error: `Slack files.getUploadURLExternal failed: ${err}` };
+    }
+    // Step 2: PUT the bytes to the returned URL.
+    const putRes = await fetch(urlData.upload_url, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: bytes,
+    });
+    if (!putRes.ok) {
+      return { error: `File upload failed (${putRes.status}): ${await putRes.text()}` };
+    }
+    // Step 3: complete the upload, optionally sharing into a channel.
+    const completeBody = {
+      files: [{ id: urlData.file_id, ...(title ? { title } : {}) }],
+      ...(channel ? { channel_id: channel } : {}),
+      ...(thread_ts ? { thread_ts } : {}),
+      ...(comment ? { initial_comment: comment } : {}),
+    };
+    const completeRes = await fetch("https://slack.com/api/files.completeUploadExternal", {
+      method: "POST",
+      headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(completeBody),
+    });
+    const completeData = await completeRes.json();
+    if (!completeData.ok) {
+      const err = completeData.error || JSON.stringify(completeData);
+      if (err === "not_in_channel") {
+        return { error: `${err}. Bot needs to be invited to the channel before sharing files there.` };
+      }
+      return { error: `Slack files.completeUploadExternal failed: ${err}` };
+    }
+    const file = completeData.files?.[0] || {};
+    return {
+      ok: true,
+      file_id: file.id,
+      title: file.title,
+      permalink: file.permalink,
+      channel_shared: channel || null,
+    };
+  },
+
   // ---------- Introspection ----------
   // Lets the agent answer questions about itself (scopes, tool inventory,
   // deploy version, integration wiring) instead of guessing or stalling.
@@ -2095,6 +2455,10 @@ ${location ? `<p>Location: ${location}</p>` : ""}
         jotform: {
           JOTFORM_API_KEY: !!process.env.JOTFORM_API_KEY,
           JOTFORM_INTAKE_FORM_ID: !!process.env.JOTFORM_INTAKE_FORM_ID,
+        },
+        docuseal: {
+          DOCUSEAL_API_KEY: !!process.env.DOCUSEAL_API_KEY,
+          DOCUSEAL_DEFAULT_TEMPLATE_ID: !!process.env.DOCUSEAL_DEFAULT_TEMPLATE_ID,
         },
       },
     };
@@ -2170,6 +2534,214 @@ ${location ? `<p>Location: ${location}</p>` : ""}
           .filter((a) => a.answer != null && a.answer !== "")
           .map((a) => [a.text || a.name || a.qid, a.prettyFormat || a.answer]),
       ),
+    };
+  },
+
+  // ---------- DocuSeal ----------
+  // Send contracts and check signature status. Auth via DOCUSEAL_API_KEY env
+  // var. The bot uses one configured template (DOCUSEAL_DEFAULT_TEMPLATE_ID)
+  // by default — pass template_id to override.
+
+  async create_docuseal_submission({ person_id, template_id = null, send_email = true, confirmed = false }) {
+    const apiKey = process.env.DOCUSEAL_API_KEY;
+    if (!apiKey) return { error: "DOCUSEAL_API_KEY not configured" };
+    const tmplId = template_id || process.env.DOCUSEAL_DEFAULT_TEMPLATE_ID;
+    if (!tmplId) return { error: "template_id required (or set DOCUSEAL_DEFAULT_TEMPLATE_ID env var)" };
+    if (!person_id) return { error: "person_id required" };
+
+    const personRes = await ncGet(
+      `/api/v2/tables/${PEOPLE_TABLE_ID}/records?where=${encodeURIComponent(`(Id,eq,${person_id})`)}&limit=1`
+    );
+    if (!personRes.list || !personRes.list[0]) return { error: `Person ${person_id} not found` };
+    const p = personRes.list[0];
+    const name = p.Name;
+    const email = p["Primary email"];
+    if (!email) return { error: `Person ${person_id} has no Primary email` };
+
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Send DocuSeal contract (template ${tmplId}) to ${name} <${email}>${send_email ? " — DocuSeal WILL email them the signing link" : " — no email, returned link must be sent manually"}`,
+        { person_id, template_id: tmplId, send_email, confirmed: true }
+      );
+    }
+
+    const res = await fetch("https://api.docuseal.com/submissions", {
+      method: "POST",
+      headers: { "X-Auth-Token": apiKey, "content-type": "application/json" },
+      body: JSON.stringify({
+        template_id: Number(tmplId),
+        send_email,
+        submitters: [{ email, name, role: "Signer" }],
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `DocuSeal ${res.status}: ${data.error || JSON.stringify(data)}` };
+    // DocuSeal returns an array of submitters when a submission is created.
+    const first = Array.isArray(data) ? data[0] : data;
+    return {
+      ok: true,
+      submission_id: first.submission_id || first.id,
+      submitter_id: first.id,
+      email,
+      name,
+      signing_url: first.embed_src || first.slug || null,
+      status: first.status || "pending",
+      email_sent: send_email,
+    };
+  },
+
+  async get_docuseal_submission({ submission_id }) {
+    const apiKey = process.env.DOCUSEAL_API_KEY;
+    if (!apiKey) return { error: "DOCUSEAL_API_KEY not configured" };
+    if (!submission_id) return { error: "submission_id required" };
+    const res = await fetch(`https://api.docuseal.com/submissions/${submission_id}`, {
+      headers: { "X-Auth-Token": apiKey },
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `DocuSeal ${res.status}: ${data.error || JSON.stringify(data)}` };
+    return {
+      submission_id: data.id,
+      template_id: data.template?.id,
+      status: data.status,
+      audit_log_url: data.audit_log_url,
+      submitters: (data.submitters || []).map((s) => ({
+        id: s.id,
+        email: s.email,
+        name: s.name,
+        status: s.status,
+        sent_at: s.sent_at,
+        opened_at: s.opened_at,
+        completed_at: s.completed_at,
+      })),
+    };
+  },
+
+  // ---------- Prompt-body editing (NocoDB-backed) ----------
+  // The substantive part of Compass's own system prompt lives in NocoDB so
+  // Yohan/Valerie can edit it from Slack ("stop using emojis", "always log
+  // touchpoints in past tense", etc.) without a code change. See KERNEL_BOTTOM
+  // "PROMPT EDITING" section. Append-only: every edit writes a new versioned
+  // row to compass_prompt; nothing is overwritten, so history doubles as the
+  // audit trail and the revert path.
+
+  async view_prompt_body() {
+    return {
+      version: cachedPromptVersion,
+      updated_by: cachedPromptUpdatedBy,
+      updated_at: cachedPromptUpdatedAt,
+      length: (cachedPromptBody || "").length,
+      body: cachedPromptBody || SEED_PROMPT_BODY,
+      persistent: !!PROMPT_TABLE.tableId,
+      note: PROMPT_TABLE.tableId
+        ? "Operator-managed body. Edit via edit_prompt_body or replace_prompt_body."
+        : "compass_prompt table not available — showing the in-code SEED fallback. Edits cannot be persisted in this environment.",
+    };
+  },
+
+  async edit_prompt_body({ old_string, new_string, reason, updated_by, confirmed = false }) {
+    if (typeof old_string !== "string" || old_string.length === 0) {
+      return { error: "old_string is required and must be non-empty" };
+    }
+    if (typeof new_string !== "string") {
+      return { error: "new_string is required (use empty string to delete the matched section)" };
+    }
+    const current = cachedPromptBody || SEED_PROMPT_BODY;
+    const idx = current.indexOf(old_string);
+    if (idx === -1) {
+      return { error: "old_string not found in current prompt body. Use view_prompt_body to see exact text. Whitespace and punctuation must match exactly." };
+    }
+    if (current.indexOf(old_string, idx + old_string.length) !== -1) {
+      return { error: "old_string is not unique in the prompt body — found multiple matches. Provide a longer surrounding context to disambiguate." };
+    }
+    const proposed = current.slice(0, idx) + new_string + current.slice(idx + old_string.length);
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Edit operator-managed prompt body (v${cachedPromptVersion} → v${cachedPromptVersion + 1}). Reason: ${reason || "(none given)"}. Diff:\n${diffPreview(old_string, new_string)}`,
+        { old_string, new_string, reason, updated_by, confirmed: true }
+      );
+    }
+    const { version } = await savePromptBody({ newBody: proposed, reason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version,
+      length: proposed.length,
+      note: "Prompt body updated. The new version is live for subsequent /run calls.",
+    };
+  },
+
+  async replace_prompt_body({ new_body, reason, updated_by, confirmed = false }) {
+    if (typeof new_body !== "string" || new_body.length === 0) {
+      return { error: "new_body is required and must be non-empty" };
+    }
+    const current = cachedPromptBody || SEED_PROMPT_BODY;
+    if (!confirmed) {
+      const sizeChange = new_body.length - current.length;
+      return pendingConfirmation(
+        `FULL REWRITE of operator-managed prompt body (v${cachedPromptVersion} → v${cachedPromptVersion + 1}). Old: ${current.length} chars. New: ${new_body.length} chars (${sizeChange >= 0 ? "+" : ""}${sizeChange}). Reason: ${reason || "(none given)"}. First 400 chars of new body:\n${new_body.slice(0, 400)}${new_body.length > 400 ? "\n…[truncated]" : ""}`,
+        { new_body, reason, updated_by, confirmed: true }
+      );
+    }
+    const { version } = await savePromptBody({ newBody: new_body, reason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version,
+      length: new_body.length,
+      note: "Prompt body fully replaced. The new version is live for subsequent /run calls.",
+    };
+  },
+
+  async view_prompt_history({ limit = 10 } = {}) {
+    if (!PROMPT_TABLE.tableId) {
+      return { error: "compass_prompt table not available — no history in this environment" };
+    }
+    const cap = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 50);
+    const data = await ncGet(`/api/v2/tables/${PROMPT_TABLE.tableId}/records?limit=${cap}&sort=-Version&fields=Id,Version,UpdatedBy,Reason,CreatedAt,UpdatedAt`);
+    return {
+      count: data.list?.length || 0,
+      current_version: cachedPromptVersion,
+      versions: (data.list || []).map((r) => ({
+        version: r.Version,
+        updated_by: r.UpdatedBy,
+        updated_at: r.UpdatedAt || r.CreatedAt,
+        reason: r.Reason,
+      })),
+      note: "To restore a specific version, call revert_prompt_body with that version number.",
+    };
+  },
+
+  async revert_prompt_body({ version, reason, updated_by, confirmed = false }) {
+    if (!PROMPT_TABLE.tableId) {
+      return { error: "compass_prompt table not available — cannot revert in this environment" };
+    }
+    const target = parseInt(version, 10);
+    if (!Number.isFinite(target) || target < 1) {
+      return { error: "version must be a positive integer (use view_prompt_history to find one)" };
+    }
+    if (target === cachedPromptVersion) {
+      return { error: `version ${target} is already the current version — no revert needed` };
+    }
+    const data = await ncGet(`/api/v2/tables/${PROMPT_TABLE.tableId}/records?where=${encodeURIComponent(`(Version,eq,${target})`)}&limit=1`);
+    if (!data.list?.length) {
+      return { error: `version ${target} not found in compass_prompt history` };
+    }
+    const targetBody = data.list[0].Body || "";
+    if (!targetBody) {
+      return { error: `version ${target} has empty Body — cannot revert to it` };
+    }
+    if (!confirmed) {
+      return pendingConfirmation(
+        `Revert operator-managed prompt body to v${target} (currently v${cachedPromptVersion}). Reason: ${reason || "(none given)"}. This will write a new row v${cachedPromptVersion + 1} whose body matches v${target}; v${cachedPromptVersion} stays in history.`,
+        { version: target, reason, updated_by, confirmed: true }
+      );
+    }
+    const fullReason = `revert to v${target}${reason ? ` — ${reason}` : ""}`;
+    const { version: newVersion } = await savePromptBody({ newBody: targetBody, reason: fullReason, updatedBy: updated_by });
+    return {
+      ok: true,
+      version: newVersion,
+      reverted_to: target,
+      length: targetBody.length,
+      note: `Prompt body reverted. v${newVersion} is now live and matches v${target}.`,
     };
   },
 
@@ -2789,6 +3361,39 @@ const tools = [
     },
   },
   {
+    name: "update_calendar_event",
+    description: "Patch an existing calendar event. Use when the user wants to reschedule ('move Joseph's call to Thursday 4pm') or amend ('add the Zoom link to Lydia's invite'). Only the fields you pass get changed — others are preserved. If datetime changes without duration, the original duration is preserved. send_updates defaults to false; set true ONLY when the user wants Google to email attendees about the change. CONFIRMATION GATED.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "Google Calendar event ID — from a prior create_calendar_event response or the user." },
+        datetime: { type: "string", description: "New ISO 8601 start (with timezone). Omit to keep current start." },
+        duration_minutes: { type: "number", description: "New duration. Omit to preserve original." },
+        title: { type: "string", description: "New title." },
+        description: { type: "string", description: "Replace the description." },
+        location: { type: "string", description: "New location (URL or address)." },
+        send_updates: { type: "boolean", description: "Default false. Set true to email attendees about the change." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user confirms the previewed change." },
+      },
+      required: ["event_id"],
+    },
+  },
+  {
+    name: "delete_calendar_event",
+    description: "Cancel a calendar event. Use when the user wants to drop a scheduled call ('cancel Joseph's onboarding', 'Yohan can't make Thursday — kill that one'). send_cancellations defaults to false; set true ONLY when the user wants Google to email attendees a cancellation notice. CONFIRMATION GATED.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "Google Calendar event ID." },
+        send_cancellations: { type: "boolean", description: "Default false. Set true to email attendees a cancellation notice." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user confirms." },
+      },
+      required: ["event_id"],
+    },
+  },
+  {
     name: "draft_calendar_invite_email",
     description: "Fallback when create_calendar_event isn't appropriate: draft a Gmail with an .ics attachment. PREFER create_calendar_event when scheduling on Yohan's calendar (which is most of the time). Use this only when: user wants the invite to flow through Yohan's email-review process exactly like any other draft, or the recipient explicitly asked for an .ics file by email. Yohan reviews + sends from Gmail like any other draft.",
     defer_loading: true,
@@ -2864,6 +3469,20 @@ const tools = [
     },
   },
   {
+    name: "send_channel_message",
+    description: "Post a NEW message into a Slack channel. Use this when the user asks you to drop something into a specific channel ('post the summary in #project-get-proactive', 'let the team know in #ops'). Different from your normal reply: replies happen automatically in whatever channel/thread triggered you; this tool initiates a fresh post in a different channel. The bot must be a member of the target channel — if it isn't, Slack returns not_in_channel and the user needs to /invite the bot. Accepts a channel ID (C... or G...) or a channel name like 'project-get-proactive'. Confirm with the user before using if the channel isn't obvious from their request.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID (preferred — e.g. C0B2W2U5MQ9) or channel name ('project-get-proactive', with or without leading #). Channel IDs are visible in Slack message references and channel-invite notifications." },
+        message: { type: "string", description: "The message body. Slack mrkdwn (single-asterisk *bold*, _italic_, no markdown headings). Keep it focused — channel posts are seen by everyone in the channel." },
+        thread_ts: { type: "string", description: "Optional. If set, posts as a reply in the thread of the message with this ts. Use to keep follow-ups out of the main channel feed." },
+      },
+      required: ["channel", "message"],
+    },
+  },
+  {
     name: "send_slack_dm",
     description: "Send a direct message to a teammate. Use this when the user asks you to DM someone ('DM Yohan that...', 'send Nathan a private note about X') or when delivering a private update fits better than replying in the original channel. Different from your normal reply: replies happen automatically in whatever channel/thread triggered you; this tool initiates a NEW message to a specific user. Recipient takes a friendly name ('yohan', 'valerie', 'nathan') or a Slack user_id starting with U. Confirm with the user before using if it isn't obvious from their request.",
     defer_loading: true,
@@ -2896,6 +3515,105 @@ const tools = [
     description: "List the bot's pending scheduled-message reminders (DMs the bot has scheduled but not yet sent). When to use: user asks 'what reminders do I have?' or 'is there a reminder for X?'. Returns id, channel, text, post_at. Note: this only lists what the bot scheduled via create_slack_reminder, NOT native Slack /remind reminders the user set themselves.",
     defer_loading: true,
     input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "delete_slack_reminder",
+    description: "Cancel a pending scheduled-message reminder. When to use: user says 'cancel that reminder' / 'never mind, drop the Friday ping'. Run list_slack_reminders first to find the right scheduled_message_id and channel — both are required.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        scheduled_message_id: { type: "string", description: "From list_slack_reminders → reminders[].id." },
+        channel: { type: "string", description: "From list_slack_reminders → reminders[].channel. For DM reminders this is the recipient's DM channel ID (D...)." },
+      },
+      required: ["scheduled_message_id", "channel"],
+    },
+  },
+  {
+    name: "read_channel_history",
+    description: "Read recent messages from a Slack channel the bot is in. When to use: user wants context from somewhere other than the triggering message — 'what did Valerie say about deposits in #ops', 'scan #intake for unanswered questions', 'summarise this week in #project-get-proactive'. Returns messages with ts, user_id, user_name, text, thread metadata. Pass channel ID (C... or G...), not name. Bot must be a member; if not, returns a clear error asking the user to /invite it. Requires channels:history (public) or groups:history (private) scopes.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID (C... for public, G... for private). Not the name." },
+        limit: { type: "number", description: "Default 20, max 100." },
+        oldest: { type: "string", description: "Optional. Slack ts (e.g. '1715500000.000000') — only return messages newer than this." },
+        latest: { type: "string", description: "Optional. Slack ts — only return messages older than this. Useful for pagination." },
+      },
+      required: ["channel"],
+    },
+  },
+  {
+    name: "lookup_slack_user",
+    description: "Find a Slack user by email, user_id, or friendly name. When to use: you need to DM someone whose ID isn't in the env-var map (anyone other than yohan/valerie/nathan), or to verify the bot can reach them before scheduling a reminder. Pass exactly one of email / user_id / name. Returns user_id, real_name, display_name, email, is_bot, tz.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        email: { type: "string", description: "Email address — uses users.lookupByEmail. Requires users:read.email scope." },
+        user_id: { type: "string", description: "Slack user_id starting with U." },
+        name: { type: "string", description: "'yohan' / 'valerie' / 'nathan' — resolves via env-var map." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "update_message",
+    description: "Edit a message Compass previously posted (via send_channel_message, send_slack_dm, or its own reply). Slack only permits editing the bot's own messages. When to use: user spots a typo or factual error in something Compass just posted and asks to fix it ('correct that — it was 28 people, not 29').",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID where the message was posted." },
+        ts: { type: "string", description: "Slack message timestamp — from the original post's response." },
+        message: { type: "string", description: "Replacement message body. Slack mrkdwn." },
+      },
+      required: ["channel", "ts", "message"],
+    },
+  },
+  {
+    name: "delete_message",
+    description: "Delete a message Compass previously posted. Same restriction as update_message — bot can only delete its own messages. Use when the user wants the message retracted entirely ('actually never mind, delete that').",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID where the message was posted." },
+        ts: { type: "string", description: "Slack message timestamp." },
+      },
+      required: ["channel", "ts"],
+    },
+  },
+  {
+    name: "get_message_permalink",
+    description: "Get a permanent shareable link to a Slack message. When to use: cross-linking — e.g. after posting an import summary in #project-get-proactive, DM Yohan with a permalink back to that post so he can jump straight to it.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID containing the message." },
+        message_ts: { type: "string", description: "Slack message timestamp." },
+      },
+      required: ["channel", "message_ts"],
+    },
+  },
+  {
+    name: "upload_file",
+    description: "Upload a text or CSV file to Slack and (optionally) share it into a channel or DM. Best for artifacts Compass generates inline — CSV exports, import diffs, plain-text summaries that would be ugly pasted as a message. Content is a UTF-8 string. Binary files not supported. Requires files:write scope; sharing into a channel requires the bot to be a member.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        filename: { type: "string", description: "Filename including extension (e.g. 'import-summary.csv', 'notes.txt'). The extension hints Slack's preview rendering." },
+        content: { type: "string", description: "File contents as a UTF-8 string." },
+        channel: { type: "string", description: "Optional channel ID to share into. Omit to upload without sharing — useful for staging then linking via permalink." },
+        thread_ts: { type: "string", description: "Optional. If sharing, post as a thread reply to this message ts." },
+        comment: { type: "string", description: "Optional message body posted alongside the file. Slack mrkdwn." },
+        title: { type: "string", description: "Optional human-readable title; defaults to filename." },
+      },
+      required: ["filename", "content"],
+    },
   },
   {
     name: "inspect_slack_config",
@@ -2934,17 +3652,141 @@ const tools = [
       required: ["submission_id"],
     },
   },
+  {
+    name: "create_docuseal_submission",
+    description: "Send a DocuSeal contract to a participant for signature. Maps to the 'contract_sent' onboarding stage. By default uses DOCUSEAL_DEFAULT_TEMPLATE_ID; pass template_id to override. send_email=true (default) means DocuSeal emails the signer the signing link directly; set false to get the link back and route it manually. CONFIRMATION GATED — first call previews recipient + template, then re-call with confirmed: true. Requires DOCUSEAL_API_KEY env var.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        person_id: { type: "number", description: "NocoDB People record ID — looked up to get name + email." },
+        template_id: { type: "string", description: "DocuSeal template ID. Omit to use DOCUSEAL_DEFAULT_TEMPLATE_ID." },
+        send_email: { type: "boolean", description: "Default true. DocuSeal emails the signing link to the recipient. Set false to send manually." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user confirms the preview." },
+      },
+      required: ["person_id"],
+    },
+  },
+  {
+    name: "get_docuseal_submission",
+    description: "Check the status of a DocuSeal submission. Maps to the 'contract_signed' onboarding stage. Returns the overall submission status plus per-submitter status (sent_at, opened_at, completed_at). When to use: user asks 'has Joseph signed yet?' or you need to verify before toggling contract_signed.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        submission_id: { type: "string", description: "DocuSeal submission ID — returned by create_docuseal_submission." },
+      },
+      required: ["submission_id"],
+    },
+  },
+  {
+    name: "view_prompt_body",
+    description: "Read the current operator-managed section of your own system prompt (the substantive guidance that lives in NocoDB and can be edited from Slack). Use BEFORE calling edit_prompt_body so you know the exact text to match. Returns the body, version, and who last edited it. The kernel mechanics (identity, confirmation-gating flow, tool-search mechanism, prompt-editing tool inventory) are NOT included — those are code-level only.",
+    defer_loading: true,
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "edit_prompt_body",
+    description: "Replace a unique substring of the operator-managed prompt body with new text. Use when the user asks you to change, add, or remove specific guidance ('stop saying X', 'always do Y', 'update the cohort list', 'change the tone'). Call view_prompt_body first to copy the exact text. The match must be UNIQUE in the body — provide enough surrounding context if the literal text appears more than once. CONFIRMATION GATED: first call returns a diff preview; second call with confirmed: true persists. Every edit writes a new version to compass_prompt — nothing is overwritten.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        old_string: { type: "string", description: "Exact substring to replace. Whitespace and punctuation must match. Must be unique." },
+        new_string: { type: "string", description: "Replacement text. Use empty string to delete the matched section." },
+        reason: { type: "string", description: "Short human-readable rationale ('Yohan: stop using emoji in DMs'). Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the person who requested the edit (Yohan / Valerie / Nathan), inferred from the Slack sender. Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed diff." },
+      },
+      required: ["old_string", "new_string", "reason"],
+    },
+  },
+  {
+    name: "replace_prompt_body",
+    description: "Full rewrite of the operator-managed prompt body. Use ONLY for major restructures the user explicitly asks for ('rewrite the whole thing to focus on X'). For routine tweaks, prefer edit_prompt_body — much smaller blast radius. CONFIRMATION GATED: first call shows old size, new size, and the first 400 chars of the new body; second call with confirmed: true persists. The previous version stays in compass_prompt history and can be restored via revert_prompt_body.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        new_body: { type: "string", description: "The complete new body. Replaces the entire operator-managed section." },
+        reason: { type: "string", description: "Why the rewrite. Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the requester (inferred from the Slack sender). Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed rewrite." },
+      },
+      required: ["new_body", "reason"],
+    },
+  },
+  {
+    name: "view_prompt_history",
+    description: "List recent versions of the operator-managed prompt body — version number, who edited it, when, and the reason given. Use to investigate 'when did Compass start doing X' or to find a version to revert to. Returns metadata only, not the full bodies.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max versions to return (1-50, default 10)." },
+      },
+    },
+  },
+  {
+    name: "revert_prompt_body",
+    description: "Restore a previous version of the operator-managed prompt body. Writes a NEW version (Version+1) whose Body matches the target version — the current version stays in history, nothing is destroyed. Use when an edit had unintended consequences and the user wants the prior behaviour back. CONFIRMATION GATED.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        version: { type: "integer", description: "Version number to restore. Find via view_prompt_history." },
+        reason: { type: "string", description: "Why the revert. Stored in the audit row." },
+        updated_by: { type: "string", description: "Name of the requester (inferred from the Slack sender). Stored in the audit row." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the revert." },
+      },
+      required: ["version"],
+    },
+  },
 ];
 
 // ---------- System prompt ----------
+//
+// Architecture: KERNEL_TOP (in code) + editable body (NocoDB) + KERNEL_BOTTOM (in code).
+// The body holds substantive guidance — onboarding stages, principles, tone, edge cases —
+// and can be edited live from Slack via edit_prompt_body. The kernel sandwiches it with
+// identity/date and the small set of mechanics that must NOT be editable from Slack
+// (confirmation-gating flow, tool-search mechanism, and the prompt-editing tool inventory
+// itself — you can't bootstrap a fix via tools you can't see). Body lives in the NocoDB
+// `compass_prompt` table, append-only: each edit writes a new row with a monotonically
+// increasing Version; the latest is live, older versions are the audit trail. If the
+// table is unavailable, falls back to SEED_PROMPT_BODY in this file (degraded but
+// functional).
 
-// Built fresh per /run so today's date doesn't freeze at module-load time.
-// Cache rebuilds once per UTC day (when the date string changes); negligible cost.
-const buildSystemPrompt = () => `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
+let cachedPromptBody = null;
+let cachedPromptVersion = 0;
+let cachedPromptUpdatedBy = null;
+let cachedPromptUpdatedAt = null;
 
-You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
+const promptVars = () => ({
+  TODAY: todayISO(),
+  YOHAN_SLACK_ID: process.env.YOHAN_SLACK_ID || "",
+  VALERIE_SLACK_ID: process.env.VALERIE_SLACK_ID || "",
+  NATHAN_SLACK_ID: process.env.NATHAN_SLACK_ID || "",
+  CLICKUP_DAILY_TASK_LIST_ID: process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var",
+});
+
+function substitutePromptVars(text) {
+  const vars = promptVars();
+  return text.replace(/\{\{(\w+)\}\}/g, (m, k) => (k in vars ? vars[k] : m));
+}
+
+const KERNEL_TOP = () => `You are Compass, the AI ops layer for Unconditional Self (UST), a coaching company run by Yohan and Valerie.
 
 Today's date: ${todayISO()}.
+
+—— OPERATOR-MANAGED GUIDANCE ——
+The section below is managed by the UST team via Slack — they can edit it at any time using edit_prompt_body / replace_prompt_body. Treat it as authoritative for substantive behaviour. If the user asks you to change something about how you operate that fits within the operator-managed scope (tone, principles, stage logic, edge cases, etc.), use the prompt-editing tools yourself rather than just promising to remember.`;
+
+// SEED_PROMPT_BODY — used to bootstrap the compass_prompt table on first run, and as
+// the fallback if NocoDB is unreachable. Substantive guidance lives here. The text is
+// loaded ONCE at boot; subsequent edits via edit_prompt_body persist to NocoDB and
+// take effect on the next /run without a redeploy.
+const SEED_PROMPT_BODY = `You receive transcripts of voice notes (or text messages) from Yohan or Valerie via Slack. Your job is to interpret the intent and execute the right actions on UST's data using the tools available.
 
 Cohort names follow the pattern "Month DD YYYY" (e.g. "May 9 2026"). Use lookup_cohort to verify a cohort exists before referencing it; use list_people with cohort_name to see who's in one. Don't assume which cohorts are currently active — the active set drifts and the prompt won't track it.
 
@@ -2987,9 +3829,6 @@ PAYMENT vs STAGES:
 
 SKILLS:
 You have access to a Skills library — markdown playbooks for specific workflows (e.g. Yohan's voice/style guide, onboarding edge cases). Use list_skills early when starting complex work to see what guidance is available; load_skill to read a specific one. Treat loaded skill content as authoritative for that workflow.
-
-TOOL SEARCH:
-Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). Always-loaded core tools: lookup_person, create_person, toggle_stage, list_people, list_skills, code_execution, ask_for_clarification, stay_silent. For anything else (payment updates, ClickUp tasks, email drafts, audit queries, schema changes, etc.), search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment") and the relevant tool will be returned for use.
 
 ACT, DON'T NARRATE:
 Every reply contains either a tool call or a clear statement of what's blocking.
@@ -3038,12 +3877,8 @@ DIRECT DATA MANIPULATION:
 For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
 For WRITES the default flips: PREFER specialized tools (update_person, update_payment, toggle_stage, create_person, add_note, log_touchpoint) over bulk_update_records / delete_records when one fits. For importing 4 or more people at once, use bulk_import_people instead of looping create_person — it dedupes shared fields and saves a lot of output tokens. The specialized write tools encode invariants you'd otherwise have to remember every call: update_payment auto-recomputes Amount owing; toggle_stage applies the documented stage cascade (welcome_email_sent → deposit_paid, etc.); add_note timestamps and appends instead of overwriting. Skipping them means silent drift in production data that's hard to spot weeks later. Use bulk_update_records / delete_records when the target is a non-People table, when you're applying the same change across many rows, or when no specialized tool covers the field.
 
-CONFIRMATION GATING:
-A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records, add_select_options, bulk_import_people) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
-1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
-2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
-3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
-This is a guardrail Yohan asked for on writes that touch money / calendar / destructive operations. Do NOT skip it. If the user's original ask is already specific and unambiguous, the confirmation step is still required — that's the point. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate; they're either reversible or already gated by drafts/review.
+CONFIRMATION-GATED TOOLS (which ones):
+The following tools require confirmation before executing: update_payment, create_calendar_event, update_calendar_event, delete_calendar_event, delete_clickup_task, bulk_update_records, delete_records, add_select_options, bulk_import_people, create_docuseal_submission, edit_prompt_body, replace_prompt_body, revert_prompt_body. Other writes (note adds, stage toggles, drafts, ClickUp task creation, person updates) do NOT need this gate — they're either reversible or already gated by drafts/review. The gating mechanics (the confirmed/replay_args flow) are described in CORE MECHANICS below; this section is just the list.
 
 QUERY TOOL SELECTION (important — get this right):
 - "Who is in onboarding / May 9 / paid in full / on Valerie's list" → use list_people with the right filter. NOT list_recent_actions.
@@ -3058,7 +3893,7 @@ SELF-AWARENESS / AUDIT TRAIL:
 Every voice note, @mention, and DM you handle is automatically logged to the Agent actions table (transcript + tool calls + redacted tool inputs). Use list_recent_actions to read it back. Don't say you have no memory — you have a full audit trail.
 
 ALREADY-DONE RESULTS (action ledger):
-A few destructive external tools (create_clickup_task, draft_email, draft_welcome_email, send_slack_dm, create_calendar_event) are de-duplicated per Slack thread. If you call one with the same arguments twice in the same thread, the second call returns the previous result with already_done=true and a note explaining when it ran. Treat that as success — don't retry, don't apologise, don't worry that something's broken. It's the system protecting against double-creates after a resume. Just proceed with whatever's next.
+A few destructive external tools (create_clickup_task, draft_email, draft_welcome_email, send_slack_dm, send_channel_message, create_calendar_event, create_docuseal_submission) are de-duplicated per Slack thread. If you call one with the same arguments twice in the same thread, the second call returns the previous result with already_done=true and a note explaining when it ran. Treat that as success — don't retry, don't apologise, don't worry that something's broken. It's the system protecting against double-creates after a resume. Just proceed with whatever's next.
 
 If a result has already_existed=true (from create_person), same idea — the row was already there from an earlier run, no duplicate created. Proceed.
 
@@ -3099,7 +3934,7 @@ ACCURACY:
 Stay grounded in what you can verify. Be skeptical of the quality of your own information — seek clarity when valuable. For UST-specific details (backend setup, file locations, vendor configs, exact column names): check recall_knowledge first; if nothing's pinned, name the person who'd know — "I don't have those details — Nathan would know". When you're unsure, defer to the human; specific verifiable answers beat plausible-sounding step-by-steps.
 
 QUESTIONS / DECISIONS NEEDED:
-When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list ${process.env.CLICKUP_DAILY_TASK_LIST_ID || "set CLICKUP_DAILY_TASK_LIST_ID env var"}) instead of using ask_for_clarification.
+When you encounter a question or decision the human team needs to make but you can still complete the current request, create a ClickUp task in the Daily Task Board (list {{CLICKUP_DAILY_TASK_LIST_ID}}) instead of using ask_for_clarification.
 
 The "❓" prefix is RESERVED for tasks that are genuinely a question or decision — not just any task assigned to a human. The prefix lets Yohan/Valerie scan their board and see "things needing my judgement" separate from regular action items.
 
@@ -3145,16 +3980,125 @@ Output is posted to Slack, which uses its own mrkdwn flavor — *bold* with sing
 
 SLACK MENTIONS (notify the right person):
 Known team Slack user IDs — use the <@USER_ID> syntax to ping them so they get a notification:
-- Yohan: <@${process.env.YOHAN_SLACK_ID || "set YOHAN_SLACK_ID env"}>
-- Valerie: <@${process.env.VALERIE_SLACK_ID || "set VALERIE_SLACK_ID env"}>
-- Nathan: <@${process.env.NATHAN_SLACK_ID || "set NATHAN_SLACK_ID env"}>
+- Yohan: <@{{YOHAN_SLACK_ID}}>
+- Valerie: <@{{VALERIE_SLACK_ID}}>
+- Nathan: <@{{NATHAN_SLACK_ID}}>
 
-@-mention them when your reply recommends they take an action — e.g. "<@${process.env.VALERIE_SLACK_ID || ""}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
+@-mention them when your reply recommends they take an action — e.g. "<@{{VALERIE_SLACK_ID}}> should prioritise getting Joseph's phone number". The mention pings them and gets their attention.
 
 For everything else, refer to them by bare name without the @ — casual references ("the call Yohan ran on Tuesday"), reports of past actions ("Valerie marked the deposit paid"), and replies to the person who's talking to you (no need to @ Yohan when Yohan is asking the question). Participants and clients aren't in this workspace, so refer to them by name only. Stick to the three IDs above; for anyone else, use plain names.
 
 ADDRESSING THE SENDER:
 The from_user_id in the '## Slack message reference' block at the top of the transcript is the person who messaged you — they're the one reading your reply. Address them in second person ('you'), not by name in third person. So if Nathan writes to you, never say 'Nathan would need to look at that' — say 'you'd need to look at that' or just describe the issue. Same for Yohan and Valerie when they're the sender. Mention other teammates by name when they're not the sender (e.g. 'Yohan should sign off on this' if Nathan is asking).`;
+
+const KERNEL_BOTTOM = `—— CORE MECHANICS (not editable from Slack — code-level changes only) ——
+
+CONFIRMATION GATING (the flow):
+The operator-managed section above lists which tools are confirmation-gated. The flow for any gated tool:
+1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
+2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
+3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
+This guardrail must NOT be skipped. Even if the user's original ask is specific and unambiguous, the confirmation step is still required — that's the point.
+
+TOOL SEARCH (the mechanism):
+Most of your tools are loaded on-demand via tool_search_tool_bm25 (natural-language search). Always-loaded core tools: lookup_person, create_person, toggle_stage, list_people, list_skills, code_execution, ask_for_clarification, stay_silent. For anything else (payment updates, ClickUp tasks, email drafts, audit queries, schema changes, prompt edits, etc.), search the tool catalog by capability (e.g. "draft email", "list tasks", "update payment", "edit prompt") and the relevant tool will be returned for use.
+
+PROMPT EDITING (your own substantive guidance):
+The OPERATOR-MANAGED GUIDANCE section above is stored in NocoDB (table: compass_prompt) and can be edited live from Slack. Tools (find them via tool search if not already in your active set):
+- view_prompt_body — read the current operator-managed body and its version.
+- edit_prompt_body({ old_string, new_string, reason }) — replace a unique substring. Confirmation-gated; preview shows the diff.
+- replace_prompt_body({ new_body, reason }) — full rewrite for big refactors. Confirmation-gated.
+- view_prompt_history({ limit }) — recent versions for audit / comparison.
+- revert_prompt_body({ version, reason }) — restore a prior version. Confirmation-gated.
+Every edit is versioned in compass_prompt; no version is ever deleted. The CORE MECHANICS in this section (and the identity line at the top) are NOT editable via these tools — they require a code change to index.js.
+
+When the user asks you to change how you behave ("stop apologising for clarifying questions", "always log touchpoints in past tense", "use British spelling"), the right response is to reach for these prompt-edit tools, not to promise you'll remember. You won't — each /run starts fresh. The body is what carries forward.`;
+
+// Built fresh per /run so today's date doesn't freeze at module-load time.
+// Body is satisfied from the in-memory cache (loaded at boot, refreshed after each edit).
+const buildSystemPrompt = () => {
+  const body = substitutePromptVars(cachedPromptBody || SEED_PROMPT_BODY);
+  return `${KERNEL_TOP()}\n\n${body}\n\n${KERNEL_BOTTOM}`;
+};
+
+// ---------- Editable prompt body (NocoDB-backed) ----------
+//
+// PROMPT_TABLE.tableId is set at boot by ensurePromptTable() — auto-discovered by
+// title `compass_prompt` (or pinned via COMPASS_PROMPT_TABLE_ID env if set), and
+// auto-created if absent. loadPromptBody() then reads the latest Version row into
+// the cache. savePromptBody() appends a new row and refreshes the cache.
+
+const PROMPT_TABLE = { tableId: COMPASS_PROMPT_TABLE_ID || null };
+const PROMPT_TABLE_TITLE = "compass_prompt";
+
+async function loadPromptBody() {
+  if (!PROMPT_TABLE.tableId) {
+    console.warn("[prompt] compass_prompt table not available — using SEED_PROMPT_BODY (in-code fallback). Edits cannot persist.");
+    cachedPromptBody = SEED_PROMPT_BODY;
+    cachedPromptVersion = 0;
+    return;
+  }
+  try {
+    const data = await ncGet(`/api/v2/tables/${PROMPT_TABLE.tableId}/records?limit=1&sort=-Version`);
+    if (!data.list?.length) {
+      console.log("[prompt] compass_prompt is empty — bootstrapping with SEED_PROMPT_BODY (Version=1)");
+      await ncPost(`/api/v2/tables/${PROMPT_TABLE.tableId}/records`, [{
+        Body: SEED_PROMPT_BODY,
+        Version: 1,
+        UpdatedBy: "system",
+        Reason: "initial seed from index.js",
+      }]);
+      cachedPromptBody = SEED_PROMPT_BODY;
+      cachedPromptVersion = 1;
+      cachedPromptUpdatedBy = "system";
+      cachedPromptUpdatedAt = new Date().toISOString();
+      return;
+    }
+    const row = data.list[0];
+    cachedPromptBody = row.Body || SEED_PROMPT_BODY;
+    cachedPromptVersion = row.Version || 0;
+    cachedPromptUpdatedBy = row.UpdatedBy || null;
+    cachedPromptUpdatedAt = row.UpdatedAt || row.CreatedAt || null;
+    console.log(`[prompt] loaded body v${cachedPromptVersion} (${cachedPromptBody.length} chars, updated_by=${cachedPromptUpdatedBy || "?"})`);
+  } catch (e) {
+    console.error(`[prompt] load failed: ${e.message} — falling back to SEED_PROMPT_BODY`);
+    cachedPromptBody = SEED_PROMPT_BODY;
+    cachedPromptVersion = 0;
+  }
+}
+
+async function savePromptBody({ newBody, reason, updatedBy }) {
+  if (!PROMPT_TABLE.tableId) {
+    throw new Error("compass_prompt table not available — prompt edits cannot be persisted in this environment");
+  }
+  if (typeof newBody !== "string" || newBody.length === 0) {
+    throw new Error("newBody must be a non-empty string");
+  }
+  const newVersion = (cachedPromptVersion || 0) + 1;
+  await ncPost(`/api/v2/tables/${PROMPT_TABLE.tableId}/records`, [{
+    Body: newBody,
+    Version: newVersion,
+    UpdatedBy: updatedBy || "agent",
+    Reason: reason || "(no reason given)",
+  }]);
+  cachedPromptBody = newBody;
+  cachedPromptVersion = newVersion;
+  cachedPromptUpdatedBy = updatedBy || "agent";
+  cachedPromptUpdatedAt = new Date().toISOString();
+  return { version: newVersion };
+}
+
+function diffPreview(oldStr, newStr) {
+  // Tiny line-based diff for previews — not a proper diff, just enough for a human to glance.
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+  const out = [];
+  for (const l of oldLines) out.push(`- ${l}`);
+  for (const l of newLines) out.push(`+ ${l}`);
+  const joined = out.join("\n");
+  if (joined.length <= 2000) return joined;
+  return joined.slice(0, 2000) + `\n… [truncated; preview is ${joined.length} chars]`;
+}
 
 // ---------- Agent loop ----------
 
@@ -3764,8 +4708,20 @@ const TOOL_HUMAN_LABELS = {
   create_calendar_event: "Created calendar event",
   check_calendar_availability: "Checked calendar availability",
   send_slack_dm: "Sent Slack DM",
+  send_channel_message: "Posted to Slack channel",
   create_slack_reminder: "Created Slack reminder",
   list_slack_reminders: "Listed Slack reminders",
+  delete_slack_reminder: "Cancelled Slack reminder",
+  read_channel_history: "Read channel history",
+  lookup_slack_user: "Looked up Slack user",
+  update_message: "Edited Slack message",
+  delete_message: "Deleted Slack message",
+  get_message_permalink: "Got message permalink",
+  upload_file: "Uploaded file to Slack",
+  update_calendar_event: "Updated calendar event",
+  delete_calendar_event: "Deleted calendar event",
+  create_docuseal_submission: "Sent DocuSeal contract",
+  get_docuseal_submission: "Checked DocuSeal status",
   react_to_message: "Reacted to message",
   list_recent_actions: "Looked at recent actions",
   list_jotform_submissions: "Listed JotForm submissions",
@@ -3789,6 +4745,11 @@ const TOOL_HUMAN_LABELS = {
   load_skill: "Loaded skill",
   code_execution: "Ran code",
   tool_search_tool_bm25: "Searched tools",
+  view_prompt_body: "Read own prompt body",
+  edit_prompt_body: "Edited own prompt body",
+  replace_prompt_body: "Rewrote own prompt body",
+  view_prompt_history: "Read prompt edit history",
+  revert_prompt_body: "Reverted prompt body",
 };
 const VERB_MAP = {
   create: "Created", update: "Updated", delete: "Deleted",
@@ -4483,6 +5444,55 @@ async function ensureThreadStateTable() {
 }
 await ensureThreadStateTable();
 
+// ---------- Editable prompt body table (auto-discovery + bootstrap) ----------
+// Mirrors ensureThreadStateTable: pin via env if set, otherwise look up by title
+// in the same NocoDB base, otherwise create. After this resolves, loadPromptBody
+// either reads the existing latest Version row or seeds Version=1 from SEED_PROMPT_BODY.
+
+async function ensurePromptTable() {
+  if (PROMPT_TABLE.tableId) {
+    console.log(`[migrate] compass_prompt table pinned via env: ${PROMPT_TABLE.tableId}`);
+    return;
+  }
+  if (!PEOPLE_TABLE_ID) {
+    console.warn("[migrate] PEOPLE_TABLE_ID not set — cannot discover base for compass_prompt table");
+    return;
+  }
+  try {
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+    if (!baseId) {
+      console.warn("[migrate] could not resolve base_id from People table — skipping compass_prompt setup");
+      return;
+    }
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+    const existing = tables.find((t) => t.title === PROMPT_TABLE_TITLE);
+    if (existing) {
+      PROMPT_TABLE.tableId = existing.id;
+      console.log(`[migrate] compass_prompt table found: ${existing.id}`);
+      return;
+    }
+    console.log(`[migrate] creating ${PROMPT_TABLE_TITLE} table…`);
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: PROMPT_TABLE_TITLE,
+      title: PROMPT_TABLE_TITLE,
+      columns: [
+        { column_name: "Body",      title: "Body",      uidt: "LongText" },
+        { column_name: "Version",   title: "Version",   uidt: "Number" },
+        { column_name: "UpdatedBy", title: "UpdatedBy", uidt: "SingleLineText" },
+        { column_name: "Reason",    title: "Reason",    uidt: "LongText" },
+      ],
+    });
+    PROMPT_TABLE.tableId = created?.id;
+    console.log(`[migrate] compass_prompt table created: ${PROMPT_TABLE.tableId}`);
+  } catch (e) {
+    console.error(`[migrate] ensurePromptTable failed (continuing with in-code SEED fallback): ${e.message}`);
+  }
+}
+await ensurePromptTable();
+await loadPromptBody();
+
 // === Thread state CRUD helpers ===
 // All silently no-op if THREAD_STATE.tableId is null (auto-create failed or
 // not yet pinned). The agent runs as it did before, just without the
@@ -4578,7 +5588,9 @@ const DESTRUCTIVE_EXTERNAL_TOOLS = new Set([
   "draft_email",
   "draft_welcome_email",
   "send_slack_dm",
+  "send_channel_message",
   "create_calendar_event",
+  "create_docuseal_submission",
 ]);
 
 class BudgetExhausted extends Error {
