@@ -3605,6 +3605,107 @@ async function fetchThreadContext(channel, threadTs, limit = 30) {
   return await formatSlackMessages(data.messages || [], botId);
 }
 
+// Find files attached to the triggering Slack message. Used as a server-side
+// fallback for the thread-reply and DM paths where n8n doesn't currently run
+// the Files-API upload sub-flow. Returns the raw Slack file objects (with
+// url_private_download), capped at MAX_FALLBACK_FILES. Best-effort: returns []
+// on any Slack error rather than throwing, so /run still proceeds.
+const MAX_FALLBACK_FILES = 5;
+const MAX_FALLBACK_FILE_BYTES = 25 * 1024 * 1024; // Anthropic Files API limit
+async function fetchSlackTriggeringFiles(slackContext) {
+  const channel = slackContext?.channel;
+  const triggerTs = slackContext?.ts || slackContext?.thread_ts;
+  if (!channel || !triggerTs) return [];
+  try {
+    let messages = [];
+    if (slackContext.thread_ts && slackContext.thread_ts !== slackContext.ts) {
+      const data = await slackApi("conversations.replies", {
+        channel,
+        ts: slackContext.thread_ts,
+        latest: triggerTs,
+        inclusive: true,
+        limit: 30,
+      });
+      messages = data.messages || [];
+    } else {
+      const data = await slackApi("conversations.history", {
+        channel,
+        latest: triggerTs,
+        inclusive: true,
+        limit: 1,
+      });
+      messages = data.messages || [];
+    }
+    const target = messages.find((m) => m.ts === triggerTs) || messages[messages.length - 1];
+    return (target?.files || []).slice(0, MAX_FALLBACK_FILES);
+  } catch (e) {
+    console.warn(`[slack-files] scan failed: ${e.message}`);
+    return [];
+  }
+}
+
+// Per-process cache of slack_file_id -> anthropic_file_id. Files API uploads
+// are free, but re-uploading the same CSV produces a new file_id and breaks
+// prompt caching. Cache is wiped on Render restart; that's fine.
+const _slackToAnthropicFileCache = new Map();
+
+// Download a Slack file's bytes via url_private_download, then upload to the
+// Anthropic Files API. Returns an attachments[] entry shaped to match what
+// n8n's mention-path sub-flow produces. Throws on hard errors so the caller
+// can log and skip — we don't want one bad file to take down the whole run.
+async function uploadSlackFileToAnthropic(file) {
+  if (!file?.id) throw new Error("missing slack file id");
+  const cached = _slackToAnthropicFileCache.get(file.id);
+  if (cached) {
+    return {
+      file_id: cached,
+      name: file.name || "unnamed",
+      mimetype: file.mimetype || "application/octet-stream",
+      size: file.size || 0,
+      slack_file_id: file.id,
+    };
+  }
+  if (file.size && file.size > MAX_FALLBACK_FILE_BYTES) {
+    throw new Error(`file ${file.name || file.id} exceeds ${MAX_FALLBACK_FILE_BYTES} bytes`);
+  }
+  const url = file.url_private_download || file.url_private;
+  if (!url) throw new Error(`slack file ${file.id} has no url_private`);
+
+  const dlRes = await fetch(url, {
+    headers: { authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    redirect: "follow",
+  });
+  if (!dlRes.ok) throw new Error(`slack download ${dlRes.status}`);
+  const buf = Buffer.from(await dlRes.arrayBuffer());
+
+  const mime = file.mimetype || "application/octet-stream";
+  const form = new FormData();
+  form.append("file", new Blob([buf], { type: mime }), file.name || "upload.bin");
+  const upRes = await fetch("https://api.anthropic.com/v1/files", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "files-api-2025-04-14",
+    },
+    body: form,
+  });
+  if (!upRes.ok) {
+    const text = await upRes.text();
+    throw new Error(`anthropic files upload ${upRes.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await upRes.json();
+  if (!data.id) throw new Error(`anthropic files response missing id: ${JSON.stringify(data).slice(0, 200)}`);
+  _slackToAnthropicFileCache.set(file.id, data.id);
+  return {
+    file_id: data.id,
+    name: file.name || "unnamed",
+    mimetype: mime,
+    size: file.size || buf.length,
+    slack_file_id: file.id,
+  };
+}
+
 // Fetch recent channel messages (top-level only) for context when the user posts at the channel level.
 // Throws on Slack errors so the caller can surface them to the agent.
 async function fetchRecentChannelContext(channel, limit = 8) {
@@ -3886,11 +3987,12 @@ await ensureAuditSchema();
 const THREAD_STATE = { tableId: process.env.THREAD_STATE_TABLE_ID || null };
 const THREAD_STATE_TABLE_TITLE = "Compass thread state";
 
-// Tunable budget cap. 50¢ per conversation is comfortable for normal voice
-// notes and a default-shaped CSV import; runaway loops trip the guard before
-// they cost anything material. Bumped per "continue" by the user (the next
-// run on a `budget_exhausted` thread resets cost_usd to 0 before proceeding).
-const MAX_USD_PER_CONVERSATION = parseFloat(process.env.MAX_USD_PER_CONVERSATION || "0.50");
+// Tunable budget cap. $1.50 per conversation accommodates a realistic CSV
+// import (25-row people-import was already $0.79 and getting cut off mid-task)
+// while still tripping the guard before runaway loops cost anything material.
+// Bumped per "continue" by the user (the next run on a `budget_exhausted`
+// thread resets cost_usd to 0 before proceeding).
+const MAX_USD_PER_CONVERSATION = parseFloat(process.env.MAX_USD_PER_CONVERSATION || "1.50");
 
 // Pricing table for cost guard. Keep in sync with
 // https://docs.claude.com/en/docs/about-claude/pricing — out of date prices
@@ -4325,6 +4427,29 @@ app.post("/run", async (req, res) => {
     );
   }
 
+  // Server-side fallback: if n8n didn't forward any attachments (thread-reply
+  // and DM paths don't currently run the Files-API sub-flow), look at the
+  // triggering Slack message ourselves, download any files via SLACK_BOT_TOKEN,
+  // and upload them to the Anthropic Files API. This makes file uploads work
+  // uniformly across mention / name-match / thread-reply / DM without needing
+  // four copies of the same sub-flow in n8n.
+  const runAttachments = [...validAttachments];
+  if (runAttachments.length === 0 && slack_context?.channel) {
+    const slackFiles = await fetchSlackTriggeringFiles(slack_context);
+    if (slackFiles.length > 0) {
+      console.log(`[agent] slack-files fallback: ${slackFiles.length} file(s) on triggering message`);
+      for (const f of slackFiles) {
+        try {
+          const entry = await uploadSlackFileToAnthropic(f);
+          runAttachments.push(entry);
+          console.log(`[agent] slack-files fallback uploaded ${entry.name} (${entry.size}B) → ${entry.file_id}`);
+        } catch (e) {
+          console.error(`[agent] slack-files fallback skipped ${f.name || f.id}: ${e.message}`);
+        }
+      }
+    }
+  }
+
   console.log(`[agent] transcript: ${redactPII(transcript).slice(0, 200)}`);
   const t0 = Date.now();
 
@@ -4429,8 +4554,8 @@ app.post("/run", async (req, res) => {
   // If files arrived, append a manifest so the model sees them in the prompt
   // text too (description = name + mime + role hint). The actual file_ids are
   // attached to the first user message as content blocks inside runAgent.
-  if (validAttachments.length > 0) {
-    const manifest = validAttachments
+  if (runAttachments.length > 0) {
+    const manifest = runAttachments
       .map((a) => `  - ${a.name || "unnamed"} · ${a.mimetype || "unknown"} · ${a.size ? a.size + " bytes" : "size unknown"} · file_id=${a.file_id}`)
       .join("\n");
     enrichedTranscript += `\n\n## Attached files (already uploaded to Files API and visible to you)\n${manifest}\n\nFor CSV / JSON / text content, you can reference these directly in code_execution by file_id (they land in /mnt/user-data/uploads/). For PDFs and images, the model can read them natively from the attached content blocks.`;
@@ -4444,7 +4569,7 @@ app.post("/run", async (req, res) => {
   // the existing placeholder or post fresh.
   let result;
   try {
-    result = await runAgent(enrichedTranscript, slack_context, validAttachments, threadTs);
+    result = await runAgent(enrichedTranscript, slack_context, runAttachments, threadTs);
   } catch (e) {
     console.error(`[agent] error:`, e);
     result = { ok: false, summary: `Error: ${e.message}`, error: e.message };
