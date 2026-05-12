@@ -2890,11 +2890,17 @@ ACT, DON'T NARRATE:
 When you decide to call a tool, call it in the same response. Skip the preview ("let me check...", "I'll look that up...") — go straight to the tool call. State results, not intentions. If you can answer from what you already know in this prompt or context, just answer; you don't need to consult a tool to talk about your own capabilities. If no available tool can answer the question, say so directly rather than promising to check.
 
 ATTACHMENTS AND CODE EXECUTION:
-When the user uploads a file in Slack, n8n uploads it to Anthropic's Files API and you receive it as a content block on the first message of the run. You'll also see a "## Attached files" manifest in the transcript listing each file's name, mime type, and file_id. You can SEE these files — do not say "I can't see attachments" or invent tools to discover them.
+There are TWO different kinds of file identifier you might see, and you must keep them straight:
 
-For CSV / JSON / Excel and any tabular or programmatic work: use the code_execution tool. It's a Python sandbox; uploaded files land at /mnt/user-data/uploads/<filename>. Read them with pandas, open(), json.load(), etc. Do NOT ask anyone to build a bespoke parser tool — code_execution covers that case.
+  1. **Anthropic file_id** — starts with "file_" (e.g. file_011AB...). These are uploaded to Anthropic's Files API and arrive as actual content blocks on the FIRST user message of this run. If you have one of these, you can pass it to code_execution (it lands in the sandbox at /mnt/user-data/uploads/<filename>) or read PDFs/images natively. The "## Attached files" manifest in the transcript only ever lists Anthropic file_ids — these are the readable ones.
 
-For PDFs and images you can read directly via the model's native multimodal capability — the document/image content blocks are already in the prompt.
+  2. **Slack file_id** — starts with "F" (e.g. F0B2XRKRCH2). These appear in thread-context history lines like  [file: name=foo.csv slack_file_id=F0B2...]  when a file was uploaded earlier in the thread. Slack file_ids are NOT readable by you. You cannot pass them to code_execution. They're metadata for context only — so you know a file was once shared in this conversation.
+
+If the user references a file but you don't see an Anthropic file_id (no "## Attached files" manifest, no document/image/container_upload content block on the current message), the file is NOT accessible to you. Say so plainly: "the file isn't reaching me — please re-upload it in this thread and I'll handle it." Don't say "let me read it" or "let me check" — those are pretend-actions when there's nothing to read. Don't write prose describing what you would do; ask for the re-upload and stop.
+
+When you DO have an Anthropic file_id available:
+- CSV / JSON / Excel / any data wrangling → use code_execution (Python sandbox with pandas, openpyxl, json, etc. preinstalled). Files land at /mnt/user-data/uploads/<filename>.
+- PDFs and images → read directly via the document/image content block already in your context.
 
 If a workflow requires a genuinely new DURABLE capability (a permanent integration with a system Compass doesn't reach yet), say so plainly and ask Nathan to add it. There is no runtime tool-minting any more.
 
@@ -3089,6 +3095,11 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // this thread (so a "continue" after pause counts toward the same budget
   // until /run resets it), or 0 if fresh. Updated after every messages.create.
   let conversationCostUsd = 0;
+  // Cumulative token usage across all iterations of this run. Surfaced in the
+  // result so logAgentAction can persist it to the audit table — letting us
+  // verify caching is actually working (cache_read should be ≥ 80% of input
+  // tokens after the first call within a 5-minute window).
+  const usageTotals = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
 
   while (iteration < maxIterations) {
     iteration++;
@@ -3145,6 +3156,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
           iterations: iteration,
           trace,
           placeholderRef,
+          usage: usageTotals,
         };
       }
       // Anything else: rethrow so /run's catch surfaces it normally.
@@ -3157,6 +3169,11 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     // (most natural: "continue") and the next /run will reset the ledger.
     const turnCost = costOf(response.usage, AGENT_MODEL);
     conversationCostUsd += turnCost;
+    // Accumulate token usage for audit visibility.
+    usageTotals.input        += response.usage?.input_tokens || 0;
+    usageTotals.output       += response.usage?.output_tokens || 0;
+    usageTotals.cache_read   += response.usage?.cache_read_input_tokens || 0;
+    usageTotals.cache_write  += response.usage?.cache_creation_input_tokens || 0;
     if (conversationCostUsd > MAX_USD_PER_CONVERSATION) {
       console.warn(`[agent] budget exhausted on iter=${iteration}: $${conversationCostUsd.toFixed(4)} > $${MAX_USD_PER_CONVERSATION}`);
       // Push the assistant turn before bailing so the audit trail captures it.
@@ -3171,6 +3188,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         iterations: iteration,
         trace,
         placeholderRef,
+        usage: usageTotals,
       };
     }
 
@@ -3222,6 +3240,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         iterations: iteration,
         trace,
         placeholderRef,
+        usage: usageTotals,
       };
     }
 
@@ -3240,6 +3259,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         iterations: iteration,
         trace,
         placeholderRef,
+        usage: usageTotals,
       };
     }
 
@@ -3343,6 +3363,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         iterations: iteration,
         trace,
         placeholderRef,
+        usage: usageTotals,
       };
     }
 
@@ -3357,6 +3378,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       iterations: iteration,
       trace,
       placeholderRef,
+      usage: usageTotals,
     };
   }
 
@@ -3367,6 +3389,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     iterations: iteration,
     trace,
     placeholderRef,
+    usage: usageTotals,
   };
 }
 
@@ -3628,16 +3651,46 @@ async function fetchSlackTriggeringFiles(slackContext) {
       });
       messages = data.messages || [];
     } else {
+      // Fetch a small window of recent messages so we can find files uploaded
+      // a few messages back, not just the triggering one. Common pattern:
+      // user uploads CSV, then sends a follow-up "@Compass please import" —
+      // the trigger has no files, but the prior message does.
       const data = await slackApi("conversations.history", {
         channel,
         latest: triggerTs,
         inclusive: true,
-        limit: 1,
+        limit: 10,
       });
-      messages = data.messages || [];
+      messages = (data.messages || []).slice().reverse(); // chronological
     }
-    const target = messages.find((m) => m.ts === triggerTs) || messages[messages.length - 1];
-    return (target?.files || []).slice(0, MAX_FALLBACK_FILES);
+
+    // Prefer files on the triggering message (the user's intent is most
+    // direct then). If none, fall back to the most recent files in the
+    // thread/channel window — newest first, capped at MAX_FALLBACK_FILES.
+    const target = messages.find((m) => m.ts === triggerTs);
+    const triggerFiles = target?.files || [];
+    if (triggerFiles.length > 0) {
+      return triggerFiles.slice(0, MAX_FALLBACK_FILES);
+    }
+
+    // Walk recent messages in reverse-chronological order, collecting files
+    // until we hit the cap. De-dupe by file id (a Slack file can appear in
+    // both file_shared and the message subtype event).
+    const seen = new Set();
+    const collected = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      for (const f of messages[i].files || []) {
+        if (!f?.id || seen.has(f.id)) continue;
+        seen.add(f.id);
+        collected.push(f);
+        if (collected.length >= MAX_FALLBACK_FILES) break;
+      }
+      if (collected.length >= MAX_FALLBACK_FILES) break;
+    }
+    if (collected.length > 0) {
+      console.log(`[slack-files] no files on trigger; using ${collected.length} from recent thread/channel`);
+    }
+    return collected;
   } catch (e) {
     console.warn(`[slack-files] scan failed: ${e.message}`);
     return [];
@@ -3944,20 +3997,35 @@ async function ensureAuditSchema() {
     console.log("[migrate] AGENT_ACTIONS_TABLE_ID not set — skipping audit schema check");
     return;
   }
+  // Add any missing columns. Each entry is { title, uidt } — idempotent: if
+  // it's already there, skip. Centralised so adding a new audit column is one
+  // line. Order matters for first-time creation: NocoDB shows them in the UI
+  // in the order they were added.
+  const desired = [
+    { title: "Trace detail",   uidt: "LongText" },
+    { title: "Cost USD",       uidt: "Decimal" },
+    { title: "Input tokens",   uidt: "Number" },
+    { title: "Output tokens",  uidt: "Number" },
+    { title: "Cache read tokens",  uidt: "Number" },
+    { title: "Cache write tokens", uidt: "Number" },
+  ];
   try {
     const meta = await ncGet(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}`);
-    const columnTitles = (meta?.columns || []).map((c) => c.title);
-    if (columnTitles.includes("Trace detail")) {
-      console.log("[migrate] audit table already has Trace detail column");
+    const have = new Set((meta?.columns || []).map((c) => c.title));
+    const missing = desired.filter((c) => !have.has(c.title));
+    if (missing.length === 0) {
+      console.log("[migrate] audit table has all expected columns");
       return;
     }
-    console.log("[migrate] adding Trace detail column to audit table…");
-    await ncPost(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}/columns`, {
-      column_name: "Trace detail",
-      title: "Trace detail",
-      uidt: "LongText",
-    });
-    console.log("[migrate] Trace detail column added");
+    for (const col of missing) {
+      console.log(`[migrate] adding column ${col.title} (${col.uidt}) to audit table…`);
+      await ncPost(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}/columns`, {
+        column_name: col.title,
+        title: col.title,
+        uidt: col.uidt,
+      });
+    }
+    console.log(`[migrate] added ${missing.length} audit column(s)`);
   } catch (e) {
     // Don't block boot — audit logging tolerates missing fields (NocoDB drops
     // unknown keys silently). Surface loudly so we notice in Render logs.
@@ -4359,6 +4427,7 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs }) 
       .map((t) => ({ tool: t.tool, input: redactToolInput(t.input) }))
       .slice(0, 50); // cap to avoid massive audit rows
     const summaryShort = (result.summary || "").slice(0, 200).replace(/\n+/g, " ");
+    const usage = result.usage || {};
     const payload = {
       Summary: summaryShort || (result.error ? `Error: ${result.error.slice(0, 180)}` : "agent run"),
       Transcript: transcript,
@@ -4375,6 +4444,14 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs }) 
       Source: source,
       "Slack channel": slack_context?.channel || null,
       "Slack user id": slack_context?.user_id || null,
+      // Usage breakdown for caching visibility. After warm-up, cache_read
+      // should be ≥ 80% of input_tokens. If it's near zero, prompt caching
+      // is broken and we're paying full price every call.
+      "Cost USD": result.cost_usd != null ? Number(result.cost_usd.toFixed(6)) : null,
+      "Input tokens": usage.input || null,
+      "Output tokens": usage.output || null,
+      "Cache read tokens": usage.cache_read || null,
+      "Cache write tokens": usage.cache_write || null,
     };
     await ncPost(`/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records`, [payload]);
   } catch (e) {
@@ -4552,13 +4629,14 @@ app.post("/run", async (req, res) => {
     enrichedTranscript = ref + enrichedTranscript;
   }
   // If files arrived, append a manifest so the model sees them in the prompt
-  // text too (description = name + mime + role hint). The actual file_ids are
-  // attached to the first user message as content blocks inside runAgent.
+  // text too. Phrasing matters: this manifest only ever lists ANTHROPIC
+  // file_ids (uploaded by n8n via the Files API). The agent must NOT confuse
+  // them with Slack file IDs that show up in thread-context history lines.
   if (runAttachments.length > 0) {
     const manifest = runAttachments
-      .map((a) => `  - ${a.name || "unnamed"} · ${a.mimetype || "unknown"} · ${a.size ? a.size + " bytes" : "size unknown"} · file_id=${a.file_id}`)
+      .map((a) => `  - ${a.name || "unnamed"} · ${a.mimetype || "unknown"} · ${a.size ? a.size + " bytes" : "size unknown"} · anthropic_file_id=${a.file_id}`)
       .join("\n");
-    enrichedTranscript += `\n\n## Attached files (already uploaded to Files API and visible to you)\n${manifest}\n\nFor CSV / JSON / text content, you can reference these directly in code_execution by file_id (they land in /mnt/user-data/uploads/). For PDFs and images, the model can read them natively from the attached content blocks.`;
+    enrichedTranscript += `\n\n## Attached files in THIS message (Anthropic Files API; readable)\n${manifest}\n\nThese are real, readable Anthropic file_ids. Use code_execution for CSV/JSON/text (they land at /mnt/user-data/uploads/). Read PDFs and images directly via their content blocks.`;
   }
 
   // Note: the live-progress placeholder is now posted lazily by runAgent — it
