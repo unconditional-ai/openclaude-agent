@@ -106,7 +106,7 @@ Then **stop and wait**. Do not proceed on ambiguous responses ("looks good", "ok
 On `go`:
 
 1. **Schema changes first** (if any) — `add_table_column` for new columns (with `options[]` for SingleSelect), `add_select_options` for dropdown extensions. Each goes through its confirmation gate; you only proceed once the user says go.
-2. **INSERTs** via `create_person` per new row. Cohort linking is handled by `create_person`'s `cohort_name` arg — pass it once per row, don't call `link_person_to_cohort` separately.
+2. **INSERTs** via `bulk_import_people` (preferred) for any batch of 4+ people. One tool call takes the whole array; cohort/owner/source can be set as defaults at the top level so per-row args stay slim. For 1-3 rows, `create_person` per row is fine. Cohort linking is automatic via `cohort_name`.
 3. **UPDATEs** via `update_person` for each updated row.
 4. Track per-row outcome. If a row fails, **continue with the rest** — don't roll back the batch. Partial failure on messy CSVs is the normal case.
 
@@ -139,7 +139,8 @@ If a previous run was killed mid-batch (credit exhaustion, deploy, anything), yo
 - `code_execution` (CSV parsing, dedup, summary generation)
 - `list_tables` (schema discovery)
 - `lookup_person` (per-row dedup)
-- `create_person` (INSERTs)
+- `bulk_import_people` (preferred for 4+ rows, single call with array)
+- `create_person` (single INSERTs, 1-3 rows)
 - `update_person` (UPDATEs)
 - `add_table_column` (only after confirmation, for new columns)
 - `add_select_options` (only after confirmation, for dropdown extensions)

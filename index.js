@@ -643,6 +643,88 @@ const toolImpls = {
     };
   },
 
+  // Bulk version of create_person. Takes one array, loops server-side, returns
+  // aggregate results. Use this for any import of more than ~3 people — it
+  // saves significant output tokens vs N individual create_person tool calls
+  // (each create_person arg block is ~50-100 tokens; bulking dedupes shared
+  // fields like cohort_name and owner). Idempotency from create_person carries
+  // through: existing emails return already_existed=true and don't double-write.
+  //
+  // Per-person field shape: same as create_person args, minus duplication of
+  // shared fields (cohort_name, owner, source) which can be set at top level
+  // and overridden per row.
+  async bulk_import_people({
+    people,
+    default_cohort_name = null,
+    default_source = "Other",
+    default_owner = null,
+    default_status = null,
+    default_room = null,
+    confirmed = false,
+  }) {
+    if (!Array.isArray(people) || people.length === 0) {
+      return { error: "people[] is required (non-empty array of {name, primary_email, ...} objects)" };
+    }
+    if (people.length > 100) {
+      return { error: `bulk_import_people accepts up to 100 people per call (got ${people.length}). Split into smaller batches.` };
+    }
+    if (!confirmed) {
+      const preview = people.slice(0, 5).map((p) => `${p.name || "(unnamed)"} <${p.primary_email || "no email"}>`).join(", ");
+      const more = people.length > 5 ? ` … and ${people.length - 5} more` : "";
+      return pendingConfirmation(
+        `Bulk import ${people.length} people into cohort "${default_cohort_name || "(none specified)"}". Preview: ${preview}${more}.`,
+        {
+          people,
+          default_cohort_name,
+          default_source,
+          default_owner,
+          default_status,
+          default_room,
+          confirmed: true,
+        }
+      );
+    }
+    const results = [];
+    for (const p of people) {
+      try {
+        const res = await this.create_person({
+          name: p.name,
+          primary_email: p.primary_email || null,
+          primary_phone: p.primary_phone || null,
+          cohort_name: p.cohort_name || default_cohort_name,
+          source: p.source || default_source,
+          notes: p.notes || "",
+          room: p.room || default_room,
+          payment_status: p.payment_status || default_status,
+          payment_risk: p.payment_risk,
+          amount_total: p.amount_total,
+          amount_paid: p.amount_paid,
+          next_action: p.next_action,
+        });
+        results.push({
+          name: p.name,
+          email: p.primary_email,
+          person_id: res.id,
+          status: res.already_existed ? "already_existed" : (res.created ? "created" : "unknown"),
+          cohort_linked: res.cohort_linked || null,
+        });
+      } catch (e) {
+        results.push({ name: p.name, email: p.primary_email, status: "error", error: e.message });
+      }
+    }
+    const created = results.filter((r) => r.status === "created").length;
+    const existed = results.filter((r) => r.status === "already_existed").length;
+    const errors = results.filter((r) => r.status === "error").length;
+    return {
+      total: people.length,
+      created,
+      already_existed: existed,
+      errors,
+      results,
+      summary: `Bulk import done: ${created} created, ${existed} already existed, ${errors} errors.`,
+    };
+  },
+
   async update_payment({ person_id, payment_status, amount_total, amount_paid, payment_risk, confirmed = false }) {
     if (!confirmed) {
       const proposed = [];
@@ -2176,6 +2258,29 @@ const tools = [
     },
   },
   {
+    name: "bulk_import_people",
+    description:
+      "Create or update many People records in ONE tool call. Strongly preferred over calling create_person individually for any import of more than ~3 people — saves tokens (one big arg block dedupes shared fields like cohort_name and owner) and reduces iteration count. Idempotency carries through from create_person: existing emails are detected and returned with status='already_existed' rather than duplicated. CONFIRMATION GATED: first call returns a preview; second call with confirmed:true executes. Caps at 100 people per call — split larger imports into batches.",
+    defer_loading: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        people: {
+          type: "array",
+          description: "Array of person objects. Each accepts the same fields as create_person (name, primary_email, primary_phone, cohort_name, source, notes, room, payment_status, payment_risk, amount_total, amount_paid, next_action). Per-row fields override the default_* values.",
+          items: { type: "object" },
+        },
+        default_cohort_name: { type: "string", description: "Cohort to link all people to (each row can override with its own cohort_name)." },
+        default_source: { type: "string", enum: ["Direct", "Referral", "Workshop", "Website", "Social", "Other"], description: "Source value applied to people who don't have one set explicitly. Default: Other." },
+        default_owner: { type: "string", enum: ["Yohan", "Valerie", "Nathan"], description: "Owner applied to all rows lacking one. If null, create_person's default (Valerie) applies." },
+        default_status: { type: "string", enum: ["Unpaid", "Deposit paid", "On payment plan", "Paid in full", "Scholarship", "Refunded"], description: "Payment status applied to people who don't have one explicitly." },
+        default_room: { type: "string", description: "Room/pod applied to people who don't have one explicitly." },
+        confirmed: { type: "boolean", description: "Set true ONLY after the user has explicitly approved the previewed import." },
+      },
+      required: ["people"],
+    },
+  },
+  {
     name: "update_payment",
     description:
       "Update payment-related fields for a person in one call. When to use: user mentions payment activity (deposit received, paid in full, on monthly plan, refund, scholarship). 'Amount owing' is auto-computed. When NOT to use: for stage checkboxes related to payment (use toggle_stage with deposit_paid/payment_plan_active/paid_in_full instead) — though both can be needed together. CONFIRMATION GATED: first call with proposed values returns a preview; show it to the user, get explicit go-ahead, then re-call with confirmed: true.",
@@ -2931,10 +3036,10 @@ If a workflow needs a new durable capability we don't have, say so plainly and a
 
 DIRECT DATA MANIPULATION:
 For READS, default to query_table — it works on any table, supports filter / sort / fields / pagination, and keeps you flexible. Specialized read tools (list_people, lookup_person, find_person_by_phone) are conveniences worth using only when their built-in logic actually helps: list_people resolves cohort names to ids automatically, find_person_by_phone tries multiple phone-format variants, lookup_person handles email-vs-name disambiguation. Otherwise reach for query_table.
-For WRITES the default flips: PREFER specialized tools (update_person, update_payment, toggle_stage, create_person, add_note, log_touchpoint) over bulk_update_records / delete_records when one fits. The specialized write tools encode invariants you'd otherwise have to remember every call: update_payment auto-recomputes Amount owing; toggle_stage applies the documented stage cascade (welcome_email_sent → deposit_paid, etc.); add_note timestamps and appends instead of overwriting. Skipping them means silent drift in production data that's hard to spot weeks later. Use bulk_update_records / delete_records when the target is a non-People table, when you're applying the same change across many rows, or when no specialized tool covers the field.
+For WRITES the default flips: PREFER specialized tools (update_person, update_payment, toggle_stage, create_person, add_note, log_touchpoint) over bulk_update_records / delete_records when one fits. For importing 4 or more people at once, use bulk_import_people instead of looping create_person — it dedupes shared fields and saves a lot of output tokens. The specialized write tools encode invariants you'd otherwise have to remember every call: update_payment auto-recomputes Amount owing; toggle_stage applies the documented stage cascade (welcome_email_sent → deposit_paid, etc.); add_note timestamps and appends instead of overwriting. Skipping them means silent drift in production data that's hard to spot weeks later. Use bulk_update_records / delete_records when the target is a non-People table, when you're applying the same change across many rows, or when no specialized tool covers the field.
 
 CONFIRMATION GATING:
-A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records, add_select_options) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
+A few high-stakes tools (update_payment, create_calendar_event, delete_clickup_task, bulk_update_records, delete_records, add_select_options, bulk_import_people) require an explicit human go-ahead before executing. They take a 'confirmed' arg defaulting to false. The flow:
 1. First call — pass the proposed args without 'confirmed' (or with confirmed: false). The tool returns { status: "confirmation_required", action_summary, replay_args, to_proceed }.
 2. Reply to the user describing what's about to happen using action_summary, and ask them to confirm (e.g. "About to delete ClickUp task abc123 — confirm?").
 3. When they explicitly confirm in the next turn ("yes", "go ahead", thumbsup react), call the SAME tool again with the args from replay_args (which already includes confirmed: true). Args may be adjusted if the user pushed back ("yes but make it 400 instead of 500").
@@ -3315,12 +3420,45 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       console.warn(`[agent] budget exhausted on iter=${iteration}: $${conversationCostUsd.toFixed(4)} > $${MAX_USD_PER_CONVERSATION}`);
       // Push the assistant turn before bailing so the audit trail captures it.
       messages.push({ role: "assistant", content: truncateLargeCodeExecOutputs(response.content) });
+
+      // Build a "what was done so far" summary from the trace so on resume
+      // the user (and Compass) can see progress without re-reading the audit.
+      // Each /run is stateless — Compass loses the parsed CSV / lookup results
+      // / etc. on the next run — but the Slack-visible message survives, so
+      // putting concrete progress here means Compass on resume can pick up
+      // intelligently rather than re-discovering everything.
+      const toolCounts = {};
+      for (const t of trace || []) {
+        if (!t?.tool) continue;
+        toolCounts[t.tool] = (toolCounts[t.tool] || 0) + 1;
+      }
+      const created = (trace || []).filter((t) => t.tool === "create_person" && t.result?.created).length;
+      const existed = (trace || []).filter((t) => t.tool === "create_person" && t.result?.already_existed).length;
+      const bulkResults = (trace || [])
+        .filter((t) => t.tool === "bulk_import_people" && t.result?.results)
+        .flatMap((t) => t.result.results);
+      const bulkCreated = bulkResults.filter((r) => r.status === "created").length;
+      const bulkExisted = bulkResults.filter((r) => r.status === "already_existed").length;
+      const totalCreated = created + bulkCreated;
+      const totalExisted = existed + bulkExisted;
+      const toolSummary = Object.entries(toolCounts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, n]) => `${name}×${n}`)
+        .join(", ");
+
+      let progressLine = "";
+      if (totalCreated > 0 || totalExisted > 0) {
+        progressLine = `\n\nProgress so far: ${totalCreated} people created, ${totalExisted} already existed (skipped).`;
+      } else if (toolSummary) {
+        progressLine = `\n\nActions so far: ${toolSummary}.`;
+      }
+
       return {
         ok: false,
         budget_exhausted: true,
         cost_usd: conversationCostUsd,
         summary:
-          `This task hit the $${MAX_USD_PER_CONVERSATION.toFixed(2)} per-conversation budget cap (spent $${conversationCostUsd.toFixed(2)}). Reply 'continue' to extend with another budget.`,
+          `This task hit the $${MAX_USD_PER_CONVERSATION.toFixed(2)} per-conversation budget cap (spent $${conversationCostUsd.toFixed(2)}).${progressLine}\n\nReply 'continue' to extend with another budget — I'll pick up where I left off (any rows already done will be skipped automatically via the email-dedup check).`,
         stop_reason: "budget_exhausted",
         iterations: iteration,
         trace,
@@ -3607,6 +3745,7 @@ const TOOL_HUMAN_LABELS = {
   lookup_person: "Looked up person",
   lookup_cohort: "Looked up cohort",
   create_person: "Created person record",
+  bulk_import_people: "Bulk-imported people",
   update_person: "Updated person",
   toggle_stage: "Updated onboarding stage",
   add_note: "Added note",
@@ -4273,7 +4412,7 @@ const THREAD_STATE_TABLE_TITLE = "Compass thread state";
 // while still tripping the guard before runaway loops cost anything material.
 // Bumped per "continue" by the user (the next run on a `budget_exhausted`
 // thread resets cost_usd to 0 before proceeding).
-const MAX_USD_PER_CONVERSATION = parseFloat(process.env.MAX_USD_PER_CONVERSATION || "1.50");
+const MAX_USD_PER_CONVERSATION = parseFloat(process.env.MAX_USD_PER_CONVERSATION || "5.00");
 
 // Pricing table for cost guard. Keep in sync with
 // https://docs.claude.com/en/docs/about-claude/pricing — out of date prices
