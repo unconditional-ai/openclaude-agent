@@ -4744,14 +4744,19 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       continue;
     }
 
+    // Concatenate every text block, not just the first. Server-side tools
+    // (code_execution, web_search) interleave content within a single response
+    // — typical shape is text → server_tool_use → result → ... → text — so
+    // `.find()` would return only the preamble and drop the actual answer.
+    const summaryText = textBlocks.map((b) => b.text || "").join("\n\n").trim();
+
     if (response.stop_reason === "end_turn") {
-      const textBlock = response.content.find((b) => b.type === "text");
       // Successfully completed — drop the checkpoint so the next /run on this
       // thread starts fresh rather than re-loading a stale conversation.
       if (threadTs) await clearCheckpoint(threadTs).catch(() => {});
       return {
         ok: true,
-        summary: textBlock?.text || "Done.",
+        summary: summaryText || "Done.",
         cost_usd: conversationCostUsd,
         iterations: iteration,
         trace,
@@ -4763,10 +4768,9 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
 
     // Other stop reasons (max_tokens, stop_sequence, etc.) with no tool calls
     // to dispatch — surface what we have.
-    const textBlock = response.content.find((b) => b.type === "text");
     return {
       ok: false,
-      summary: textBlock?.text || `Stopped: ${response.stop_reason}`,
+      summary: summaryText || `Stopped: ${response.stop_reason}`,
       stop_reason: response.stop_reason,
       cost_usd: conversationCostUsd,
       iterations: iteration,
@@ -6505,33 +6509,6 @@ app.post("/run", async (req, res) => {
     );
   }
 
-  // Server-side fallback: if n8n didn't forward any attachments (thread-reply
-  // and DM paths don't currently run the Files-API sub-flow), look at the
-  // triggering Slack message ourselves, download any files via SLACK_BOT_TOKEN,
-  // and upload them to the Anthropic Files API. This makes file uploads work
-  // uniformly across mention / name-match / thread-reply / DM without needing
-  // four copies of the same sub-flow in n8n.
-  const runAttachments = [...validAttachments];
-  if (validAttachments.length > 0) {
-    console.log(`[agent] received ${validAttachments.length} attachment(s) from n8n: ${validAttachments.map((a) => a.file_id).join(",")}`);
-  }
-  if (runAttachments.length === 0 && slack_context?.channel) {
-    console.log(`[agent] no n8n attachments — running slack-files fallback (channel=${slack_context.channel} ts=${slack_context.ts} thread_ts=${slack_context.thread_ts})`);
-    const slackFiles = await fetchSlackTriggeringFiles(slack_context);
-    if (slackFiles.length > 0) {
-      console.log(`[agent] slack-files fallback: ${slackFiles.length} file(s) — uploading to Anthropic`);
-      for (const f of slackFiles) {
-        try {
-          const entry = await uploadSlackFileToAnthropic(f);
-          runAttachments.push(entry);
-          console.log(`[agent] slack-files fallback uploaded ${entry.name} (${entry.size}B) → ${entry.file_id}`);
-        } catch (e) {
-          console.error(`[agent] slack-files fallback skipped ${f.name || f.id}: ${e.message}`);
-        }
-      }
-    }
-  }
-
   console.log(`[agent] transcript: ${redactPII(transcript).slice(0, 200)}`);
   const t0 = Date.now();
 
@@ -6542,12 +6519,14 @@ app.post("/run", async (req, res) => {
   // from a budget_exhausted or credit_paused thread so the user's "continue"
   // gets a fresh per-conversation budget.
   //
-  // Returns one of:
-  //   { proceed: true, resetCost: bool }
-  //   { proceed: false, react: ":eyes:" }   ← skip this run, react instead
+  // Runs BEFORE the slack-files fallback because Slack regularly emits two
+  // events for a single upload-with-comment (a `message` event and a
+  // `file_shared` event). Both reach /run within ~1s. If the guard ran after
+  // the fallback, the second request would still download the file from
+  // Slack and re-upload to Anthropic before bailing — wasted work.
   //
-  // Silently passes through (proceed: true) if THREAD_STATE.tableId is null
-  // — graceful degradation if the table didn't auto-create.
+  // Silently passes through if THREAD_STATE.tableId is null — graceful
+  // degradation if the table didn't auto-create.
   const threadTs = slack_context?.thread_ts || slack_context?.ts || null;
   let resumeFromPause = false;
   if (threadTs && THREAD_STATE.tableId) {
@@ -6596,6 +6575,33 @@ app.post("/run", async (req, res) => {
       last_started: new Date().toISOString(),
       ...(resumeFromPause ? { cost_usd: 0 } : {}),
     });
+  }
+
+  // Server-side fallback: if n8n didn't forward any attachments (thread-reply
+  // and DM paths don't currently run the Files-API sub-flow), look at the
+  // triggering Slack message ourselves, download any files via SLACK_BOT_TOKEN,
+  // and upload them to the Anthropic Files API. This makes file uploads work
+  // uniformly across mention / name-match / thread-reply / DM without needing
+  // four copies of the same sub-flow in n8n.
+  const runAttachments = [...validAttachments];
+  if (validAttachments.length > 0) {
+    console.log(`[agent] received ${validAttachments.length} attachment(s) from n8n: ${validAttachments.map((a) => a.file_id).join(",")}`);
+  }
+  if (runAttachments.length === 0 && slack_context?.channel) {
+    console.log(`[agent] no n8n attachments — running slack-files fallback (channel=${slack_context.channel} ts=${slack_context.ts} thread_ts=${slack_context.thread_ts})`);
+    const slackFiles = await fetchSlackTriggeringFiles(slack_context);
+    if (slackFiles.length > 0) {
+      console.log(`[agent] slack-files fallback: ${slackFiles.length} file(s) — uploading to Anthropic`);
+      for (const f of slackFiles) {
+        try {
+          const entry = await uploadSlackFileToAnthropic(f);
+          runAttachments.push(entry);
+          console.log(`[agent] slack-files fallback uploaded ${entry.name} (${entry.size}B) → ${entry.file_id}`);
+        } catch (e) {
+          console.error(`[agent] slack-files fallback skipped ${f.name || f.id}: ${e.message}`);
+        }
+      }
+    }
   }
 
   let enrichedTranscript = transcript;
