@@ -57,12 +57,13 @@ for (const [k, v] of Object.entries(requiredEnv)) {
   }
 }
 
-// code_execution and the Files API both still need beta opt-in headers as of
-// May 2026. Set once at the client so every messages.create inherits them.
+// code_execution_20260120 is GA and no longer takes a beta header (the API
+// rejects `code-execution-2026-01-20` as an unknown value). Files API still
+// needs its opt-in. Set once at the client so every messages.create inherits.
 const anthropic = new Anthropic({
   apiKey: ANTHROPIC_API_KEY,
   defaultHeaders: {
-    "anthropic-beta": "code-execution-2026-01-20,files-api-2025-04-14",
+    "anthropic-beta": "files-api-2025-04-14",
   },
 });
 
