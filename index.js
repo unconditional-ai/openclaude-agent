@@ -5161,12 +5161,18 @@ async function fetchSlackTriggeringFiles(slackContext) {
     }
   }
 
-  // === Pass 2: channel scan (always, but especially valuable when in a
-  // thread that doesn't contain the file). Common pattern: user posts a
-  // CSV at the channel level, then later starts a thread on something
-  // else. The CSV is a sibling channel message — invisible to
-  // conversations.replies on the unrelated thread. Catch it via
-  // conversations.history near the trigger ts. ===
+  // === Pass 2: channel scan — only for top-level messages (no thread).
+  // When thread_ts is set, conversations.replies already returns the
+  // parent message and its files, so Pass 1 covers the "file on parent,
+  // discuss in thread" case. Running a channel scan in thread context
+  // grabs stale files from unrelated threads — that caused Compass to
+  // hallucinate CSV references on unrelated questions (May 2026 bug). ===
+  if (slackContext.thread_ts) {
+    if (collected.length === 0) {
+      console.log(`[slack-files] in-thread context — skipping channel scan (thread should contain all relevant files)`);
+    }
+    return collected.slice(0, MAX_FALLBACK_FILES);
+  }
   try {
     const histParams = { channel, limit: 20 };
     if (haveExplicitTs) {
@@ -5683,6 +5689,7 @@ async function ensureAuditSchema() {
     { title: "Output tokens",  uidt: "Number" },
     { title: "Cache read tokens",  uidt: "Number" },
     { title: "Cache write tokens", uidt: "Number" },
+    { title: "Attachments",        uidt: "LongText" },
   ];
   try {
     const meta = await ncGet(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}`);
@@ -6422,7 +6429,7 @@ function redactToolInput(input) {
 // "what did Compass actually do at 4:15 PM" is answerable from NocoDB without
 // re-reading Render logs. Outputs are not logged (too verbose, varies wildly);
 // the tool name + redacted input is enough to reconstruct intent.
-async function logAgentAction({ transcript, slack_context, result, elapsedMs }) {
+async function logAgentAction({ transcript, slack_context, result, elapsedMs, attachments = [] }) {
   if (!AGENT_ACTIONS_TABLE_ID) return;
   try {
     const source = slack_context?.file_id ? "Slack voice" : (slack_context?.channel ? "Slack text" : "API call");
@@ -6457,6 +6464,9 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs }) 
       "Output tokens": usage.output || null,
       "Cache read tokens": usage.cache_read || null,
       "Cache write tokens": usage.cache_write || null,
+      "Attachments": attachments.length > 0
+        ? JSON.stringify(attachments.map((a) => ({ name: a.name, mime: a.mimetype, size: a.size, file_id: a.file_id })))
+        : null,
     };
     await ncPost(`/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records`, [payload]);
   } catch (e) {
@@ -6684,7 +6694,7 @@ app.post("/run", async (req, res) => {
   }
 
   // Audit log — fire-and-forget, don't block the response on it
-  logAgentAction({ transcript, slack_context, result, elapsedMs });
+  logAgentAction({ transcript, slack_context, result, elapsedMs, attachments: runAttachments });
 
   // Reply to Slack — either by editing the live-progress placeholder in place
   // (the common path) or by posting fresh (placeholder post failed earlier).
