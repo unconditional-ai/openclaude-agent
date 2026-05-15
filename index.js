@@ -14,7 +14,6 @@ const {
   ANTHROPIC_API_KEY,
   NOCODB_URL,
   NOCODB_TOKEN,
-  AGENT_ACTIONS_TABLE_ID = "mkifqf7pr88ytsp",
   COMPASS_PROMPT_TABLE_ID,
   NOCODB_BASE_ID,
 
@@ -42,6 +41,10 @@ let TOUCHPOINTS_TABLE_ID             = process.env.TOUCHPOINTS_TABLE_ID         
 let KNOWLEDGE_TABLE_ID               = process.env.KNOWLEDGE_TABLE_ID               || null;
 let COHORTS_LINK_COLUMN_ID           = process.env.COHORTS_LINK_COLUMN_ID           || null;
 let TOUCHPOINTS_PERSON_LINK_COLUMN_ID = process.env.TOUCHPOINTS_PERSON_LINK_COLUMN_ID || null;
+// Audit table also auto-discovered by title ("Agent actions"). Pin via
+// AGENT_ACTIONS_TABLE_ID env if you want to force a specific table id (e.g.
+// when running against a base where the title differs).
+let AGENT_ACTIONS_TABLE_ID           = process.env.AGENT_ACTIONS_TABLE_ID           || null;
 
 const requiredEnv = {
   ANTHROPIC_API_KEY,
@@ -5664,6 +5667,69 @@ async function ensureCoreNocoIds() {
   }
 }
 await ensureCoreNocoIds();
+
+// Auto-discover (or create) the Agent actions audit table. Mirrors the
+// ensureThreadStateTable() pattern: resolves base_id from People meta, looks
+// for the table by title, creates it with the full column schema if missing.
+// Lets the staging service "just work" against a fresh base — no manual table
+// setup or env override required. Pinned via AGENT_ACTIONS_TABLE_ID env if set.
+const AGENT_ACTIONS_TABLE_TITLE = "Agent actions";
+async function ensureAgentActionsTable() {
+  if (AGENT_ACTIONS_TABLE_ID) {
+    console.log(`[migrate] audit table pinned via env: ${AGENT_ACTIONS_TABLE_ID}`);
+    return;
+  }
+  if (!PEOPLE_TABLE_ID) {
+    console.warn("[migrate] PEOPLE_TABLE_ID not set — cannot discover base for audit table");
+    return;
+  }
+  try {
+    const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
+    const baseId = peopleMeta?.base_id || peopleMeta?.source_id || peopleMeta?.fk_base_id;
+    if (!baseId) {
+      console.warn("[migrate] could not resolve base_id from People table — skipping audit table setup");
+      return;
+    }
+    const tablesResp = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
+    const tables = tablesResp?.list || tablesResp?.tables || tablesResp || [];
+    const existing = tables.find((t) => t.title === AGENT_ACTIONS_TABLE_TITLE);
+    if (existing) {
+      AGENT_ACTIONS_TABLE_ID = existing.id;
+      console.log(`[migrate] audit table found: ${existing.id}`);
+      return;
+    }
+    console.log(`[migrate] creating ${AGENT_ACTIONS_TABLE_TITLE} table…`);
+    const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
+      table_name: AGENT_ACTIONS_TABLE_TITLE,
+      title: AGENT_ACTIONS_TABLE_TITLE,
+      columns: [
+        { column_name: "Summary",              title: "Summary",              uidt: "SingleLineText" },
+        { column_name: "Transcript",           title: "Transcript",           uidt: "LongText" },
+        { column_name: "Agent response",       title: "Agent response",       uidt: "LongText" },
+        { column_name: "Tools used",           title: "Tools used",           uidt: "LongText" },
+        { column_name: "Trace detail",         title: "Trace detail",         uidt: "LongText" },
+        { column_name: "Iterations",           title: "Iterations",           uidt: "Number" },
+        { column_name: "Elapsed ms",           title: "Elapsed ms",           uidt: "Number" },
+        { column_name: "Success",              title: "Success",              uidt: "Checkbox" },
+        { column_name: "Needed clarification", title: "Needed clarification", uidt: "Checkbox" },
+        { column_name: "Source",               title: "Source",               uidt: "SingleLineText" },
+        { column_name: "Slack channel",        title: "Slack channel",        uidt: "SingleLineText" },
+        { column_name: "Slack user id",        title: "Slack user id",        uidt: "SingleLineText" },
+        { column_name: "Cost USD",             title: "Cost USD",             uidt: "Decimal" },
+        { column_name: "Input tokens",         title: "Input tokens",         uidt: "Number" },
+        { column_name: "Output tokens",        title: "Output tokens",        uidt: "Number" },
+        { column_name: "Cache read tokens",    title: "Cache read tokens",    uidt: "Number" },
+        { column_name: "Cache write tokens",   title: "Cache write tokens",   uidt: "Number" },
+        { column_name: "Attachments",          title: "Attachments",          uidt: "LongText" },
+      ],
+    });
+    AGENT_ACTIONS_TABLE_ID = created?.id;
+    console.log(`[migrate] audit table created: ${AGENT_ACTIONS_TABLE_ID}`);
+  } catch (e) {
+    console.error(`[migrate] ensureAgentActionsTable failed (continuing without audit logging): ${e.message}`);
+  }
+}
+await ensureAgentActionsTable();
 
 // Idempotent schema migration for the Agent actions audit table. Adds the
 // `Trace detail` column (LongText) on boot if it doesn't already exist. Self-
