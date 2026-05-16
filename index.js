@@ -1320,6 +1320,16 @@ const toolImpls = {
     const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
     const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
     if (!baseId) return { error: "Could not determine base ID from People table metadata" };
+    // Fetch the base's human-readable title so Compass can answer "what base
+    // am I in?" without leaking the raw id. Non-fatal if it fails — fall back
+    // to id-only.
+    let baseTitle = null;
+    try {
+      const baseMeta = await ncGet(`/api/v2/meta/bases/${baseId}`);
+      baseTitle = baseMeta?.title || baseMeta?.name || null;
+    } catch (e) {
+      console.warn(`[list_tables] base title lookup failed: ${e.message}`);
+    }
     const data = await ncGet(`/api/v2/meta/bases/${baseId}/tables`);
     // Filter out Compass-internal infrastructure tables. Thread state is the
     // agent's own scratch memory; surfacing it invites confused reads/writes
@@ -1341,7 +1351,7 @@ const toolImpls = {
         table_name: t.table_name,
         description: t.description || null,
       }));
-    return { base_id: baseId, tables };
+    return { base_id: baseId, base_title: baseTitle, tables };
   },
 
   async add_table_column({ table_id, name, type = "SingleLineText", options = null }) {
