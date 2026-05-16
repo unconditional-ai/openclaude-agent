@@ -60,15 +60,14 @@ for (const [k, v] of Object.entries(requiredEnv)) {
   }
 }
 
-// code_execution and the Files API need beta opt-in headers. The value
-// changes when Anthropic versions a beta (the API hard-rejects unknown
-// values), so make it overridable via env so we can rotate without a
-// redeploy. Default reflects the betas in use as of May 2026; set
-// ANTHROPIC_BETA="" to disable beta features entirely (e.g. while
-// debugging an API-side rejection).
+// Only the Files API still requires a beta header — code_execution_20260120
+// went GA and now hard-rejects the old `code-execution-2026-01-20` beta
+// value (was breaking every /run that touched the API). Keep this
+// overridable via env so we can rotate or disable without a redeploy: set
+// ANTHROPIC_BETA="" to disable beta features entirely.
 const ANTHROPIC_BETA = process.env.ANTHROPIC_BETA !== undefined
   ? process.env.ANTHROPIC_BETA
-  : "code-execution-2026-01-20,files-api-2025-04-14";
+  : "files-api-2025-04-14";
 const anthropic = new Anthropic({
   apiKey: ANTHROPIC_API_KEY,
   defaultHeaders: ANTHROPIC_BETA ? { "anthropic-beta": ANTHROPIC_BETA } : {},
