@@ -116,6 +116,50 @@ async function ncDelete(path, body) {
   return res.json();
 }
 
+// ---------- Base guard ----------
+// NocoDB personal API tokens are workspace-scoped, not base-scoped: a single
+// token grants read+write to every base the issuing user can see. Prod and
+// staging Compass share one token, so the boundary between the two databases
+// has to be enforced in code. RESOLVED_BASE_ID is captured at boot from
+// discoverBaseId(); every agent-callable tool that takes a table_id (or that
+// targets a base directly) must verify the target lives in this base before
+// the request goes out. A misconfigured table-id env, a hallucinated id, a
+// prod id pasted into staging chat — all refused at the helper layer instead
+// of silently crossing the boundary.
+let RESOLVED_BASE_ID = null;
+const _tableBaseIdCache = new Map();
+
+async function getTableBaseId(tableId) {
+  if (_tableBaseIdCache.has(tableId)) return _tableBaseIdCache.get(tableId);
+  const meta = await ncGet(`/api/v2/meta/tables/${tableId}`);
+  const id = meta?.base_id || meta?.source_id || meta?.fk_base_id || null;
+  if (id) _tableBaseIdCache.set(tableId, id);
+  return id;
+}
+
+async function assertSameBase(tableId, op = "access") {
+  if (!RESOLVED_BASE_ID) throw new Error("base-guard: RESOLVED_BASE_ID not set at boot — refusing");
+  if (!tableId) throw new Error(`base-guard: ${op} called with no table_id`);
+  const baseId = await getTableBaseId(tableId);
+  if (!baseId) throw new Error(`base-guard: could not resolve base for table ${tableId}`);
+  if (baseId !== RESOLVED_BASE_ID) {
+    throw new Error(
+      `base-guard: refusing ${op} on table ${tableId} — belongs to base ${baseId}, ` +
+      `but this Compass is wired to base ${RESOLVED_BASE_ID}. Cross-base calls are not allowed.`
+    );
+  }
+}
+
+function assertBaseMatches(baseId, op = "access") {
+  if (!RESOLVED_BASE_ID) throw new Error("base-guard: RESOLVED_BASE_ID not set at boot — refusing");
+  if (!baseId) throw new Error(`base-guard: ${op} called with no base_id`);
+  if (baseId !== RESOLVED_BASE_ID) {
+    throw new Error(
+      `base-guard: refusing ${op} on base ${baseId} — this Compass is wired to base ${RESOLVED_BASE_ID}.`
+    );
+  }
+}
+
 const STAGE_ORDER = [
   "onboarding_call_done",
   "deposit_paid",
@@ -1317,6 +1361,7 @@ const toolImpls = {
     } else if (options) {
       return { error: `options[] is only valid for SingleSelect or MultiSelect (got type=${type}).` };
     }
+    await assertSameBase(table_id, "add_table_column");
     const body = { column_name: name, title: name, uidt: type };
     if (options) body.colOptions = { options: options.map((v) => ({ title: String(v) })) };
     const created = await ncPost(`/api/v2/meta/tables/${table_id}/columns`, body);
@@ -1335,6 +1380,7 @@ const toolImpls = {
     if (!Array.isArray(new_options) || new_options.length === 0) {
       return { error: "new_options must be a non-empty array of value strings" };
     }
+    await assertSameBase(table_id, "add_select_options");
     if (!confirmed) {
       return pendingConfirmation(
         `Add ${new_options.length} new option${new_options.length === 1 ? "" : "s"} to column ${column_id}: ${new_options.join(", ")}.`,
@@ -1393,6 +1439,7 @@ const toolImpls = {
     const peopleMeta = await ncGet(`/api/v2/meta/tables/${PEOPLE_TABLE_ID}`);
     const baseId = peopleMeta.base_id || peopleMeta.source_id || peopleMeta.fk_base_id;
     if (!baseId) return { error: "Could not determine base ID" };
+    assertBaseMatches(baseId, "create_table");
     const created = await ncPost(`/api/v2/meta/bases/${baseId}/tables`, {
       table_name: name,
       title: name,
@@ -1412,6 +1459,7 @@ const toolImpls = {
     if (records.length > 100) {
       return { error: `bulk_create_records accepts up to 100 records per call (got ${records.length}). Split into smaller batches.` };
     }
+    await assertSameBase(table_id, "bulk_create_records");
     const created = await ncPost(`/api/v2/tables/${table_id}/records`, records);
     const ids = (Array.isArray(created) ? created : [created]).map((r) => r.Id ?? r.id);
     return { table_id, count: ids.length, ids };
@@ -1424,6 +1472,7 @@ const toolImpls = {
   async query_table({ table_id, where = null, fields = null, sort = null, limit = 25, offset = 0 }) {
     if (!table_id) return { error: "table_id required (use list_tables to discover)" };
     if (limit > 200) return { error: "limit cannot exceed 200" };
+    await assertSameBase(table_id, "query_table");
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (where) params.set("where", where);
     if (Array.isArray(fields) && fields.length > 0) params.set("fields", fields.join(","));
@@ -1452,6 +1501,7 @@ const toolImpls = {
     if (missingId !== -1) {
       return { error: `record at index ${missingId} is missing 'Id' (required for update)` };
     }
+    await assertSameBase(table_id, "bulk_update_records");
     if (!confirmed) {
       return pendingConfirmation(
         `Update ${records.length} row${records.length === 1 ? "" : "s"} in table ${table_id}. Affected Ids: ${records.map((r) => r.Id).join(", ")}.`,
@@ -1471,6 +1521,7 @@ const toolImpls = {
     if (record_ids.length > 100) {
       return { error: `delete_records accepts up to 100 ids per call (got ${record_ids.length}).` };
     }
+    await assertSameBase(table_id, "delete_records");
     if (!confirmed) {
       return pendingConfirmation(
         `Delete ${record_ids.length} row${record_ids.length === 1 ? "" : "s"} from table ${table_id} (irreversible). Ids: ${record_ids.join(", ")}.`,
@@ -5570,14 +5621,10 @@ async function discoverBaseId() {
 }
 
 async function ensureCoreNocoIds() {
-  // Skip the lookup if every ID is already pinned via env — no work to do.
-  const allPinned = PEOPLE_TABLE_ID && COHORTS_TABLE_ID && TOUCHPOINTS_TABLE_ID &&
-                    KNOWLEDGE_TABLE_ID && COHORTS_LINK_COLUMN_ID && TOUCHPOINTS_PERSON_LINK_COLUMN_ID;
-  if (allPinned) {
-    console.log("[migrate] all core NocoDB IDs pinned via env — skipping auto-discovery");
-    return;
-  }
-
+  // Resolve the base id first, regardless of whether the table ids are pinned.
+  // The base-guard relies on RESOLVED_BASE_ID being set for every request that
+  // takes a table_id; skipping this on the allPinned path would leave the
+  // guard disabled in the most common prod config.
   let baseId;
   try {
     baseId = await discoverBaseId();
@@ -5585,7 +5632,16 @@ async function ensureCoreNocoIds() {
     console.error(`[migrate] FATAL: could not resolve NocoDB base id: ${e.message}`);
     process.exit(1);
   }
+  RESOLVED_BASE_ID = baseId;
   console.log(`[migrate] resolved NocoDB base: ${baseId}`);
+
+  // Skip the table-id auto-discovery if every ID is already pinned via env.
+  const allPinned = PEOPLE_TABLE_ID && COHORTS_TABLE_ID && TOUCHPOINTS_TABLE_ID &&
+                    KNOWLEDGE_TABLE_ID && COHORTS_LINK_COLUMN_ID && TOUCHPOINTS_PERSON_LINK_COLUMN_ID;
+  if (allPinned) {
+    console.log("[migrate] all core NocoDB IDs pinned via env — skipping table auto-discovery");
+    return;
+  }
 
   let tables;
   try {
