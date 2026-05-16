@@ -60,13 +60,18 @@ for (const [k, v] of Object.entries(requiredEnv)) {
   }
 }
 
-// code_execution and the Files API both still need beta opt-in headers as of
-// May 2026. Set once at the client so every messages.create inherits them.
+// code_execution and the Files API need beta opt-in headers. The value
+// changes when Anthropic versions a beta (the API hard-rejects unknown
+// values), so make it overridable via env so we can rotate without a
+// redeploy. Default reflects the betas in use as of May 2026; set
+// ANTHROPIC_BETA="" to disable beta features entirely (e.g. while
+// debugging an API-side rejection).
+const ANTHROPIC_BETA = process.env.ANTHROPIC_BETA !== undefined
+  ? process.env.ANTHROPIC_BETA
+  : "code-execution-2026-01-20,files-api-2025-04-14";
 const anthropic = new Anthropic({
   apiKey: ANTHROPIC_API_KEY,
-  defaultHeaders: {
-    "anthropic-beta": "code-execution-2026-01-20,files-api-2025-04-14",
-  },
+  defaultHeaders: ANTHROPIC_BETA ? { "anthropic-beta": ANTHROPIC_BETA } : {},
 });
 
 // ---------- NocoDB helpers ----------
@@ -5164,42 +5169,18 @@ async function fetchSlackTriggeringFiles(slackContext) {
     }
   }
 
-  // === Pass 2: channel scan — only for top-level messages (no thread).
-  // When thread_ts is set, conversations.replies already returns the
-  // parent message and its files, so Pass 1 covers the "file on parent,
-  // discuss in thread" case. Running a channel scan in thread context
-  // grabs stale files from unrelated threads — that caused Compass to
-  // hallucinate CSV references on unrelated questions (May 2026 bug). ===
-  if (slackContext.thread_ts) {
-    if (collected.length === 0) {
-      console.log(`[slack-files] in-thread context — skipping channel scan (thread should contain all relevant files)`);
-    }
-    return collected.slice(0, MAX_FALLBACK_FILES);
-  }
-  try {
-    const histParams = { channel, limit: 20 };
-    if (haveExplicitTs) {
-      histParams.latest = triggerTs;
-      histParams.inclusive = true;
-    }
-    const data = await slackApi("conversations.history", histParams);
-    const messages = (data.messages || []).slice().reverse(); // chronological
-    const messagesWithFiles = messages.filter((m) => (m.files || []).length > 0);
-    const allIds = messagesWithFiles.flatMap((m) => (m.files || []).map((f) => f?.id || "?"));
-    console.log(
-      `[slack-files] channel: ${messages.length} messages, ${messagesWithFiles.length} have files, ids=[${allIds.join(",")}]`
-    );
-    const fromChannel = collectUniqueFiles(messages, MAX_FALLBACK_FILES - collected.length, seenIds, seenContent);
-    collected.push(...fromChannel);
-    if (fromChannel.length > 0) {
-      console.log(`[slack-files] channel walk-back: collected ${fromChannel.length} new (ids=[${fromChannel.map((f) => f.id).join(",")}])`);
-    }
-  } catch (e) {
-    console.warn(`[slack-files] channel scan failed: ${e.message}`);
-  }
-
+  // No channel-level walk-back. We previously did a second pass over
+  // recent channel messages to catch the exotic case "file is on a sibling
+  // channel message, not in this thread" — but that scan can't distinguish
+  // a genuinely-related sibling file from a stale file in an unrelated
+  // thread, and routinely surfaced phantoms (May 2026: stale .m4a from a
+  // hours-old voice note got injected into an unrelated curriculum-hub
+  // thread, causing Compass to hallucinate a non-existent "voice note").
+  // If a user wants Compass to see a file, the file needs to live in this
+  // thread — either on the trigger message or on the thread parent — both
+  // of which Pass 1 covers via conversations.replies.
   if (collected.length === 0) {
-    console.log(`[slack-files] no files found in thread or channel scan`);
+    console.log(`[slack-files] no files found in thread scan`);
   }
   return collected.slice(0, MAX_FALLBACK_FILES);
 }
