@@ -7,6 +7,7 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHmac } from "node:crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -6887,6 +6888,44 @@ function timingSafeEq(a, b) {
   return mismatch === 0;
 }
 
+// Verify a Slack request via the signing-secret HMAC scheme.
+// https://api.slack.com/authentication/verifying-requests-from-slack
+//
+// Used by Slack-direct endpoints (slash commands, interactivity) where the
+// request comes from slack.com without an intermediate n8n hop that would
+// otherwise authenticate via RUN_SHARED_SECRET.
+//
+// Requires SLACK_SIGNING_SECRET env var, copied from the Slack app's "Basic
+// Information" page. Returns false (and refuses the request) if unset rather
+// than silently accepting — fail-closed for credential mishandling.
+//
+// Replays are rejected if the timestamp is more than 5 minutes off our clock,
+// matching Slack's recommendation.
+function verifySlackSignature(req) {
+  const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+  if (!SLACK_SIGNING_SECRET) {
+    console.warn("[slack-verify] SLACK_SIGNING_SECRET not set — refusing request");
+    return false;
+  }
+  const ts = req.get("x-slack-request-timestamp");
+  const sig = req.get("x-slack-signature");
+  const raw = req.rawBody;
+  if (!ts || !sig || typeof raw !== "string") return false;
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 300) return false;
+  const basestring = `v0:${ts}:${raw}`;
+  const expected = `v0=${createHmac("sha256", SLACK_SIGNING_SECRET).update(basestring).digest("hex")}`;
+  return timingSafeEq(expected, sig);
+}
+
+// Body parser for Slack slash commands (form-urlencoded) that ALSO captures
+// the raw body string so we can verify the signature against it. Slack signs
+// the raw bytes — re-serialising the parsed form would not match.
+const slackFormParser = express.urlencoded({
+  extended: false,
+  verify: (req, _res, buf) => { req.rawBody = buf.toString("utf8"); },
+});
+
 app.post("/run", async (req, res) => {
   // Auth gate. RUN_SHARED_SECRET is required in production — n8n sends it as
   // X-Run-Secret. We also accept Authorization: Bearer <secret> for callers
@@ -7198,6 +7237,101 @@ app.post("/run", async (req, res) => {
 // — same gate as /run.
 //
 // Slack requires a 200 within 3 seconds. We ack first, then process async so
+// Slash command: /knowledge — let the user inspect Compass's knowledge store
+// directly without going through the agent. Returns an ephemeral message
+// visible only to the caller.
+//
+// Modes (the slash command's text argument):
+//   /knowledge              → 25 most recent entries (newest first)
+//   /knowledge all          → up to 200 entries, newest first
+//   /knowledge tag <name>   → entries tagged <name>
+//   /knowledge <substring>  → entries whose topic or content contains <substring>
+//
+// Auth: Slack-signature HMAC against SLACK_SIGNING_SECRET. Configure the
+// command in api.slack.com → your Compass app → Slash Commands:
+//   Command:        /knowledge
+//   Request URL:    https://<service>.onrender.com/slash-knowledge
+//   Short Desc:     What does Compass remember?
+//   Usage hint:     [all | tag <name> | <substring>]
+//
+// SLACK_SIGNING_SECRET must be set on Render for this to work — copy from
+// the Slack app's Basic Information page. Different per Slack app, so prod
+// and staging each need their own.
+//
+// Synchronous response (no response_url) because the NocoDB query is fast
+// (<500ms for hundreds of rows) and Slack's 3s deadline is plenty.
+app.post("/slash-knowledge", slackFormParser, async (req, res) => {
+  if (!verifySlackSignature(req)) {
+    return res.status(401).send("unauthorized (invalid Slack signature or SLACK_SIGNING_SECRET unset)");
+  }
+  if (!KNOWLEDGE_TABLE_ID) {
+    return res.json({ response_type: "ephemeral", text: "Knowledge table not configured on this service." });
+  }
+  try {
+    // Defence in depth — this endpoint goes around the agent tool layer but
+    // we still want it to refuse cross-base reads if someone ever pointed
+    // KNOWLEDGE_TABLE_ID at a foreign base.
+    await assertSameBase(KNOWLEDGE_TABLE_ID, "slash-knowledge");
+  } catch (e) {
+    console.error(`[slash-knowledge] base-guard: ${e.message}`);
+    return res.json({ response_type: "ephemeral", text: `Refused: ${e.message}` });
+  }
+
+  const raw = (req.body.text || "").trim();
+  let limit = 25;
+  let where = "";
+  let summary;
+  if (raw === "" ) {
+    summary = "25 most recent entries";
+  } else if (raw === "all") {
+    limit = 200;
+    summary = "All entries (newest first, up to 200)";
+  } else if (raw.toLowerCase().startsWith("tag ")) {
+    const tag = raw.slice(4).trim();
+    if (!tag) {
+      return res.json({ response_type: "ephemeral", text: "Usage: `/knowledge tag <name>`" });
+    }
+    where = `&where=${encodeURIComponent(`(Tags,like,%${tag}%)`)}`;
+    summary = `Entries tagged "${tag}"`;
+  } else {
+    where = `&where=${encodeURIComponent(`((Topic,like,%${raw}%)~or(Content,like,%${raw}%))`)}`;
+    summary = `Entries matching "${raw}"`;
+  }
+
+  try {
+    const url = `/api/v2/tables/${KNOWLEDGE_TABLE_ID}/records?limit=${limit}&sort=-CreatedAt${where}`;
+    const data = await ncGet(url);
+    const items = data.list || [];
+    const total = data.pageInfo?.totalRows ?? items.length;
+    if (items.length === 0) {
+      return res.json({ response_type: "ephemeral", text: `_${summary}_ — no entries.` });
+    }
+    // Slack ephemeral messages cap at 4000 chars. Format compactly and
+    // truncate with a "...N more" footer if we'd overflow.
+    const OUTPUT_CAP = 3500;
+    const header = `*${summary}* (${items.length}${total > items.length ? ` of ${total}` : ""}):\n\n`;
+    let body = "";
+    let included = 0;
+    for (const r of items) {
+      const topic = r.Topic || "Untitled";
+      const content = String(r.Content || "").replace(/\s+/g, " ").slice(0, 220);
+      const tags = r.Tags ? ` _(${r.Tags})_` : "";
+      const addedBy = r["Added by"] ? ` _— ${r["Added by"]}_` : "";
+      const line = `• *${topic}*${tags}${addedBy}\n  ${content}\n\n`;
+      if (header.length + body.length + line.length > OUTPUT_CAP) break;
+      body += line;
+      included += 1;
+    }
+    if (included < items.length) {
+      body += `_…${items.length - included} more not shown. Narrow with \`/knowledge tag <name>\` or \`/knowledge <substring>\`._`;
+    }
+    return res.json({ response_type: "ephemeral", text: header + body });
+  } catch (e) {
+    console.error(`[slash-knowledge] query failed: ${e.message}`);
+    return res.json({ response_type: "ephemeral", text: `Error querying knowledge: ${e.message}` });
+  }
+});
+
 // the user's UI updates feel snappy and slow tools don't blow the deadline.
 //
 // Expected request body shape (from n8n):
