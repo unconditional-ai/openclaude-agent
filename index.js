@@ -4419,6 +4419,35 @@ async function clearCheckpoint(threadTs) {
 // only produces one log line per event type, not one per run.
 const _loggedUnknownStreamEvents = new Set();
 
+// Extract a one-line description of what a code_execution block is doing, for
+// the live-progress Slack message. Without this, every code_execution row
+// reads "Ran Python in sandbox" — useful to know SOMETHING ran but not which
+// step, especially for multi-block flows (e.g. CSV parse → header inspect →
+// row map → validation, five "Ran Python" lines in a row).
+//
+// Heuristic, in order:
+//   1. First standalone comment line — Claude's Python blocks almost always
+//      open with a "# do X" comment. Highest-signal source.
+//   2. First non-import, non-blank, non-comment-line — the actual operation.
+//   3. null — no summary; renderer falls back to the generic label.
+//
+// Truncated to 80 chars to keep the rendered line within Slack's wrap width.
+function extractCodeSummary(code) {
+  if (typeof code !== "string" || !code) return null;
+  for (const raw of code.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#") && !line.startsWith("#!")) {
+      const desc = line.replace(/^#+\s*/, "").trim();
+      if (desc) return desc.length > 80 ? desc.slice(0, 77) + "…" : desc;
+      continue; // empty comment, skip
+    }
+    if (/^(import|from)\s/.test(line)) continue;
+    return line.length > 80 ? line.slice(0, 77) + "…" : line;
+  }
+  return null;
+}
+
 async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, resumeFromPause = false) {
   // Live progress: a chronological event log of what Compass has produced so
   // far in this run, rendered into one Slack message that gets edited in
@@ -4476,17 +4505,18 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     progressVersion++;
   }
   // Server-side code_execution invocation. Pushed when the block starts;
-  // status flipped to "done" when content_block_stop arrives. The "Running…"
-  // state shows the user that Python is in flight, which can take 10-30s for
-  // a heavy CSV parse.
+  // status flipped to "done" (with an optional code-summary label) when
+  // content_block_stop arrives. The "Running…" state shows the user that
+  // Python is in flight, which can take 10-30s for a heavy CSV parse.
   function pushSandboxRun(blockIndex) {
     progressEvents.push({ type: "sandbox_run", blockIndex, status: "running" });
     progressVersion++;
   }
-  function markSandboxDone(blockIndex) {
+  function markSandboxDone(blockIndex, summary = null) {
     const evt = progressEvents.find((e) => e.type === "sandbox_run" && e.blockIndex === blockIndex);
     if (evt && evt.status === "running") {
       evt.status = "done";
+      if (summary) evt.summary = summary;
       progressVersion++;
     }
   }
@@ -4500,7 +4530,14 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         return `${e.marker} _${e.label}_${suffix}`;
       }
       if (e.type === "sandbox_run") {
-        if (e.status === "done") return `:white_check_mark: _Ran Python in sandbox_`;
+        if (e.status === "done") {
+          // Show the code summary if we extracted one — gives the user a
+          // sense of what each block actually did. Falls back to the generic
+          // label if extraction failed (no comment, no non-import line).
+          return e.summary
+            ? `:white_check_mark: _Ran Python_: \`${e.summary}\``
+            : `:white_check_mark: _Ran Python in sandbox_`;
+        }
         return `:hourglass_flowing_sand: _Running Python in sandbox…_`;
       }
       return "";
@@ -4597,6 +4634,12 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // `container`.
   async function streamAndCollect(params) {
     const blockMeta = new Map(); // index -> { type, name? } captured at content_block_start
+    // Per-sandbox-block accumulator for the input JSON streamed via
+    // input_json_delta events. Lets us extract a one-line code summary on
+    // content_block_stop (the input.code field) so the rendered "Ran Python"
+    // line includes a description of the block instead of repeating "Ran
+    // Python in sandbox" five times in a row.
+    const sandboxInputJson = new Map(); // index -> partial JSON string
     let capturedContainer = null;
     const stream = anthropic.messages.stream(params);
     for await (const event of stream) {
@@ -4614,6 +4657,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         const block = event.content_block;
         blockMeta.set(event.index, block);
         if (block.type === "server_tool_use" && block.name === "code_execution") {
+          sandboxInputJson.set(event.index, "");
           pushSandboxRun(event.index);
           scheduleFlush();
         }
@@ -4622,11 +4666,28 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         if (event.delta?.type === "text_delta") {
           pushTextDelta(event.index, event.delta.text);
           scheduleFlush();
+        } else if (event.delta?.type === "input_json_delta" && sandboxInputJson.has(event.index)) {
+          // Accumulate the JSON-serialized input for sandbox blocks so we can
+          // extract input.code at block_stop. Anthropic streams this in
+          // multiple deltas per block.
+          sandboxInputJson.set(event.index, sandboxInputJson.get(event.index) + (event.delta.partial_json || ""));
         }
       } else if (event.type === "content_block_stop") {
         const block = blockMeta.get(event.index);
         if (block?.type === "server_tool_use" && block.name === "code_execution") {
-          markSandboxDone(event.index);
+          // Extract a one-line code summary from the accumulated input JSON.
+          // Best-effort: if the JSON is malformed or input.code is missing,
+          // summary stays null and the renderer falls back to "Ran Python
+          // in sandbox".
+          let summary = null;
+          try {
+            const raw = sandboxInputJson.get(event.index);
+            if (raw) summary = extractCodeSummary(JSON.parse(raw).code);
+          } catch (e) {
+            // Malformed JSON or non-code input — fall back to generic label.
+          }
+          sandboxInputJson.delete(event.index);
+          markSandboxDone(event.index, summary);
           scheduleFlush();
         }
       } else if (
