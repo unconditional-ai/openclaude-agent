@@ -4360,52 +4360,107 @@ async function clearCheckpoint(threadTs) {
 }
 
 async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, resumeFromPause = false) {
-  // Live progress: posts an "On it…" placeholder right before the FIRST tool
-  // dispatch, then edits it in place after each subsequent iteration to add a
-  // status line per tool. /run replaces the placeholder with the final answer
-  // when this function returns. The lazy-on-first-tool design means stay_silent
-  // and pure-text-reply cases never post a placeholder at all — fixing the
-  // "Compass don't reply to this" → flash of 'On it…' then disappears bug.
-  // progressLines holds objects { marker, label, count } so consecutive
-  // identical actions collapse to "✓ Looked up person ×3" rather than
-  // repeating three lines. Slack chat.update has a 40000-char limit; if
-  // we exceed, we tail-truncate with a "[N earlier actions truncated]"
-  // header so the user always sees the most recent activity.
-  const progressLines = [];
+  // Live progress: a chronological event log of what Compass has produced so
+  // far in this run, rendered into one Slack message that gets edited in
+  // place as new events arrive. /run replaces the placeholder with the final
+  // answer when this function returns.
+  //
+  // Three event types:
+  //   - text         (streamed text deltas from the model; coalesced per content_block)
+  //   - sandbox_run  (server-side code_execution starting/finishing; live "Running Python…")
+  //   - tool_status  (client-side tool dispatched by the agent loop; "✓ Looked up person")
+  //
+  // Why an event log instead of two separate buckets: the model interleaves
+  // text and code_execution within a single response — "Let me check..." →
+  // (Python runs) → "Got it" → (Python runs) → "Here's the answer". Rendering
+  // them in chronological order preserves the actual sequence the user would
+  // expect to see.
+  //
+  // The previous version only flushed *between* agent-loop iterations, which
+  // meant a single response with five interleaved code_execution calls and
+  // four text blocks (~90s of work) sat silent in Slack until the iteration
+  // finished. Now we stream — Slack edits land every ~1s while the model is
+  // still emitting.
+  //
+  // Slack chat.update has a 40000-char limit and rate-limits at roughly 1/sec
+  // per channel; the scheduler below debounces to FLUSH_DEBOUNCE_MS and the
+  // renderer tail-truncates over SLACK_MSG_CAP.
+  const progressEvents = [];
   let progressVersion = 0;
   let lastFlushedVersion = 0;
   let placeholderRef = null;
-  function pushProgress(marker, label) {
-    const last = progressLines[progressLines.length - 1];
-    if (last && last.marker === marker && last.label === label) {
-      last.count += 1;
+  // Append a text delta to the currently-streaming text block, or open a new
+  // text event if the last event was something else (tool call, sandbox run).
+  // blockIndex matches the model's content_block index so concurrent text in
+  // different blocks doesn't get smashed together.
+  function pushTextDelta(blockIndex, deltaText) {
+    if (!deltaText) return;
+    const last = progressEvents[progressEvents.length - 1];
+    if (last && last.type === "text" && last.blockIndex === blockIndex) {
+      last.text += deltaText;
     } else {
-      progressLines.push({ marker, label, count: 1 });
+      progressEvents.push({ type: "text", blockIndex, text: deltaText });
     }
     progressVersion++;
+  }
+  // Client-side tool status pushed by the agent loop's dispatcher after a
+  // tool returns. Collapses consecutive identical statuses ("Looked up person
+  // ×3") so a 50-row bulk import doesn't print 50 lines.
+  function pushProgress(marker, label) {
+    const last = progressEvents[progressEvents.length - 1];
+    if (last && last.type === "tool_status" && last.marker === marker && last.label === label) {
+      last.count += 1;
+    } else {
+      progressEvents.push({ type: "tool_status", marker, label, count: 1 });
+    }
+    progressVersion++;
+  }
+  // Server-side code_execution invocation. Pushed when the block starts;
+  // status flipped to "done" when content_block_stop arrives. The "Running…"
+  // state shows the user that Python is in flight, which can take 10-30s for
+  // a heavy CSV parse.
+  function pushSandboxRun(blockIndex) {
+    progressEvents.push({ type: "sandbox_run", blockIndex, status: "running" });
+    progressVersion++;
+  }
+  function markSandboxDone(blockIndex) {
+    const evt = progressEvents.find((e) => e.type === "sandbox_run" && e.blockIndex === blockIndex);
+    if (evt && evt.status === "running") {
+      evt.status = "done";
+      progressVersion++;
+    }
   }
   function renderProgress() {
     const SLACK_MSG_CAP = 35_000; // Slack's hard limit is 40k; leave headroom
     const HEADER = "_Working on it…_\n\n";
-    const lines = progressLines.map((p) =>
-      p.count > 1 ? `${p.marker} _${p.label}_  ×${p.count}` : `${p.marker} _${p.label}_`
-    );
-    const fullText = HEADER + lines.join("\n");
+    const parts = progressEvents.map((e) => {
+      if (e.type === "text") return e.text;
+      if (e.type === "tool_status") {
+        const suffix = e.count > 1 ? `  ×${e.count}` : "";
+        return `${e.marker} _${e.label}_${suffix}`;
+      }
+      if (e.type === "sandbox_run") {
+        if (e.status === "done") return `:white_check_mark: _Ran Python in sandbox_`;
+        return `:hourglass_flowing_sand: _Running Python in sandbox…_`;
+      }
+      return "";
+    }).filter(Boolean);
+    const fullText = HEADER + parts.join("\n");
     if (fullText.length <= SLACK_MSG_CAP) return fullText;
-    // Tail-truncate. Walk lines from the end, keeping until we'd exceed.
+    // Tail-truncate. Walk parts from the end, keeping until we'd exceed.
     const TRUNC_HEADER_RESERVE = 80;
     const targetSize = SLACK_MSG_CAP - HEADER.length - TRUNC_HEADER_RESERVE;
     let acc = 0;
-    let keepFromIdx = lines.length;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const lineLen = lines[i].length + 1;
-      if (acc + lineLen > targetSize) break;
-      acc += lineLen;
+    let keepFromIdx = parts.length;
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const partLen = parts[i].length + 1;
+      if (acc + partLen > targetSize) break;
+      acc += partLen;
       keepFromIdx = i;
     }
     const droppedCount = keepFromIdx;
-    const kept = lines.slice(keepFromIdx);
-    return `${HEADER}_[…${droppedCount} earlier action${droppedCount === 1 ? "" : "s"} truncated…]_\n${kept.join("\n")}`;
+    const kept = parts.slice(keepFromIdx);
+    return `${HEADER}_[…${droppedCount} earlier item${droppedCount === 1 ? "" : "s"} truncated…]_\n${kept.join("\n")}`;
   }
   async function ensurePlaceholder() {
     if (placeholderRef || !slack_context?.channel) return;
@@ -4425,6 +4480,76 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     } catch (e) {
       console.error(`[progress] update failed: ${e.message}`);
     }
+  }
+  // Debounced scheduler. Slack rate-limits chat.update at ~1/sec per channel,
+  // so we throttle to one flush per FLUSH_DEBOUNCE_MS. The in-flight guard
+  // makes sure we never have two concurrent chat.update calls — if events
+  // keep arriving during a flush, we schedule another flush AFTER the current
+  // one resolves rather than racing it.
+  const FLUSH_DEBOUNCE_MS = 1000;
+  let pendingFlushTimer = null;
+  let lastFlushAt = 0;
+  let flushInFlight = null;
+  function scheduleFlush() {
+    if (pendingFlushTimer) return;
+    const elapsed = Date.now() - lastFlushAt;
+    const delay = Math.max(0, FLUSH_DEBOUNCE_MS - elapsed);
+    pendingFlushTimer = setTimeout(async () => {
+      pendingFlushTimer = null;
+      if (flushInFlight) {
+        try { await flushInFlight; } catch (_) {}
+      }
+      lastFlushAt = Date.now();
+      flushInFlight = flushProgress();
+      try { await flushInFlight; } catch (_) {}
+      flushInFlight = null;
+      // More events arrived during the flush — keep going.
+      if (progressVersion !== lastFlushedVersion) scheduleFlush();
+    }, delay);
+  }
+  async function finalFlush() {
+    if (pendingFlushTimer) {
+      clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = null;
+    }
+    if (flushInFlight) {
+      try { await flushInFlight; } catch (_) {}
+    }
+    lastFlushAt = Date.now();
+    await flushProgress();
+  }
+  // Wraps anthropic.messages.stream so the agent loop can keep treating the
+  // result like a single Message object. Pushes streaming events into the
+  // progress log as they arrive and schedules flushes so Slack sees real-time
+  // updates while the model is still emitting. Returns the same shape that
+  // anthropic.messages.create would have returned, so nothing downstream
+  // needs to change.
+  async function streamAndCollect(params) {
+    const blockMeta = new Map(); // index -> { type, name? } captured at content_block_start
+    const stream = anthropic.messages.stream(params);
+    for await (const event of stream) {
+      if (event.type === "content_block_start") {
+        const block = event.content_block;
+        blockMeta.set(event.index, block);
+        if (block.type === "server_tool_use" && block.name === "code_execution") {
+          pushSandboxRun(event.index);
+          scheduleFlush();
+        }
+        // text and tool_use blocks: wait for deltas / dispatcher respectively
+      } else if (event.type === "content_block_delta") {
+        if (event.delta?.type === "text_delta") {
+          pushTextDelta(event.index, event.delta.text);
+          scheduleFlush();
+        }
+      } else if (event.type === "content_block_stop") {
+        const block = blockMeta.get(event.index);
+        if (block?.type === "server_tool_use" && block.name === "code_execution") {
+          markSandboxDone(event.index);
+          scheduleFlush();
+        }
+      }
+    }
+    return await stream.finalMessage();
   }
   // If files were uploaded to the Files API at the n8n boundary, attach them
   // as content blocks on the first user message so Claude sees them natively.
@@ -4561,7 +4686,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     });
     let response;
     try {
-      response = await anthropic.messages.create(buildRequest());
+      response = await streamAndCollect(buildRequest());
     } catch (e) {
       const msg = String(e?.message || "");
       const status = e?.status || e?.response?.status;
@@ -4590,12 +4715,17 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       if (containerId && /container_expired|container not found/i.test(msg)) {
         console.warn(`[agent] container ${containerId} expired — retrying with fresh container`);
         containerId = null;
-        response = await anthropic.messages.create(buildRequest());
+        response = await streamAndCollect(buildRequest());
       } else {
         // Anything else: rethrow so /run's catch surfaces it normally.
         throw e;
       }
     }
+    // Ensure the final stream state is on Slack before we move on to tool
+    // dispatch — otherwise the iteration could complete and dispatch new
+    // status lines while a partial-stream flush is still in flight, racing
+    // them.
+    await finalFlush();
     if (response.container?.id && response.container.id !== containerId) {
       containerId = response.container.id;
       console.log(`[agent] code_execution container: ${containerId}`);
