@@ -7364,22 +7364,29 @@ app.post("/slash-knowledge", slackFormParser, async (req, res) => {
   const raw = (req.body.text || "").trim();
   let limit = 25;
   let where = "";
-  let summary;
-  if (raw === "" ) {
-    summary = "25 most recent entries";
+  // mode is one of: "recent" (default), "all", "tag", "search". We use it to
+  // construct a context-aware header AFTER we know how many items came back —
+  // saying "25 most recent (2)" is confusing when only 2 exist; "2 entries
+  // pinned" reads correctly.
+  let mode = "recent";
+  let modeArg = null;
+  if (raw === "") {
+    // default — recent 25
   } else if (raw === "all") {
     limit = 200;
-    summary = "All entries (newest first, up to 200)";
+    mode = "all";
   } else if (raw.toLowerCase().startsWith("tag ")) {
     const tag = raw.slice(4).trim();
     if (!tag) {
       return res.json({ response_type: "ephemeral", text: "Usage: `/knowledge tag <name>`" });
     }
     where = `&where=${encodeURIComponent(`(Tags,like,%${tag}%)`)}`;
-    summary = `Entries tagged "${tag}"`;
+    mode = "tag";
+    modeArg = tag;
   } else {
     where = `&where=${encodeURIComponent(`((Topic,like,%${raw}%)~or(Content,like,%${raw}%))`)}`;
-    summary = `Entries matching "${raw}"`;
+    mode = "search";
+    modeArg = raw;
   }
 
   try {
@@ -7388,12 +7395,38 @@ app.post("/slash-knowledge", slackFormParser, async (req, res) => {
     const items = data.list || [];
     const total = data.pageInfo?.totalRows ?? items.length;
     if (items.length === 0) {
-      return res.json({ response_type: "ephemeral", text: `_${summary}_ — no entries.` });
+      const emptyMsg = mode === "tag"
+        ? `No entries tagged "${modeArg}".`
+        : mode === "search"
+          ? `No entries match "${modeArg}".`
+          : "No knowledge entries pinned yet.";
+      return res.json({ response_type: "ephemeral", text: emptyMsg });
+    }
+    // Header reads the actual data — no more "25 most recent (2)" when there
+    // are only 2 entries total. Pluralisation handled too.
+    const noun = total === 1 ? "entry" : "entries";
+    const truncated = items.length < total;
+    let header;
+    if (mode === "recent") {
+      header = truncated
+        ? `*${items.length} most recent of ${total} ${noun}* pinned:\n\n`
+        : `*${total} ${noun} pinned* (newest first):\n\n`;
+    } else if (mode === "all") {
+      header = truncated
+        ? `*First ${items.length} of ${total} ${noun}* (newest first):\n\n`
+        : `*All ${total} ${noun}* (newest first):\n\n`;
+    } else if (mode === "tag") {
+      header = truncated
+        ? `*${items.length} of ${total} ${noun} tagged "${modeArg}"*:\n\n`
+        : `*${total} ${noun} tagged "${modeArg}"*:\n\n`;
+    } else {
+      header = truncated
+        ? `*${items.length} of ${total} ${noun} matching "${modeArg}"*:\n\n`
+        : `*${total} ${noun} matching "${modeArg}"*:\n\n`;
     }
     // Slack ephemeral messages cap at 4000 chars. Format compactly and
     // truncate with a "...N more" footer if we'd overflow.
     const OUTPUT_CAP = 3500;
-    const header = `*${summary}* (${items.length}${total > items.length ? ` of ${total}` : ""}):\n\n`;
     let body = "";
     let included = 0;
     for (const r of items) {
