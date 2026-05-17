@@ -2856,7 +2856,12 @@ const tools = [
   // Server-side Python sandbox. When a user uploads a CSV / Excel / PDF / JSON,
   // or any time the agent needs to slice/aggregate data ad-hoc, run Python here
   // instead of asking for a new bespoke JS tool. Files referenced via
-  // container_upload blocks (Files API) land in /mnt/user-data/uploads/.
+  // container_upload blocks (Files API) land at $INPUT_DIR/<filename>
+  // (resolves to /files/input/<session_hash>/<filename>). The historical
+  // /mnt/user-data/uploads/ path is from claude.ai scaffolding and does NOT
+  // exist in this sandbox — Compass wasted iterations checking it before
+  // 015049d corrected the system prompt, but the tool-description comment
+  // was missed in that pass. See commit 015049d for the empirical test.
   // See https://docs.claude.com/en/docs/agents-and-tools/tool-use/code-execution-tool
   {
     type: "code_execution_20260120",
@@ -6797,7 +6802,7 @@ app.post("/run", async (req, res) => {
     const manifest = runAttachments
       .map((a) => `  - ${a.name || "unnamed"} · ${a.mimetype || "unknown"} · ${a.size ? a.size + " bytes" : "size unknown"} · anthropic_file_id=${a.file_id}`)
       .join("\n");
-    enrichedTranscript += `\n\n## Attached files in THIS message (Anthropic Files API; readable)\n${manifest}\n\nThese are real, readable Anthropic file_ids. Use code_execution for CSV/JSON/text (they land at /mnt/user-data/uploads/). Read PDFs and images directly via their content blocks.`;
+    enrichedTranscript += `\n\n## Attached files in THIS message (Anthropic Files API; readable)\n${manifest}\n\nThese are real, readable Anthropic file_ids. Use code_execution for CSV/JSON/text — files land at $INPUT_DIR/<filename> (resolves to /files/input/<session_hash>/<filename>). Read PDFs and images directly via their content blocks.`;
   }
 
   // Note: the live-progress placeholder is now posted lazily by runAgent — it
