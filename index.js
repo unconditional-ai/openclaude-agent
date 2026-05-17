@@ -4584,10 +4584,32 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // updates while the model is still emitting. Returns the same shape that
   // anthropic.messages.create would have returned, so nothing downstream
   // needs to change.
+  //
+  // IMPORTANT (May 2026): @anthropic-ai/sdk 0.27.3 predates the
+  // code_execution_20260120 GA event shape. Its message-accumulator
+  // (lib/MessageStream.mjs _MessageStream_accumulateMessage) only copies
+  // stop_reason / stop_sequence / output_tokens from message_delta and drops
+  // the top-level `container` field on the floor. messages.create works
+  // because that path returns the raw response body unchanged; stream() does
+  // not. We scan every event for container metadata and attach it to the
+  // final message ourselves so the agent loop's containerId capture works.
+  // Remove this once the SDK is bumped to a version that knows about
+  // `container`.
   async function streamAndCollect(params) {
     const blockMeta = new Map(); // index -> { type, name? } captured at content_block_start
+    let capturedContainer = null;
     const stream = anthropic.messages.stream(params);
     for await (const event of stream) {
+      // Defensive container capture: take the first non-null container we see
+      // from any of the documented locations. Container ids don't change
+      // within a single response, so first-wins is correct.
+      if (!capturedContainer) {
+        const c = event.message?.container || event.delta?.container || event.container || null;
+        if (c?.id) {
+          capturedContainer = c;
+          console.log(`[stream] captured container from ${event.type}: ${c.id}`);
+        }
+      }
       if (event.type === "content_block_start") {
         const block = event.content_block;
         blockMeta.set(event.index, block);
@@ -4609,7 +4631,11 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         }
       }
     }
-    return await stream.finalMessage();
+    const finalMessage = await stream.finalMessage();
+    if (capturedContainer && !finalMessage.container) {
+      finalMessage.container = capturedContainer;
+    }
+    return finalMessage;
   }
   // If files were uploaded to the Files API at the n8n boundary, attach them
   // as content blocks on the first user message so Claude sees them natively.
