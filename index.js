@@ -4420,6 +4420,11 @@ async function clearCheckpoint(threadTs) {
   await upsertThreadState(threadTs, { messages_json: "", usage_totals_json: "" });
 }
 
+// First-occurrence-per-process log dedup for unhandled stream event types.
+// Module-level (not per-run) so a flood of unknown events across many runs
+// only produces one log line per event type, not one per run.
+const _loggedUnknownStreamEvents = new Set();
+
 async function runAgent(transcript, slack_context = null, attachments = [], threadTs = null, resumeFromPause = false) {
   // Live progress: a chronological event log of what Compass has produced so
   // far in this run, rendered into one Slack message that gets edited in
@@ -4630,6 +4635,22 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
           markSandboxDone(event.index);
           scheduleFlush();
         }
+      } else if (
+        event.type !== "message_start" &&
+        event.type !== "message_delta" &&
+        event.type !== "message_stop"
+      ) {
+        // Catch-all for event types we don't yet handle. Anthropic adds new
+        // event types when features ship (e.g. thinking deltas, server-tool
+        // result blocks). Today's branches handle the events we use; future
+        // event types arrive silently if we don't log them here, and the
+        // next "Compass suddenly stopped doing X" bug surfaces invisibly.
+        // First-occurrence-per-process is enough — we don't need to spam the
+        // log on every event.
+        if (!_loggedUnknownStreamEvents.has(event.type)) {
+          _loggedUnknownStreamEvents.add(event.type);
+          console.warn(`[stream] unhandled event type: ${event.type} (first occurrence; will not log again this process)`);
+        }
       }
     }
     const finalMessage = await stream.finalMessage();
@@ -4645,12 +4666,14 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   //   - application/pdf / text/plain / text/markdown → document block
   //   - text/csv / application/json / etc. → container_upload (sandbox)
   //
-  // For small text-based files (CSV/JSON ≤ 30KB) the server-side fallback
-  // also captured the raw bytes as `inline_text`. We append a text block
-  // with the file's content right after — belt-and-braces so Compass can
-  // read the data directly even if container_upload doesn't deliver to the
-  // sandbox (which has been unreliable). For files coming directly from
-  // n8n we don't have the bytes, so they get container_upload only.
+  // For small text-based files (CSV/JSON ≤ 4KB — see INLINE_TEXT_MAX_BYTES
+  // in uploadSlackFileToAnthropic) the server-side fallback also captured the
+  // raw bytes as `inline_text`. We append a text block with the file's content
+  // right after — belt-and-braces so Compass can read the data directly even
+  // if container_upload doesn't deliver to the sandbox (which has been
+  // unreliable). For files coming directly from n8n we don't have the bytes,
+  // so they get container_upload only. Files larger than 4KB rely entirely on
+  // container_upload — no inline fallback.
   let initialContent;
   if (attachments && attachments.length > 0) {
     const blocks = [{ type: "text", text: transcript }];
@@ -4784,48 +4807,65 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       messages,
       ...(containerId ? { container: containerId } : {}),
     });
+    // Snapshot progress-event length so the container-expired retry can roll
+    // back any partial events the failed stream emitted before throwing.
+    // Without this, the placeholder ends up concatenating the failed attempt's
+    // text with the retried attempt's text in Slack.
+    const eventsLengthBeforeStream = progressEvents.length;
     let response;
     try {
-      response = await streamAndCollect(buildRequest());
-    } catch (e) {
-      const msg = String(e?.message || "");
-      const status = e?.status || e?.response?.status;
-      // credit_balance_too_low arrives as HTTP 400, not 429 — generic retry libs
-      // miss it. Catch explicitly so we surface a useful Slack message instead
-      // of a JSON-blob error and so the loop stops cleanly mid-batch (the May
-      // 2026 incident: 12 of 25 rows written, then the loop crashed silently).
-      if (status === 400 && /credit balance/i.test(msg)) {
-        console.error(`[agent] credit exhausted on iter=${iteration} after tools=[${trace.map((t) => t.tool).join(",")}]`);
-        return {
-          ok: false,
-          credit_exhausted: true,
-          cost_usd: conversationCostUsd,
-          summary:
-            "Anthropic credits are exhausted, so I had to stop. Top up at console.anthropic.com and reply in this thread — I'll pick up where I left off (any rows I already wrote will be detected as duplicates and skipped).",
-          stop_reason: "credit_exhausted",
-          iterations: iteration,
-          trace,
-          placeholderRef,
-          usage: usageTotals,
-        };
-      }
-      // Container expired (4.5 min idle / 30-day max). Drop the stale id and
-      // retry once with a fresh container — sandbox state is lost but the
-      // conversation can continue. Don't retry on a non-container error.
-      if (containerId && /container_expired|container not found/i.test(msg)) {
-        console.warn(`[agent] container ${containerId} expired — retrying with fresh container`);
-        containerId = null;
+      try {
         response = await streamAndCollect(buildRequest());
-      } else {
-        // Anything else: rethrow so /run's catch surfaces it normally.
-        throw e;
+      } catch (e) {
+        const msg = String(e?.message || "");
+        const status = e?.status || e?.response?.status;
+        // credit_balance_too_low arrives as HTTP 400, not 429 — generic retry
+        // libs miss it. Catch explicitly so we surface a useful Slack message
+        // instead of a JSON-blob error and so the loop stops cleanly mid-batch
+        // (the May 2026 incident: 12 of 25 rows written, then the loop
+        // crashed silently).
+        if (status === 400 && /credit balance/i.test(msg)) {
+          console.error(`[agent] credit exhausted on iter=${iteration} after tools=[${trace.map((t) => t.tool).join(",")}]`);
+          return {
+            ok: false,
+            credit_exhausted: true,
+            cost_usd: conversationCostUsd,
+            summary:
+              "Anthropic credits are exhausted, so I had to stop. Top up at console.anthropic.com and reply in this thread — I'll pick up where I left off (any rows I already wrote will be detected as duplicates and skipped).",
+            stop_reason: "credit_exhausted",
+            iterations: iteration,
+            trace,
+            placeholderRef,
+            usage: usageTotals,
+          };
+        }
+        // Container expired (4.5 min idle / 30-day max). Drop the stale id
+        // and retry once with a fresh container — sandbox state is lost but
+        // the conversation can continue. Roll back the partial-stream events
+        // first so the retried attempt's text doesn't concatenate onto the
+        // failed attempt's text in the Slack placeholder. Don't retry on a
+        // non-container error.
+        if (containerId && /container_expired|container not found/i.test(msg)) {
+          console.warn(`[agent] container ${containerId} expired — retrying with fresh container`);
+          containerId = null;
+          if (progressEvents.length > eventsLengthBeforeStream) {
+            progressEvents.length = eventsLengthBeforeStream;
+            progressVersion++;
+          }
+          response = await streamAndCollect(buildRequest());
+        } else {
+          // Anything else: rethrow so /run's catch surfaces it normally.
+          throw e;
+        }
       }
+    } finally {
+      // Drain whatever's in the progress log to Slack — success, credit-
+      // exhausted early-return, container retry, or any rethrow. Without this,
+      // a non-container error mid-stream would leave the placeholder stuck
+      // mid-flush. finalFlush itself catches its own errors so this is safe
+      // inside a finally even if Slack is unreachable.
+      await finalFlush();
     }
-    // Ensure the final stream state is on Slack before we move on to tool
-    // dispatch — otherwise the iteration could complete and dispatch new
-    // status lines while a partial-stream flush is still in flight, racing
-    // them.
-    await finalFlush();
     if (response.container?.id && response.container.id !== containerId) {
       containerId = response.container.id;
       console.log(`[agent] code_execution container: ${containerId}`);
