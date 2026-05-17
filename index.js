@@ -7567,8 +7567,28 @@ app.post("/reload", async (req, res) => {
   if (!timingSafeEq(provided, RUN_SHARED_SECRET)) {
     return res.status(401).json({ error: "unauthorized" });
   }
+  // Reload both n8n tools AND the prompt body. Prompt body is normally
+  // only loaded at boot, so out-of-band edits (via an external script that
+  // POSTs new rows directly to compass_prompt rather than going through
+  // edit_prompt_body / replace_prompt_body) won't be visible until the next
+  // restart — unless we explicitly reload here.
+  const beforeVersion = cachedPromptVersion;
+  const beforeLength = (cachedPromptBody || "").length;
   const discovered = await refreshN8nTools();
-  res.json({ ok: true, n8n_tools: discovered.map((t) => t.name) });
+  try {
+    await loadPromptBody();
+  } catch (e) {
+    console.warn(`[reload] prompt reload failed: ${e.message}`);
+  }
+  res.json({
+    ok: true,
+    n8n_tools: discovered.map((t) => t.name),
+    prompt: {
+      before: { version: beforeVersion, length: beforeLength },
+      after: { version: cachedPromptVersion, length: (cachedPromptBody || "").length },
+      changed: cachedPromptVersion !== beforeVersion,
+    },
+  });
 });
 
 app.listen(PORT, async () => {
