@@ -212,13 +212,51 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// Strip known secret-looking patterns from a string. Used everywhere a user
+// transcript or agent response gets persisted (logs + NocoDB audit table).
+// Designed to be applied liberally — false positives just blank out a fragment
+// of text; false negatives leak credentials. Prefer the former.
+//
+// The /\b/ word-boundary anchors stop a token getting partly-matched in the
+// middle of a longer alphanum run. Order matters: sk-ant- must match before
+// the generic sk- catchall so we don't blank "ant-..." separately.
+function redactSecrets(s) {
+  if (typeof s !== "string") return s;
+  return s
+    // Slack tokens — bot / user / refresh / config / legacy variants.
+    // xoxb-/xoxp-/xoxc-/xoxd-/xoxs-/xoxr-: tokens like xoxb-123-456-AbCdEf
+    .replace(/\bxox[bpcdsra]-[A-Za-z0-9-]{10,}/g, "[slack-token]")
+    // xoxe.xoxb-...: rotation-style refresh tokens
+    .replace(/\bxoxe\.[A-Za-z0-9_.-]{20,}/g, "[slack-token]")
+    // Anthropic API keys
+    .replace(/\bsk-ant-[A-Za-z0-9_-]{20,}/g, "[anthropic-key]")
+    // OpenAI keys (sk-...; after sk-ant- so we don't double-match)
+    .replace(/\bsk-[A-Za-z0-9]{20,}/g, "[openai-key]")
+    // GitHub PATs and OAuth tokens
+    .replace(/\bghp_[A-Za-z0-9]{30,}/g, "[github-token]")
+    .replace(/\bgho_[A-Za-z0-9]{30,}/g, "[github-token]")
+    .replace(/\bghs_[A-Za-z0-9]{30,}/g, "[github-token]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{50,}/g, "[github-token]")
+    // Google OAuth refresh/access tokens
+    .replace(/\b1\/\/0[A-Za-z0-9_-]{30,}/g, "[google-token]")
+    .replace(/\bya29\.[A-Za-z0-9_-]{30,}/g, "[google-token]")
+    // Bearer auth headers (rare in user transcripts, but covers paste mistakes)
+    .replace(/(authorization\s*[:=]\s*bearer\s+)\S+/gi, "$1[bearer]")
+    // NocoDB API tokens — format is opaque, but they sit behind "xc-token"
+    // headers in pasted requests. Catch the header-with-value pattern.
+    .replace(/(xc-token\s*[:=]\s*)\S+/gi, "$1[nocodb-token]");
+}
+
 // Redact PII before writing transcripts to logs. Render's logs are searchable
 // and may be retained for weeks; we don't want emails, phone numbers, or full
 // auth tokens floating around in there. The redaction is deliberately coarse —
 // the goal is "scrubbed enough for ops debugging," not forensic privacy.
+//
+// Secrets are scrubbed first via redactSecrets so the long-token regex below
+// doesn't accidentally see a partially-redacted credential as fresh content.
 function redactPII(s) {
   if (typeof s !== "string") return s;
-  return s
+  return redactSecrets(s)
     .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, "[email]")
     .replace(/(?:\+?\d[\d\s().-]{7,}\d)/g, "[phone]")
     .replace(/\b(?:[A-Za-z0-9_-]{20,})\b/g, (m) => (m.length >= 32 ? "[token]" : m));
@@ -1337,14 +1375,36 @@ const toolImpls = {
     // editable system-prompt body — Compass should edit it via the gated
     // edit_prompt_body tool, not via raw CRUD that bypasses the diff preview.
     // compass_config and compass_pending_actions are similarly internal.
-    const internal = new Set([
+    //
+    // Filter by RESOLVED ID first (survives a rename), then fall back to
+    // title match for any internal table whose id we somehow didn't capture
+    // at boot. Previously this was title-only and a rename would silently
+    // expose internal tables to query_table / bulk_* calls.
+    const internalIds = new Set([
+      PROMPT_TABLE.tableId,
+      THREAD_STATE.tableId,
+      PENDING_ACTIONS.tableId,
+      APP_CONFIG_TABLE.tableId,
+      AGENT_ACTIONS_TABLE_ID,
+    ].filter(Boolean));
+    const internalTitles = new Set([
       THREAD_STATE_TABLE_TITLE,
       PROMPT_TABLE_TITLE,
       APP_CONFIG_TABLE_TITLE,
       PENDING_ACTIONS_TABLE_TITLE,
     ]);
     const tables = (data.list || data.tables || data || [])
-      .filter((t) => !internal.has(t.title))
+      .filter((t) => {
+        if (internalIds.has(t.id)) return false;
+        if (internalTitles.has(t.title)) {
+          // The id-set should have caught this. If the title matches but the
+          // id wasn't in our internal set, we're flying without one of the
+          // resolved IDs — surface that so we can investigate.
+          console.warn(`[list_tables] filtered "${t.title}" by title fallback — id ${t.id} not in resolved internal set (boot discovery may have missed it)`);
+          return false;
+        }
+        return true;
+      })
       .map((t) => ({
         id: t.id,
         title: t.title,
@@ -4598,6 +4658,19 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   // or unparseable.
   let messages;
   const trace = [];
+  // Tool dispatch context. Each tool impl is invoked with `this` bound to an
+  // object that lets it call siblings (`this.lookup_person(...)`) and inspect
+  // the running trace (`this._trace`). Previously we built this with
+  // `{ ...toolImpls, _trace: trace }` on EVERY dispatch, which copies all
+  // ~50 tool refs per call — fine at current scale, but a wasted alloc per
+  // tool_use block in a heavy bulk import.
+  //
+  // Object.create() uses prototype delegation: `dispatchCtx.lookup_person`
+  // resolves to `toolImpls.lookup_person` via the chain without any copy.
+  // Adding `_trace` directly on dispatchCtx doesn't mutate the toolImpls
+  // prototype.
+  const dispatchCtx = Object.create(toolImpls);
+  dispatchCtx._trace = trace;
   let iteration = 0;
   let resumedFromCheckpoint = false;
   if (resumeFromPause && threadTs) {
@@ -4918,7 +4991,7 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
                 // Spread so tool impls keep working via `this.<other_tool>`. The
                 // running trace is exposed too in case a tool wants to enforce a
                 // call-order invariant (no current users; kept for future-proofing).
-                result = await impl.call({ ...toolImpls, _trace: trace }, block.input);
+                result = await impl.call(dispatchCtx, block.input);
               }
             } catch (e) {
               result = { error: e.message };
@@ -5964,7 +6037,17 @@ async function ensureAuditSchema() {
     { title: "Output tokens",  uidt: "Number" },
     { title: "Cache read tokens",  uidt: "Number" },
     { title: "Cache write tokens", uidt: "Number" },
+    // Full attachment forensics (JSON array of {name, mime, size, file_id}).
+    // Keeps Render logs short while preserving everything for debugging.
     { title: "Attachments",        uidt: "LongText" },
+    // Structured attachment metrics. Lets you write SQL-style queries from
+    // NocoDB without LIKE'ing through the JSON blob — "show me runs with
+    // > 5MB of attachments", "all runs that injected audio", etc. Populated
+    // alongside the JSON blob; the blob stays canonical.
+    { title: "Attachment count",       uidt: "Number" },
+    { title: "Attachment total bytes", uidt: "Number" },
+    { title: "Attachment mimes",       uidt: "SingleLineText" },
+    { title: "Attachment names",       uidt: "LongText" },
   ];
   try {
     const meta = await ncGet(`/api/v2/meta/tables/${AGENT_ACTIONS_TABLE_ID}`);
@@ -6715,10 +6798,15 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs, at
       .slice(0, 50); // cap to avoid massive audit rows
     const summaryShort = (result.summary || "").slice(0, 200).replace(/\n+/g, " ");
     const usage = result.usage || {};
+    // Scrub credential-shaped strings from anything that lands in the audit
+    // table. Keep PII (names, emails, phones) intact — they're often necessary
+    // context for "what did Compass actually do" forensics. Secrets are pure
+    // operational risk with zero forensic value, so they get stripped here as
+    // belt-and-braces in case a user ever pastes one into Slack.
     const payload = {
-      Summary: summaryShort || (result.error ? `Error: ${result.error.slice(0, 180)}` : "agent run"),
-      Transcript: transcript,
-      "Agent response": result.summary || "",
+      Summary: redactSecrets(summaryShort) || (result.error ? `Error: ${redactSecrets(result.error).slice(0, 180)}` : "agent run"),
+      Transcript: redactSecrets(transcript),
+      "Agent response": redactSecrets(result.summary || ""),
       "Tools used": JSON.stringify(toolsUsed),
       // 32KB cap — bumped from 8KB to comfortably hold a 25-row CSV import
       // trace (each tool call is ~250-400 bytes after PII redaction). NocoDB
@@ -6741,6 +6829,21 @@ async function logAgentAction({ transcript, slack_context, result, elapsedMs, at
       "Cache write tokens": usage.cache_write || null,
       "Attachments": attachments.length > 0
         ? JSON.stringify(attachments.map((a) => ({ name: a.name, mime: a.mimetype, size: a.size, file_id: a.file_id })))
+        : null,
+      "Attachment count": attachments.length || null,
+      "Attachment total bytes": attachments.length > 0
+        ? attachments.reduce((s, a) => s + (Number(a.size) || 0), 0)
+        : null,
+      // Distinct mimes as a CSV — short enough to fit SingleLineText (255 chars
+      // in NocoDB) for the realistic case of ≤ a few mimes per run. Filter
+      // out empty/null entries so the field is empty if no mimes were known.
+      "Attachment mimes": attachments.length > 0
+        ? [...new Set(attachments.map((a) => a.mimetype).filter(Boolean))].join(",") || null
+        : null,
+      // Names as newline-joined LongText so a single filename containing a
+      // comma doesn't get mis-parsed if someone splits the field later.
+      "Attachment names": attachments.length > 0
+        ? attachments.map((a) => a.name || "unnamed").join("\n")
         : null,
     };
     await ncPost(`/api/v2/tables/${AGENT_ACTIONS_TABLE_ID}/records`, [payload]);
@@ -7161,10 +7264,16 @@ app.post("/slack-interaction", async (req, res) => {
 
       // Approved — run the tool with confirmed:true (the replay_args we stored
       // already include it, set by pendingConfirmation()).
+      //
+      // Build the dispatch context via Object.create (same pattern as runAgent
+      // — avoids spreading the whole toolImpls into a fresh object per call,
+      // and keeps tool sibling-calls working via prototype delegation).
       console.log(`[slack-interaction] approved ref_id=${refId} tool=${pending.tool_name} by=${clickerId}`);
+      const dispatchCtx = Object.create(toolImpls);
+      dispatchCtx._trace = [];
       let result;
       try {
-        result = await impl.call({ ...toolImpls, _trace: [] }, pending.args || {});
+        result = await impl.call(dispatchCtx, pending.args || {});
       } catch (e) {
         result = { error: e.message };
       }
