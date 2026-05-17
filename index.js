@@ -4794,10 +4794,21 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
   if (!messages) {
     messages = [{ role: "user", content: initialContent }];
   }
-  // Was 12; bumped to 25 to support batch CSV imports (May 9 import used 11 in
-  // its final batch — already too close to the old ceiling). Safe to bump
-  // because the cost guard below caps spend per conversation.
-  const maxIterations = 25;
+  // History:
+  //   12 → 25 (May 2026, for batch CSV imports)
+  //   25 → 75 (May 17 2026, after observing 25-row imports hit the cap when
+  //   the model used sandbox programmatic tool calling correctly but with
+  //   `await create_person()` one-per-row — each await is one round-trip
+  //   per Anthropic's programmatic-tool-calling contract, so a 26-row CSV
+  //   needs ~27 iterations even on the happy path. Bumped to 75 so a single
+  //   /run can comfortably handle up to ~70-row batches before resume kicks
+  //   in. Safe because MAX_USD_PER_CONVERSATION caps spend independently.)
+  //
+  // For larger batches, the model should prefer `bulk_create_records` /
+  // `bulk_update_records` (array-input, 1 tool call = N rows = 1 iteration)
+  // rather than looping `create_person` per row. The system prompt now
+  // documents this — see the BATCH OPERATIONS section in compass_prompt.
+  const maxIterations = 75;
   // Cost ledger for this conversation. Starts at the value already accrued on
   // this thread (so a "continue" after pause counts toward the same budget
   // until /run resets it), or 0 if fresh. Updated after every messages.create.
