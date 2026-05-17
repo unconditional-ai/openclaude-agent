@@ -94,7 +94,8 @@ There's no per-byte storage charge as of May 2026; cap is 500 GB per workspace.
   - `image/*` → image content block (model sees natively)
   - `application/pdf` / `text/plain` / `text/markdown` → document block
   - everything else (CSV, JSON, Excel, unknown) → `container_upload` block
-    (file lands in the code-execution sandbox at `/mnt/user-data/uploads/`)
+    (file lands in the code-execution sandbox at `$INPUT_DIR/<filename>`,
+    which resolves to `/files/input/<session_hash>/<filename>`)
 
 If you want to override the routing for a specific upload, you can set
 `attachments[i].role` (future-reserved, not currently consumed) — for now Compass

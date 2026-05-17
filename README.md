@@ -27,7 +27,7 @@ Generic data:
 - `query_table`, `bulk_create_records`, `bulk_update_records`, `delete_records`
 
 Server-side Anthropic tools (no impl in this codebase):
-- `code_execution` — Python sandbox. Use for CSV/JSON/Excel/PDF/image work. Files attached via the `attachments[]` payload land at `/mnt/user-data/uploads/`.
+- `code_execution` — Python sandbox. Use for CSV/JSON/Excel/PDF/image work. Files attached via the `attachments[]` payload land at `$INPUT_DIR/<filename>` (resolves to `/files/input/<session_hash>/<filename>`). The legacy `/mnt/user-data/uploads/` path is from claude.ai's scaffolding and does NOT exist in this sandbox.
 - `tool_search_tool_bm25` — discovers deferred tools by natural-language query.
 
 Loop control:

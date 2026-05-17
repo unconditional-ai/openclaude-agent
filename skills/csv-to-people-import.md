@@ -31,11 +31,18 @@ Import progress:
 
 ### 1. Read the CSV
 
-The file is already in the code_execution sandbox at `/mnt/user-data/uploads/<filename>` (you'll see it in the "## Attached files" manifest). Load it with pandas, handling the three real-world CSV pains:
+The file is already in the code_execution sandbox at `$INPUT_DIR/<filename>` (resolves to `/files/input/<session_hash>/<filename>`). You'll see it in the "## Attached files" manifest. The simplest way to find it is via the env var rather than hardcoding the path:
 
 ```python
+import os
 import pandas as pd
-df = pd.read_csv("/mnt/user-data/uploads/<filename>", dtype=str, keep_default_na=False)
+
+input_dir = os.environ.get("INPUT_DIR", "/files/input")
+files = os.listdir(input_dir)
+# Pick the CSV (or by name if the manifest told you which)
+csv_path = os.path.join(input_dir, [f for f in files if f.endswith(".csv")][0])
+
+df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
 df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 for col in df.columns:
     df[col] = df[col].astype(str).str.strip()
@@ -43,6 +50,8 @@ print(df.head())
 print(df.dtypes)
 print(f"{len(df)} rows, {len(df.columns)} columns")
 ```
+
+Do NOT hardcode `/mnt/user-data/uploads/` — that path is from claude.ai's scaffolding and does NOT exist in this sandbox. Reading from it will throw `FileNotFoundError`, which the model then spends iterations recovering from.
 
 If the CSV has wide unstructured headers (the May 9 file had inline emojis, totals, and pivot rows mashed in), find the actual header row first by looking for "First Name" / "Email" cells, and re-read with `skiprows=N`.
 
@@ -60,7 +69,25 @@ Required columns for People: `email` (always) and at least one of `first_name` /
 
 ### 3. Dedup and classify rows
 
-For each row, normalise the email (`.strip().lower()`) and use `lookup_person({type: "email", query: ...})` to check existence. Batch the lookups; don't fire 100 sequential calls if you have 100 rows — group by 25 max and parallelise inside code_execution where possible.
+For each row, normalise the email (`.strip().lower()`) and use `lookup_person({type: "email", query: ...})` to check existence.
+
+**Do all lookups inside a single code_execution block, in a Python loop.** `lookup_person` is callable from the sandbox via `await lookup_person(...)`. ALL dedup lookups must happen in ONE Python block:
+
+```python
+results = []
+for _, row in df.iterrows():
+    email = row["email"].strip().lower()
+    if not email:
+        results.append({"row": row.to_dict(), "match": None, "reason": "no email"})
+        continue
+    match = await lookup_person(type="email", query=email)
+    results.append({"row": row.to_dict(), "match": match})
+print(f"Dedup complete: {len(results)} rows checked")
+```
+
+Do NOT issue `lookup_person` calls one at a time through the model loop (i.e., emitting one `tool_use` per turn). The agent loop's per-/run iteration cap is 25 — a 30-row CSV would hit max iterations on dedup alone before any imports happen. The sandbox programmatic-tool path bypasses this cap because all N lookups happen inside a single model turn.
+
+If the sandbox path fails (rare — see the May 2026 incident where 22 sequential lookups exhausted iterations), STOP and tell the user rather than falling back to per-row model-loop calls. The retry will likely succeed.
 
 Per row, decide:
 - **new** — no email match → INSERT
