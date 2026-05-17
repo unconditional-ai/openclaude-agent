@@ -62,16 +62,10 @@ for (const [k, v] of Object.entries(requiredEnv)) {
 }
 
 // Only the Files API still requires a beta header — code_execution_20260120
-// went GA and now hard-rejects the old `code-execution-2026-01-20` beta
-// value (was breaking every /run that touched the API). Keep this
-// overridable via env so we can rotate or disable without a redeploy: set
-// ANTHROPIC_BETA="" to disable beta features entirely.
-const ANTHROPIC_BETA = process.env.ANTHROPIC_BETA !== undefined
-  ? process.env.ANTHROPIC_BETA
-  : "files-api-2025-04-14";
+// is GA and the API now rejects the old `code-execution-2026-01-20` value.
 const anthropic = new Anthropic({
   apiKey: ANTHROPIC_API_KEY,
-  defaultHeaders: ANTHROPIC_BETA ? { "anthropic-beta": ANTHROPIC_BETA } : {},
+  defaultHeaders: { "anthropic-beta": "files-api-2025-04-14" },
 });
 
 // ---------- NocoDB helpers ----------
@@ -4807,23 +4801,18 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       messages,
       ...(containerId ? { container: containerId } : {}),
     });
-    // Snapshot progress-event length so the container-expired retry can roll
-    // back any partial events the failed stream emitted before throwing.
-    // Without this, the placeholder ends up concatenating the failed attempt's
-    // text with the retried attempt's text in Slack.
-    const eventsLengthBeforeStream = progressEvents.length;
     let response;
     try {
       try {
         response = await streamAndCollect(buildRequest());
       } catch (e) {
-        const msg = String(e?.message || "");
-        const status = e?.status || e?.response?.status;
         // credit_balance_too_low arrives as HTTP 400, not 429 — generic retry
         // libs miss it. Catch explicitly so we surface a useful Slack message
         // instead of a JSON-blob error and so the loop stops cleanly mid-batch
         // (the May 2026 incident: 12 of 25 rows written, then the loop
         // crashed silently).
+        const msg = String(e?.message || "");
+        const status = e?.status || e?.response?.status;
         if (status === 400 && /credit balance/i.test(msg)) {
           console.error(`[agent] credit exhausted on iter=${iteration} after tools=[${trace.map((t) => t.tool).join(",")}]`);
           return {
@@ -4839,31 +4828,14 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
             usage: usageTotals,
           };
         }
-        // Container expired (4.5 min idle / 30-day max). Drop the stale id
-        // and retry once with a fresh container — sandbox state is lost but
-        // the conversation can continue. Roll back the partial-stream events
-        // first so the retried attempt's text doesn't concatenate onto the
-        // failed attempt's text in the Slack placeholder. Don't retry on a
-        // non-container error.
-        if (containerId && /container_expired|container not found/i.test(msg)) {
-          console.warn(`[agent] container ${containerId} expired — retrying with fresh container`);
-          containerId = null;
-          if (progressEvents.length > eventsLengthBeforeStream) {
-            progressEvents.length = eventsLengthBeforeStream;
-            progressVersion++;
-          }
-          response = await streamAndCollect(buildRequest());
-        } else {
-          // Anything else: rethrow so /run's catch surfaces it normally.
-          throw e;
-        }
+        throw e;
       }
     } finally {
-      // Drain whatever's in the progress log to Slack — success, credit-
-      // exhausted early-return, container retry, or any rethrow. Without this,
-      // a non-container error mid-stream would leave the placeholder stuck
-      // mid-flush. finalFlush itself catches its own errors so this is safe
-      // inside a finally even if Slack is unreachable.
+      // Drain the progress log to Slack on every exit path — success,
+      // credit-exhausted return, or rethrow. Without this, a mid-stream
+      // throw would leave the placeholder stuck mid-flush. finalFlush
+      // catches its own errors so this is safe in finally even if Slack
+      // is unreachable.
       await finalFlush();
     }
     if (response.container?.id && response.container.id !== containerId) {
