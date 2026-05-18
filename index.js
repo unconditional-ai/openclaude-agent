@@ -4884,6 +4884,9 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
         // (the May 2026 incident: 12 of 25 rows written, then the loop
         // crashed silently).
         const msg = String(e?.message || "");
+        // SDK 0.50+ exposes status directly on the error; e.response?.status
+        // was the pre-0.50 path. Both kept here for safety until we confirm
+        // every error class on the new SDK lifts status correctly.
         const status = e?.status || e?.response?.status;
         if (status === 400 && /credit balance/i.test(msg)) {
           console.error(`[agent] credit exhausted on iter=${iteration} after tools=[${trace.map((t) => t.tool).join(",")}]`);
