@@ -4965,13 +4965,22 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
     // it without drifting from the primary call site.
     const buildRequest = () => ({
       model: AGENT_MODEL,
-      // 8192 (was 2048): server-side tools like code_execution count their
-      // bash + tool_result blocks toward output_tokens, and a multi-tool
-      // turn (e.g. several Python snippets while parsing a CSV) easily
-      // crosses 2048. Hitting max_tokens with server-side tool blocks
-      // returns ok=false from the loop — work gets truncated mid-task.
-      // Opus 4.7 supports ≥32k output; 8192 is plenty of headroom.
-      max_tokens: 8192,
+      // History:
+      //   2048 → 8192 (May 2026, for server-side tools like code_execution
+      //   whose bash/tool_result blocks count toward output_tokens).
+      //   8192 → 32768 (May 18 2026, after audit row 16 caught the model
+      //   hitting max_tokens on a CSV-import first turn: 9365 output
+      //   tokens, iterations=1, tools_used=[], stop_reason=max_tokens.
+      //   The model spent 3 minutes thinking via adaptive thinking and
+      //   never got to dispatch any tool. Thinking tokens count toward
+      //   max_tokens, so the model needs more room to think AND emit
+      //   actionable output.)
+      //
+      // Opus 4.7 supports up to 32k output. Adaptive thinking is task-
+      // sensitive — simple chat ("hi compass") still produces ~12 tokens
+      // and ~$0.045 (audit row 15). Cost scales with what the model
+      // actually emits, not the cap.
+      max_tokens: 32768,
       // Adaptive (interleaved) extended thinking. On Opus 4.7 manual
       // budget thinking is replaced by adaptive — the model decides how
       // much to think between tool calls based on task complexity.
