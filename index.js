@@ -1051,6 +1051,53 @@ const toolImpls = {
     return { name: skill.name, description: skill.description, content: skill.body };
   },
 
+  // Plan-discipline tool, modeled on Claude Code's TodoWrite. Forces explicit
+  // plan-then-execute for multi-step tasks instead of improvising step by
+  // step. The state lives in the conversation history — the tool just
+  // validates and echoes the list back; the model "sees" its plan by
+  // re-reading the latest write_todos tool_result. Updates replace the whole
+  // list (no append/merge semantics) so the model maintains a single source
+  // of truth.
+  //
+  // Invariant: at most one task in_progress at a time. Enforced server-side
+  // so the model can't accidentally lose track of what it's doing.
+  async write_todos({ todos, reason = null }) {
+    if (!Array.isArray(todos) || todos.length === 0) {
+      return { error: "todos must be a non-empty array of { content, activeForm, status } objects" };
+    }
+    const validStatuses = new Set(["pending", "in_progress", "completed"]);
+    for (let i = 0; i < todos.length; i++) {
+      const t = todos[i];
+      if (!t || typeof t !== "object") return { error: `todos[${i}] must be an object` };
+      if (typeof t.content !== "string" || !t.content.trim()) {
+        return { error: `todos[${i}].content required (non-empty string, imperative form like "Read the CSV")` };
+      }
+      if (typeof t.activeForm !== "string" || !t.activeForm.trim()) {
+        return { error: `todos[${i}].activeForm required (non-empty string, present continuous like "Reading the CSV")` };
+      }
+      if (!validStatuses.has(t.status)) {
+        return { error: `todos[${i}].status must be one of pending/in_progress/completed (got: ${JSON.stringify(t.status)})` };
+      }
+    }
+    const inProgressCount = todos.filter((t) => t.status === "in_progress").length;
+    if (inProgressCount > 1) {
+      return {
+        error: `Only one task may be in_progress at a time; got ${inProgressCount}. Pick the one you're actively working on right now and leave the others as pending.`,
+      };
+    }
+    return {
+      ok: true,
+      summary: {
+        total: todos.length,
+        pending: todos.filter((t) => t.status === "pending").length,
+        in_progress: todos.filter((t) => t.status === "in_progress").length,
+        completed: todos.filter((t) => t.status === "completed").length,
+      },
+      todos,
+      reason: reason || null,
+    };
+  },
+
   async list_recent_actions({ limit = 10, since_hours = null, source = null, success_only = null }) {
     if (!AGENT_ACTIONS_TABLE_ID) return { error: "AGENT_ACTIONS_TABLE_ID not configured" };
     const filters = [];
@@ -3297,6 +3344,45 @@ const tools = [
     },
   },
   {
+    name: "write_todos",
+    description:
+      "Lay out an explicit task list for multi-step work. Call this FIRST before starting any task with three or more dependent steps (CSV imports, bulk record updates, schema migrations, complex orchestrations). Each todo has `content` (imperative — 'Read the CSV'), `activeForm` (present continuous — 'Reading the CSV'), and `status` ('pending' | 'in_progress' | 'completed'). Exactly one task should be in_progress at a time. To update progress, call write_todos again with the FULL updated list (no append/merge — the call replaces prior state).\n\nWhy this matters: tonight's run with no todo list spent 14 code-execution blocks improvising a CSV import that should have been 4 steps. Having an explicit plan stops the 'let me try X / hmm let me try Y' loop. The plan lives in your conversation history — re-read your last write_todos tool_result before deciding the next action.\n\nWhen to use:\n  - CSV imports (read → dedup → write → update stages → report)\n  - Bulk stage / payment updates across multiple people\n  - Schema migrations or column additions\n  - Multi-record orchestration (e.g. 'process all May 9 cohort follow-ups')\n  - Anything where you'd be tempted to start improvising — pause and write the plan instead\n\nWhen NOT to use:\n  - Trivial 1-2 step tasks (lookup a person, add a note, react to a message)\n  - Single tool calls\n  - Conversational replies that don't involve doing work",
+    input_schema: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          minItems: 1,
+          description: "The complete current todo list. This call REPLACES any prior list — include every task (pending, in_progress, completed) you want tracked.",
+          items: {
+            type: "object",
+            properties: {
+              content: {
+                type: "string",
+                description: "Imperative form of the task (what to do). Examples: 'Read the CSV', 'Dedup against existing People rows', 'Set onboarding stages from CSV columns'.",
+              },
+              activeForm: {
+                type: "string",
+                description: "Present continuous form of the task (what you're doing while in progress). Examples: 'Reading the CSV', 'Deduping against existing People rows', 'Setting onboarding stages from CSV columns'.",
+              },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "completed"],
+                description: "Current state. Exactly one task should be in_progress at a time.",
+              },
+            },
+            required: ["content", "activeForm", "status"],
+          },
+        },
+        reason: {
+          type: "string",
+          description: "Optional one-line note on the update (e.g. 'starting CSV import', 'finished dedup, moving to creates'). Useful for audit.",
+        },
+      },
+      required: ["todos"],
+    },
+  },
+  {
     name: "list_skills",
     description:
       "List available Skills (workflow playbooks, voice/style guides, process docs). When to use: at the start of complex multi-step work to discover relevant guidance, or when the user references an established process. Skills hold knowledge that doesn't fit in the system prompt and loads on-demand. Returns each skill's name + one-sentence description.",
@@ -3919,6 +4005,10 @@ const SANDBOX_CALLABLE_TOOLS = new Set([
   "create_person", "update_person", "toggle_stage", "add_note",
   "log_touchpoint", "link_person_to_cohort", "pin_knowledge",
   "bulk_create_records",
+  // Plan discipline — sandbox-callable so the model can update todos
+  // from inside a Python loop ("mark current task complete, mark next
+  // task in_progress") without bouncing back to the model layer.
+  "write_todos",
 ]);
 
 for (const t of tools) {
@@ -4194,6 +4284,22 @@ ADDRESSING THE SENDER:
 The from_user_id in the '## Slack message reference' block at the top of the transcript is the person who messaged you — they're the one reading your reply. Address them in second person ('you'), not by name in third person. So if Nathan writes to you, never say 'Nathan would need to look at that' — say 'you'd need to look at that' or just describe the issue. Same for Yohan and Valerie when they're the sender. Mention other teammates by name when they're not the sender (e.g. 'Yohan should sign off on this' if Nathan is asking).`;
 
 const KERNEL_BOTTOM = `—— CORE MECHANICS (not editable from Slack — code-level changes only) ——
+
+PLAN BEFORE YOU IMPROVISE (write_todos):
+For any task with 3+ dependent steps — CSV imports, bulk stage updates, schema migrations, multi-record orchestration — call write_todos FIRST. Lay out the steps as { content (imperative), activeForm (present continuous), status }. Mark ONE as in_progress, execute it, then call write_todos again to update.
+
+The plan lives in your conversation history. Re-read your last write_todos tool_result before deciding what to do next. This stops the "let me try X / hmm let me try Y" improvisation pattern that wastes iterations.
+
+Example for "import this CSV":
+  [
+    { content: "Read the CSV and validate columns",   activeForm: "Reading the CSV and validating columns",   status: "in_progress" },
+    { content: "Dedup against existing People rows",  activeForm: "Deduping against existing People rows",   status: "pending" },
+    { content: "Create new rows, link to cohort",     activeForm: "Creating new rows and linking to cohort", status: "pending" },
+    { content: "Set onboarding stages from CSV",      activeForm: "Setting onboarding stages from CSV",      status: "pending" },
+    { content: "Report import summary",               activeForm: "Reporting import summary",                status: "pending" },
+  ]
+
+Don't use write_todos for trivial 1-2 step tasks (a single lookup, a single note, a reaction). The overhead isn't worth it. Use it whenever you'd be tempted to start improvising.
 
 CONFIRMATION GATING (the flow):
 The operator-managed section above lists which tools are confirmation-gated. The flow for any gated tool:
@@ -5390,6 +5496,7 @@ const TOOL_HUMAN_LABELS = {
   read_google_sheet: "Read Google Sheet",
   list_skills: "Listed skills",
   load_skill: "Loaded skill",
+  write_todos: "Updated plan",
   code_execution: "Ran code",
   tool_search_tool_bm25: "Searched tools",
   view_prompt_body: "Read own prompt body",
