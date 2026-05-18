@@ -4866,6 +4866,23 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       // returns ok=false from the loop — work gets truncated mid-task.
       // Opus 4.7 supports ≥32k output; 8192 is plenty of headroom.
       max_tokens: 8192,
+      // Adaptive (interleaved) extended thinking. On Opus 4.7 manual
+      // budget thinking is replaced by adaptive — the model decides how
+      // much to think between tool calls based on task complexity.
+      // Returned as `thinking` content blocks in response.content (and
+      // thinking_delta / signature_delta events during streaming, both
+      // of which our renderer ignores so they don't appear in Slack
+      // progress). The blocks are passed back to the API unchanged via
+      // messages.push({role: "assistant", content: response.content}),
+      // preserving reasoning continuity across iterations as required
+      // by the extended-thinking contract.
+      //
+      // Why this matters: previously the model's "Hmm, let me try X"
+      // reasoning leaked into text content blocks, which we render to
+      // Slack. With thinking enabled, that reasoning moves into
+      // thinking blocks (not user-visible) and only the substantive
+      // text reaches Slack. Cleaner UX, more compact final replies.
+      thinking: { type: "adaptive" },
       system: [
         { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
       ],
