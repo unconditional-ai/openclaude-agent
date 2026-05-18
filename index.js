@@ -4976,18 +4976,19 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       //   max_tokens, so the model needs more room to think AND emit
       //   actionable output.)
       //
-      // Opus 4.7 supports up to 32k output. Adaptive thinking is task-
-      // sensitive — simple chat ("hi compass") still produces ~12 tokens
-      // and ~$0.045 (audit row 15). Cost scales with what the model
-      // actually emits, not the cap.
+      // Sonnet 4.6 (our default per AGENT_MODEL) supports up to 32k
+      // output. Adaptive thinking is task-sensitive — simple chat
+      // ("hi compass") still produces ~12 tokens and ~$0.045 (audit
+      // row 15). Cost scales with what the model actually emits,
+      // not the cap.
       max_tokens: 32768,
-      // Adaptive (interleaved) extended thinking. On Opus 4.7 manual
-      // budget thinking is replaced by adaptive — the model decides how
-      // much to think between tool calls based on task complexity.
-      // Returned as `thinking` content blocks in response.content (and
-      // thinking_delta / signature_delta events during streaming, both
-      // of which our renderer ignores so they don't appear in Slack
-      // progress). The blocks are passed back to the API unchanged via
+      // Adaptive (interleaved) extended thinking. The model decides
+      // how much to think between tool calls based on task complexity;
+      // we don't set an explicit budget. Returned as `thinking`
+      // content blocks in response.content (and thinking_delta /
+      // signature_delta events during streaming, both of which our
+      // renderer ignores so they don't appear in Slack progress). The
+      // blocks are passed back to the API unchanged via
       // messages.push({role: "assistant", content: response.content}),
       // preserving reasoning continuity across iterations as required
       // by the extended-thinking contract.
@@ -4997,6 +4998,14 @@ async function runAgent(transcript, slack_context = null, attachments = [], thre
       // Slack. With thinking enabled, that reasoning moves into
       // thinking blocks (not user-visible) and only the substantive
       // text reaches Slack. Cleaner UX, more compact final replies.
+      //
+      // Adaptive vs enabled: Anthropic added the adaptive shape in
+      // SDK v0.73 (Opus 4.6 era); Opus 4.7 *requires* it (no manual
+      // budget option). On Sonnet 4.6 both shapes are accepted, but
+      // adaptive matches the model's own pacing instead of a guessed
+      // budget. If we ever want to cap thinking explicitly (e.g.,
+      // budget_tokens for predictable latency), switch the type to
+      // "enabled" with a budget_tokens field.
       thinking: { type: "adaptive" },
       system: [
         { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
